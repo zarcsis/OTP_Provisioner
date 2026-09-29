@@ -1,0 +1,4 @@
+# rpiboot-side config: load boot.img (the fastboot gadget initramfs) instead of the SD card.
+# Once the module is locked to a key, boot.sig (rpi-eeprom-digest -i boot.img -o boot.sig -k key.pem) is mandatory.
+boot_ramdisk=1
+uart_2ndstage=1
