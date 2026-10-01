@@ -17,6 +17,15 @@
  * File server messages are 260 bytes: int32 command (0 GetFileSize,
  * 1 ReadFile, 2 Done) + 256-byte name. Names starting with '*' carry
  * metadata "*KEY*VALUE" (serial, MAC, key hash, ...).
+ *
+ * A failed file-server read is NOT proof that the board left: Chrome's WinUSB
+ * backend gives every control transfer a fixed ~5 s timeout and reports it as
+ * NetworkError, and recovery.bin goes quiet for longer than that while it
+ * writes the EEPROM / OTP. Like usbboot's file_server (sleep(1); continue),
+ * the read is retried while the device is still attached; the session ends
+ * with DeviceGone only once the device is really gone (NotFoundError, closed,
+ * a 'disconnect' event, or missing from navigator.usb.getDevices()), and with
+ * an error when the board has not asked for anything for idleTimeoutMs.
  */
 (function () {
     'use strict';
@@ -150,6 +159,11 @@
      *   session.step(device) → { kind: 'second-stage-sent' | 'file-server-done', ... }
      * The caller decides what to do when the device re-enumerates (the app
      * waits for the WebUSB connect event and calls step() again).
+     * hooks: log, onProgress, onMetadata; usb (navigator.usb or a stand-in, used to tell a read timeout from a
+     * disconnect; default navigator.usb), retryMs (1000, pause between failed reads), idleTimeoutMs (180000,
+     * give up when the file server has had no request for that long while the board stays attached).
+     * `handedOff` is true once the device of the current step has been handed control (the whole second stage
+     * was written to the ROM, or the file server received a request): that USBDevice is about to go away.
      */
     class RpiBootSession {
         constructor(bootDir, hooks) {
@@ -158,20 +172,49 @@
             this.log = hooks.log || (() => {});
             this.onProgress = hooks.onProgress || (() => {});
             this.onMetadata = hooks.onMetadata || (() => {});
+            this.usb = hooks.usb !== undefined ? hooks.usb : (typeof navigator !== 'undefined' && navigator.usb) || null;
+            this.retryMs = hooks.retryMs || 1000;
+            this.idleTimeoutMs = hooks.idleTimeoutMs || 180000;
             this.metadata = {};
             this.metadataOrder = [];
             this.filesServed = [];
             this.aborted = false;
+            this.handedOff = false;
             this.device = null;
+            this._wakers = new Set();
         }
 
         abort() {
             this.aborted = true;
+            this._wake();
             if (this.device) this.device.close(); // rejects the pending control transfer
+        }
+
+        _wake() { for (const w of [...this._wakers]) w(); }
+
+        /** sleep(ms) that abort() and a 'disconnect' of the current device cut short. */
+        _pause(ms) {
+            return new Promise((resolve) => {
+                const done = () => { clearTimeout(t); this._wakers.delete(done); resolve(); };
+                const t = setTimeout(done, ms);
+                this._wakers.add(done);
+            });
+        }
+
+        /** Is the board behind `dev` still on the bus? (a failed transfer alone does not say so on Windows) */
+        async _stillAttached(dev, unplugged) {
+            if (unplugged() || !dev.usb.opened) return false;
+            if (this.usb && this.usb.getDevices) {
+                try {
+                    if (!(await this.usb.getDevices()).includes(dev.usb)) return false;
+                } catch (e) { /* cannot tell: rely on the other signals */ }
+            }
+            return true;
         }
 
         async step(rpiDevice) {
             this.device = rpiDevice;
+            this.handedOff = false;
             if (!rpiDevice.chip) throw new Error(`Unknown Raspberry Pi product 0x${rpiDevice.usb.productId.toString(16)}`);
             if (!rpiDevice.opened) await rpiDevice.open();
             this.log('info', `Found ${rpiDevice.chip.name} (${rpiDevice.chip.board}) serial ${rpiDevice.serial || '?'} iSerialNumber=${rpiDevice.iSerial === null ? '?' : rpiDevice.iSerial}`);
@@ -201,6 +244,7 @@
             if (n !== BOOT_MESSAGE_SIZE) throw new Error(`Failed to write correct length, returned ${n}`);
             n = await dev.epWrite(code, (sent, total) => this.onProgress(name, sent, total));
             if (n !== code.byteLength) throw new Error(`Failed to write second stage, sent ${n} of ${code.byteLength}`);
+            this.handedOff = true; // the ROM runs the second stage now and re-enumerates
             await sleep(1000);
             let retcode = null;
             try {
@@ -218,25 +262,56 @@
         // file_server(): answer GetFileSize / ReadFile / Done and collect "*KEY*VALUE" metadata
         async fileServer(dev) {
             this.log('info', 'Second stage boot server');
+            let unplugged = false;
+            const onDisconnect = (ev) => { if (ev && ev.device === dev.usb) { unplugged = true; this._wake(); } };
+            const hub = this.usb && this.usb.addEventListener ? this.usb : null;
+            if (hub) hub.addEventListener('disconnect', onDisconnect);
+            try {
+                return await this._fileServerLoop(dev, () => unplugged);
+            } finally {
+                if (hub && hub.removeEventListener) hub.removeEventListener('disconnect', onDisconnect);
+            }
+        }
+
+        async _fileServerLoop(dev, unplugged) {
             let current = null; // {name, data, origin}
             let going = true;
             let metadataIndex = 0;
+            let lastRequest = Date.now();
+            let failures = 0;
+            const gone = () => { this.log('warn', 'Device went away during the file server'); return new DeviceGone(); };
             while (going && !this.aborted) {
                 let msg;
                 try {
                     msg = await dev.epRead(FILE_MESSAGE_SIZE);
                 } catch (e) {
                     if (this.aborted) break;
-                    if (isGone(e)) { this.log('warn', 'Device went away during the file server'); throw new DeviceGone(); }
-                    this.log('warn', `Read failed (${e.status || e.message}); retrying in 1 s`);
-                    await sleep(1000);
+                    // usbboot: drop out only when the device went away; a timeout is retried (sleep(1); continue)
+                    if ((e && e.name === 'NotFoundError') || !(await this._stillAttached(dev, unplugged))) throw gone();
+                    const quiet = Date.now() - lastRequest;
+                    const why = `${(e && e.name) || 'Error'}: ${(e && (e.status || e.message)) || e}`;
+                    if (quiet >= this.idleTimeoutMs) {
+                        throw new Error(`the board is still attached but has not asked for anything for ${Math.round(quiet / 1000)} s (last read: ${why})`);
+                    }
+                    failures++;
+                    if (failures === 1) this.log('info', `Read failed (${why}); the board is still attached (busy writing the EEPROM / OTP?), retrying every ${Math.round(this.retryMs / 100) / 10} s`);
+                    else this.log('debug', `Read failed again (${why}), ${Math.round(quiet / 1000)} s since the last request`);
+                    await this._pause(this.retryMs);
+                    if (this.aborted) break;
+                    if (!(await this._stillAttached(dev, unplugged))) throw gone();
                     continue;
                 }
+                if (failures) {
+                    this.log('info', `The board answered again after ${Math.round((Date.now() - lastRequest) / 1000)} s`);
+                    failures = 0;
+                }
+                lastRequest = Date.now();
                 if (msg.byteLength < 4) { await sleep(200); continue; }
                 const command = new DataView(msg.buffer, msg.byteOffset, 4).getInt32(0, true);
                 const fname = cstr(msg, 4, 256);
                 this.log('debug', `← ${COMMAND_NAMES[command] || 'cmd ' + command}: ${fname || '(empty)'}`);
 
+                this.handedOff = true; // the board runs the second stage and moves on from here
                 if (fname.length === 0) { await dev.epWrite(null); break; }   // "Done can also just be null filename"
 
                 if (fname[0] === '*' && command !== 2) {
@@ -317,5 +392,50 @@
         }
     }
 
-    OTP.rpiboot = { RPI_VID, RPI_PIDS, USB_FILTERS, RpiDevice, RpiBootSession, DeviceGone, isGone, sleep };
+    /**
+     * rpiboot's main loop across re-enumerations: while the board is in the ROM stage send the second stage
+     * and wait for the next enumeration; then run the file server until "Done" (or until the board leaves USB,
+     * which is normal when a ramdisk takes over: the result is then marked `interrupted`).
+     *   waitNext(previousUsb) → Promise<USBDevice>  the next enumeration of the same board
+     *   opts.maxHops (6), opts.onDevice(usb), opts.log(level, msg)
+     * Returns {result, usb, serial}: result = {kind:'file-server-done', metadata, filesServed, interrupted?}.
+     */
+    async function runSession(session, usb, waitNext, opts) {
+        opts = opts || {};
+        const log = opts.log || session.log;
+        let lastISerial = -1;
+        let serial = usb.serialNumber || '';
+        for (let hop = 0; hop < (opts.maxHops || 6) && !session.aborted; hop++) {
+            const dev = new RpiDevice(usb);
+            await dev.open();
+            if (dev.serial) serial = dev.serial;
+            if (dev.iSerial !== null && dev.iSerial === lastISerial) {
+                // same enumeration as last time (rpiboot: last_serial) → keep waiting
+                await dev.close();
+                log('debug', 'Same enumeration as before; waiting for a new one');
+                usb = await waitNext(usb);
+                session.handedOff = false;
+                if (opts.onDevice) opts.onDevice(usb);
+                continue;
+            }
+            lastISerial = dev.iSerial;
+            let r;
+            try {
+                r = await session.step(dev);
+            } catch (e) {
+                if (!(e instanceof DeviceGone)) throw e;
+                log('warn', 'The board left USB before "Done"; keeping what was collected');
+                r = { kind: 'file-server-done', metadata: session.metadata, filesServed: session.filesServed, interrupted: true };
+            }
+            if (r.kind === 'file-server-done') return { result: r, usb, serial };
+            log('info', 'Waiting for the board to re-enumerate as the second stage…');
+            usb = await waitNext(usb);
+            session.handedOff = false; // nothing was handed to the new enumeration yet
+            if (opts.onDevice) opts.onDevice(usb);
+        }
+        if (session.aborted) throw new Error('aborted');
+        throw new Error('the board kept re-enumerating in the ROM stage; check the second-stage file');
+    }
+
+    OTP.rpiboot = { RPI_VID, RPI_PIDS, USB_FILTERS, RpiDevice, RpiBootSession, DeviceGone, isGone, sleep, runSession };
 })();

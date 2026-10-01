@@ -1,0 +1,73 @@
+# OTP_Provisioner configuration. Copy to config.yaml (repo root) or <work>/config.yaml and edit.
+# Every key is optional; the values below are the built-in defaults (otp_server/config.py).
+# Search order: --config PATH, $OTP_CONFIG, <repo>/config.yaml, <work>/config.yaml (first one found wins).
+# Environment overrides applied after the file: OTP_WORK_DIR (paths.work), OTP_STORAGE (storage.backend),
+# OTP_PORT (server.port). Relative paths are resolved against the repo root; ~ and %VAR% / $VAR are expanded.
+# Unknown keys are reported as a warning and ignored; a bad value (enum, type) stops the server with exit 2.
+
+server:
+  host: 127.0.0.1            # listen address; anything but loopback exposes signing files and LUKS passphrases
+                             # requests must name it (or 127.0.0.1/localhost/::1) in Host, else 403
+  port: 8765                 # http://127.0.0.1:8765/
+  open_browser: true         # open the page in Chrome (else Edge, else the default browser) at start
+
+paths:
+  work: null                 # runtime state; null = %LOCALAPPDATA%\OTP_Provisioner or ~/.local/share/otp-provisioner
+  droneos: ../droneos        # droneos checkout (rpi-image-gen image definition), relative to the repo root
+
+storage:
+  backend: local             # local | gsheets | gdrive
+  local:
+    dir: null                # null = <work>/registry; one <serial>.json per board
+  gsheets:
+    auth: service_account    # service_account | oauth
+    credentials: null        # service-account key JSON, or OAuth "Desktop app" client JSON for auth: oauth
+    token: null              # oauth token, written by 'python -m otp_server login'; null = <work>/google/gsheets-token.json
+    spreadsheet: null        # spreadsheet key or full URL (required for gsheets)
+    worksheet: modules       # tab name; created with the header row when missing
+  gdrive:
+    auth: service_account    # service_account | oauth
+    credentials: null        # service-account key JSON, or OAuth "Desktop app" client JSON for auth: oauth
+    token: null              # oauth token, written by 'python -m otp_server login'; null = <work>/google/gdrive-token.json
+    folder_id: null          # Drive folder id, the last part of the folder URL (required for gdrive);
+                             # service_account: must be in a Shared Drive (My Drive -> 403 storageQuotaExceeded)
+
+provisioning:
+  secure_boot: false         # sign EEPROM/gadget/boot slot with the board key and burn program_pubkey=1 (IRREVERSIBLE)
+  jtag_lock: false           # program_jtag_lock=1; only honoured together with secure_boot (IRREVERSIBLE)
+  recovery_passphrase: true  # stage 3: add the server-derived passphrase to LUKS keyslot 1 (oem cryptsetpassword)
+  confirm_irreversible: true # the page asks the operator to type the serial before OTP writes / erase
+  erase_storage: true        # stage 3: erase:<disk> before IDP writes the partition table
+  firmware_channel: default  # rpi-eeprom firmware-2712/<channel>: default | latest
+  max_piece_size: 268435456  # largest sparse piece sent in one download (rpi-fastbootd max-download-size, 256 MiB);
+                             # lowering it marks an existing image set 'rebuild needed'
+  # boot_conf: signed mode forces ENABLE_SELF_UPDATE=0 and SIGNED_BOOT=1 under [all] (removing other
+  # assignments of them in any section); unsigned mode strips SIGNED_BOOT. Never set SIGNED_BOOT here.
+  boot_conf: |               # EEPROM bootloader config
+    [all]
+    BOOT_UART=1
+    POWER_OFF_ON_HALT=1
+    BOOT_ORDER=0xf2461
+
+builds:
+  auto: true                 # at server start, build whatever is missing: tools image, gadget, droneos image
+  tools:
+    image_tag: otp-tools:latest            # signing/packing tools image (docker/tools.Dockerfile)
+  gadget:
+    source: auto             # build (only a self-built gadget) | prebuilt (rpi-sb-provisioner image) | auto (built, else prebuilt)
+    targets: pi5-family      # pi-gen-micro fastboot targets; the prebuilt image exists for pi5-family only
+    image_tag: otp-gadget-builder:trixie   # arm64 builder image (docker/gadget.Dockerfile)
+    volume: otp-pgm-work     # Docker volume with the pi-gen-micro work tree and apt cache
+  image:
+    config: droneos.yaml     # rpi-image-gen config, relative to the droneos checkout (or absolute)
+    overrides:               # KEY=VALUE overrides passed to the droneos build after "--"
+      - IGconf_image_pmap=crypt   # LUKS2 root container (osroot_crypt), required for the encrypted flow
+    builder_tag: droneos-builder:trixie    # image built from <droneos>/docker
+    volume: otp-droneos-work # Docker volume holding the rpi-image-gen work tree
+    keep_raw_image: false    # keep the raw .img in <work>/artifacts/image/staging after collecting the IDP set
+
+docker:
+  binary: docker             # docker CLI name or path
+  start_desktop: true        # Windows: launch Docker Desktop when the engine is not running and wait up to 180 s
+  desktop_path: null         # null = %ProgramFiles%\Docker\Docker\Docker Desktop.exe (Windows only)
+  idle_timeout: 1800         # seconds without output before a streamed docker build/run is stopped (0 = never)

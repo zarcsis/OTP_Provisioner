@@ -8,102 +8,171 @@
 </head>
 <body>
 <header>
-    <h1>OTP Provisioner</h1>
-    <span class="sub">Raspberry Pi 5 provisioning station · WebUSB, no dependencies</span>
-    <div id="caps"></div>
+    <div class="brand">
+        <h1>OTP Provisioner</h1>
+        <span class="sub">Raspberry Pi 5 provisioning station</span>
+    </div>
+    <div id="server-badges" class="badges"></div>
+    <div id="caps" class="badges"></div>
 </header>
 
-<main class="layout">
+<main class="layout" id="main-layout">
     <div class="col-left">
-        <section class="panel" id="devices-panel">
-            <h2>Modules on USB</h2>
-            <div class="row">
-                <button id="btn-pick-device" class="primary">Select device…</button>
-                <button id="btn-refresh-devices">Refresh</button>
-                <label class="check"><input type="checkbox" id="chk-autoprobe" checked> probe stage on select</label>
+        <section class="panel" id="board-panel">
+            <div class="panel-head">
+                <h2>Board</h2>
+                <span id="board-device" class="badge">no board</span>
             </div>
-            <p class="hint">Raspberry Pi 5: no SD card, hold the power button, plug USB-C into the station, release.
-                The boot ROM enumerates as <code>0a5c:2712</code> "BCM2712 Boot". Chrome lists a device only after
-                you have granted it once; afterwards it appears here automatically on plug-in.</p>
-            <ul id="device-list" class="device-list"></ul>
-        </section>
-
-        <section class="panel" id="detail-panel">
-            <h2>Selected module</h2>
-            <div id="device-detail"><p class="muted">No module selected.</p></div>
+            <div class="row">
+                <button id="btn-connect" class="primary big">Connect board</button>
+                <span id="board-status" class="muted"></span>
+            </div>
+            <div id="board-detail"></div>
         </section>
 
         <section class="panel" id="registry-panel">
-            <h2>Module registry <span class="muted">(this browser)</span></h2>
-            <table class="list" id="registry-table">
-                <thead><tr><th>Serial</th><th>Chip</th><th>Stage</th><th>Last seen</th></tr></thead>
-                <tbody></tbody>
-            </table>
-            <div class="row">
-                <button id="btn-registry-export" class="small">Export JSON</button>
-                <button id="btn-registry-clear" class="small danger-outline">Clear</button>
+            <div class="panel-head">
+                <h2>Registry</h2>
+                <button id="btn-registry-refresh" class="small push">Refresh</button>
+                <span id="registry-backend" class="muted head-note"></span>
+            </div>
+            <div class="table-wrap">
+                <table class="list" id="registry-table">
+                    <thead><tr><th>Serial</th><th>Stage</th><th>Updated</th></tr></thead>
+                    <tbody></tbody>
+                </table>
             </div>
         </section>
     </div>
 
     <div class="col-right">
-        <nav class="stages" id="stage-nav">
-            <button data-stage="stage-1" class="active">1 · OTP &amp; EEPROM</button>
-            <button data-stage="stage-2">2 · Provisioning agent</button>
-            <button data-stage="stage-3">3 · Image (fastboot / IDP)</button>
-        </nav>
-
-        <section class="stage panel" id="stage-1"></section>
-        <section class="stage panel hidden" id="stage-2"></section>
-
-        <section class="stage panel hidden" id="stage-3">
-            <h2>Stage 3 · Write the image over fastboot (IDP)</h2>
-            <p class="blurb">After stage 2 the provisioning agent runs Linux with the fastboot gadget (USB interface
-                class <code>ff/42/03</code>, rpi-fastbootd). The station stages <code>image.json</code> from
-                rpi-image-gen, the module creates its partitions and LUKS2 containers itself, then the station
-                flashes each sparse image where the module asks (<code>oem idpgetblk</code>) — the sequence of
-                <code>rpi-image-gen/bin/idp.sh</code>. A browser cannot write raw disks, so for a Chrome-only
-                station this, not a USB mass-storage disk, is the transport. <b>Not verified on hardware yet.</b>
-                Images larger than <code>max-download-size</code> need sparse splitting, which is not implemented.</p>
-            <div class="row">
-                <button id="fb-pick" class="primary">Select fastboot device…</button>
-                <button id="fb-getvar" disabled>getvar:all</button>
-                <span id="fb-device" class="muted">no fastboot device selected</span>
+        <section class="panel" id="provision-panel">
+            <div class="panel-head">
+                <h2>Provision</h2>
+                <span id="provision-mode" class="muted"></span>
             </div>
-            <table class="list" id="fb-vars"><tbody></tbody></table>
-            <h3>IDP image</h3>
-            <div class="row">
-                <button id="fb-pick-dir">Choose image directory…</button>
-                <span id="fb-dir" class="muted">image.json + sparse images (rpi-image-gen output directory)</span>
-                <input type="file" id="fb-dir-input" webkitdirectory class="hidden">
+            <ol class="instructions">
+                <li>Insert the target <b>SD card</b> into the board.</li>
+                <li><b>Hold the power button</b>, connect <b>USB-C</b> to this station, release the button.</li>
+                <li>Click <b>Connect board</b> and pick <i>BCM2712 Boot</i> in Chrome's list.</li>
+                <li>Click <b>Provision</b>. When asked, click <b>Connect fastboot gadget</b> and pick <i>Raspberry Pi …</i>.</li>
+            </ol>
+            <div id="offline-box" class="callout offline hidden">
+                <div><b>The server is not reachable.</b> Provisioning needs it (it holds the board secrets and builds every
+                    file). Start it with <code>python server.py</code> and reload, or use the manual mode with local directories.</div>
+                <button id="btn-open-advanced" class="small">Open Advanced (manual)</button>
             </div>
-            <div class="row">
-                <button id="fb-run-idp" class="danger" disabled>Provision (IDP)</button>
-                <button id="fb-abort" disabled>Abort</button>
+            <div id="steps" class="steps"></div>
+            <div id="need-box" class="callout hidden"></div>
+            <div class="row actions">
+                <button id="btn-provision" class="primary big" disabled>Provision</button>
+                <button id="btn-connect-fastboot" class="attention big hidden">Connect fastboot gadget</button>
+                <button id="btn-select-device" class="attention hidden">Select device…</button>
+                <button id="btn-abort" disabled>Abort</button>
+                <span id="provision-hint" class="muted"></span>
             </div>
-            <h3>Manual</h3>
-            <div class="row">
-                <input type="text" id="fb-part" class="mono" placeholder="partition / block device, e.g. mmcblk0">
-                <input type="file" id="fb-file">
-                <button id="fb-flash" disabled>flash</button>
-                <button id="fb-reboot" disabled>reboot</button>
-            </div>
-            <div class="progress"><div id="fb-progress"></div></div>
-            <div class="progress-label" id="fb-progress-label"></div>
         </section>
 
-        <section class="panel log-panel">
-            <h2>Log</h2>
-            <div class="row">
-                <button id="btn-log-copy" class="small">Copy</button>
-                <button id="btn-log-save" class="small">Save</button>
-                <button id="btn-log-clear" class="small">Clear</button>
-                <label class="check"><input type="checkbox" id="chk-verbose"> verbose (protocol messages)</label>
-            </div>
-            <pre id="log"></pre>
-        </section>
+        <div class="right-grid">
+            <section class="panel" id="builds-panel">
+                <div class="panel-head">
+                    <h2>Server builds</h2>
+                    <span id="docker-note" class="muted"></span>
+                </div>
+                <div id="builds" class="builds"></div>
+                <div class="panel-head sub-head">
+                    <h3>Job log</h3>
+                    <span id="job-log-title" class="muted"></span>
+                </div>
+                <pre id="job-log" class="console"></pre>
+            </section>
+
+            <section class="panel log-panel">
+                <div class="panel-head">
+                    <h2>Log</h2>
+                    <label class="check push"><input type="checkbox" id="chk-verbose"> verbose</label>
+                    <button id="btn-log-copy" class="small">Copy</button>
+                    <button id="btn-log-save" class="small">Save</button>
+                    <button id="btn-log-clear" class="small">Clear</button>
+                </div>
+                <pre id="log" class="console"></pre>
+            </section>
+        </div>
     </div>
 </main>
+
+<details id="advanced" class="advanced">
+    <summary>Advanced (manual) · local boot directories and manual fastboot, works without the server</summary>
+    <div class="layout advanced-layout">
+        <div class="col-left">
+            <section class="panel" id="devices-panel">
+                <h2>Boards on USB</h2>
+                <div class="row">
+                    <button id="btn-pick-device" class="primary">Select device…</button>
+                    <button id="btn-refresh-devices">Refresh</button>
+                    <label class="check"><input type="checkbox" id="chk-autoprobe" checked> probe stage on select</label>
+                </div>
+                <p class="hint">Raspberry Pi 5 in RPIBOOT mode (hold the power button while connecting USB-C) enumerates as
+                    <code>0a5c:2712</code> "BCM2712 Boot". Chrome lists a device only after you have granted it once.</p>
+                <ul id="device-list" class="device-list"></ul>
+            </section>
+
+            <section class="panel" id="detail-panel">
+                <h2>Selected device</h2>
+                <div id="device-detail"><p class="muted">No device selected.</p></div>
+            </section>
+        </div>
+
+        <div class="col-right">
+            <nav class="stages" id="stage-nav">
+                <button data-stage="stage-1" class="active">1 · EEPROM &amp; OTP</button>
+                <button data-stage="stage-2">2 · Gadget / agent</button>
+                <button data-stage="stage-3">3 · Image (fastboot / IDP)</button>
+            </nav>
+
+            <section class="stage panel" id="stage-1"></section>
+            <section class="stage panel hidden" id="stage-2"></section>
+
+            <section class="stage panel hidden" id="stage-3">
+                <h2>Stage 3 · Write the image over fastboot (IDP)</h2>
+                <p class="blurb">With the fastboot gadget running (USB <code>18d1:4e40</code>, interface <code>ff/42/03</code>,
+                    rpi-fastbootd), stage <code>image.json</code> from an rpi-image-gen output directory; the board creates
+                    its partitions and LUKS2 containers itself, then the station flashes each sparse image the board asks for
+                    (<code>oem idpgetblk</code>). Sparse files above <code>max-download-size</code> (256 MiB) are refused here;
+                    the server splits them.</p>
+                <div class="row">
+                    <button id="fb-pick" class="primary">Select fastboot device…</button>
+                    <button id="fb-getvar" disabled>getvar:all</button>
+                    <span id="fb-device" class="muted">no fastboot device selected</span>
+                </div>
+                <div class="table-wrap short"><table class="list" id="fb-vars"><tbody></tbody></table></div>
+                <h3>IDP image</h3>
+                <div class="row">
+                    <button id="fb-pick-dir">Choose image directory…</button>
+                    <span id="fb-dir" class="muted">image.json + sparse images (rpi-image-gen output directory)</span>
+                    <input type="file" id="fb-dir-input" webkitdirectory class="hidden">
+                </div>
+                <div class="row">
+                    <label class="check"><input type="checkbox" id="fb-opt-erase"> <code>erase:mmcblk0</code> first</label>
+                    <label class="check"><input type="checkbox" id="fb-opt-fwcrypto"> <code>oem fwcrypto init</code> first (IRREVERSIBLE; needed for encrypted images)</label>
+                </div>
+                <div class="row">
+                    <button id="fb-run-idp" class="danger" disabled>Provision (IDP)</button>
+                    <button id="fb-abort" disabled>Abort</button>
+                </div>
+                <h3>Manual</h3>
+                <div class="row">
+                    <input type="text" id="fb-part" class="mono" placeholder="partition / block device, e.g. mmcblk0">
+                    <input type="file" id="fb-file">
+                    <button id="fb-flash" disabled>flash</button>
+                    <button id="fb-reboot" disabled>reboot</button>
+                </div>
+                <div class="progress"><div id="fb-progress"></div></div>
+                <div class="progress-label" id="fb-progress-label"></div>
+            </section>
+        </div>
+    </div>
+</details>
 
 <dialog id="confirm-dialog">
     <h2>Irreversible operation</h2>
@@ -117,15 +186,16 @@
     </div>
 </dialog>
 
-<footer>OTP Provisioner · a port of <a href="https://github.com/raspberrypi/usbboot" target="_blank" rel="noopener">usbboot/rpiboot</a>
-    and the <a href="https://github.com/raspberrypi/rpi-image-gen" target="_blank" rel="noopener">rpi-image-gen</a> IDP client to WebUSB.</footer>
+<footer>OTP Provisioner · rpiboot (<a href="https://github.com/raspberrypi/usbboot" target="_blank" rel="noopener">usbboot</a>)
+    and the <a href="https://github.com/raspberrypi/rpi-fastbootd" target="_blank" rel="noopener">rpi-fastbootd</a> IDP client over WebUSB.</footer>
 
 <script src="js/duid.js"></script>
 <script src="js/tar.js"></script>
 <script src="js/bootdir.js"></script>
 <script src="js/rpiboot.js"></script>
 <script src="js/fastboot.js"></script>
-<script src="js/registry.js"></script>
+<script src="js/server.js"></script>
+<script src="js/flow.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

@@ -1,0 +1,12 @@
+[submodule "external/usbboot"]
+	path = external/usbboot
+	url = https://github.com/raspberrypi/usbboot
+	shallow = true
+[submodule "external/rpi-sb-provisioner"]
+	path = external/rpi-sb-provisioner
+	url = https://github.com/raspberrypi/rpi-sb-provisioner
+	shallow = true
+[submodule "external/pi-gen-micro"]
+	path = external/pi-gen-micro
+	url = https://github.com/raspberrypi/pi-gen-micro
+	shallow = true

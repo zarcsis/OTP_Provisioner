@@ -10,9 +10,10 @@
  * <prefix> is "2712" for BCM2712 (Pi 5 / CM5), "2711" for BCM2711 and
  * "2710" for the older SoCs.
  *
- * Two sources are supported: a FileSystemDirectoryHandle from
- * window.showDirectoryPicker() (lazy reads, no size limit) and a FileList
- * from <input type="file" webkitdirectory> (fallback).
+ * Three sources are supported: a stage manifest from the OTP_Provisioner
+ * server (files fetched lazily by name, size + SHA-256 checked), a
+ * FileSystemDirectoryHandle from window.showDirectoryPicker() (lazy reads,
+ * no size limit) and a FileList from <input type="file" webkitdirectory>.
  */
 (function () {
     'use strict';
@@ -31,6 +32,7 @@
             this._read = reader;            // async (relPath) => Uint8Array|null
             this._tar = undefined;          // Uint8Array | null once loaded
             this._cache = new Map();
+            this._pins = new Map();         // "<prefix>|<name>" → {data, origin}: bytes resolve() must serve verbatim
         }
 
         /** Directory picked with the File System Access API. */
@@ -85,6 +87,45 @@
             return bd;
         }
 
+        /**
+         * A stage directory served by the OTP_Provisioner server: manifest = the stage-1/2 manifest
+         * ({files: [{name, size, sha256, url}], mode, title, stage}). Files are fetched lazily by name,
+         * once, and checked against the manifest's size and sha256.
+         * opts.fetchBytes(url, onProgress) → Uint8Array (default OTP.api.fetchBytes); opts.onFetch(name, got, total).
+         */
+        static fromManifest(manifest, opts) {
+            opts = opts || {};
+            const fetchBytes = opts.fetchBytes || ((url, p) => OTP.api.fetchBytes(url, p));
+            const files = new Map();
+            for (const f of (manifest && manifest.files) || []) files.set(String(f.name).replace(/\\/g, '/').toLowerCase(), f);
+            const pending = new Map();
+            const reader = async (relPath) => {
+                const key = String(relPath).toLowerCase();
+                const f = files.get(key);
+                if (!f) return null;
+                if (!pending.has(key)) {
+                    pending.set(key, (async () => {
+                        const data = await fetchBytes(f.url, (got, total) => opts.onFetch && opts.onFetch(f.name, got, total));
+                        if (typeof f.size === 'number' && data.byteLength !== f.size) {
+                            throw new Error(`${f.name}: server sent ${data.byteLength} bytes, manifest says ${f.size}`);
+                        }
+                        if (f.sha256) {
+                            const h = await BootDir.sha256Hex(data);
+                            if (h !== String(f.sha256).toLowerCase()) throw new Error(`${f.name}: SHA-256 mismatch (got ${h.slice(0, 16)}…, manifest ${String(f.sha256).slice(0, 16)}…)`);
+                        }
+                        return data;
+                    })());
+                    pending.get(key).catch(() => pending.delete(key)); // allow a retry after a failed download
+                }
+                return pending.get(key);
+            };
+            const label = manifest ? `server stage ${manifest.stage || '?'}${manifest.mode ? ' (' + manifest.mode + ')' : ''}` : 'server';
+            const bd = new BootDir(label, reader);
+            bd.manifest = manifest;
+            bd._listTop = async () => [...files.values()].map((f) => ({ name: f.name, size: f.size || 0, kind: 'file' }));
+            return bd;
+        }
+
         /** FileList from <input type="file" webkitdirectory>. */
         static fromFileList(files) {
             const arr = Array.from(files);
@@ -126,6 +167,8 @@
             if (fname.includes('..')) return { denied: true, reason: 'path traversal (..)' };
             if (fname.startsWith('/') || fname.startsWith('\\')) return { denied: true, reason: 'absolute path' };
             const prefix = chip.prefix;
+            const pinned = this._pins.get(`${prefix}|${fname.toLowerCase()}`);
+            if (pinned) return { data: pinned.data, origin: pinned.origin };
             const tar = await this.bootfiles();
             if (tar) {
                 const overlay = await this.readFile(prefix + '/' + fname);
@@ -149,10 +192,18 @@
             return problems;
         }
 
-        /** Parse the rpiboot-side config.txt (NOT the OS config.txt) into {text, keys}. */
-        async configTxt() {
-            const data = await this.readFile('config.txt');
-            if (!data) return null;
+        /**
+         * Make resolve(fname, chip) return exactly `found.data` for the rest of this directory's life (until
+         * unpin): the bytes the operator confirmed are the bytes the board gets, even if the file changes on disk.
+         */
+        pin(fname, chip, found) {
+            this._pins.set(`${chip.prefix}|${String(fname).toLowerCase()}`, { data: found.data, origin: found.origin });
+        }
+
+        unpin(fname, chip) { this._pins.delete(`${chip.prefix}|${String(fname).toLowerCase()}`); }
+
+        /** Parse rpiboot config.txt bytes (NOT the OS config.txt) into {text, keys}. */
+        static parseConfig(data) {
             const text = new TextDecoder().decode(data);
             const keys = {};
             for (const raw of text.split(/\r?\n/)) {
@@ -162,6 +213,40 @@
                 if (m) keys[m[1]] = m[2].trim();
             }
             return { text, keys };
+        }
+
+        /**
+         * The rpiboot-side config.txt as {text, keys, origin, data}, or null.
+         * With `chip`: the file the file server will serve to that chip — the same resolve() result
+         * (<prefix>/config.txt overlay, the bootfiles.bin member <prefix>/config.txt, <prefix>/config.txt,
+         * then the top-level config.txt). Without `chip`: the top-level file only.
+         */
+        async configTxt(chip) {
+            let data;
+            let origin;
+            if (chip) {
+                const found = await this.resolve('config.txt', chip);
+                if (!found || found.denied) return null;
+                data = found.data;
+                origin = found.origin;
+            } else {
+                data = await this.readFile('config.txt');
+                if (!data) return null;
+                origin = `${this.name}/config.txt`;
+            }
+            return Object.assign(BootDir.parseConfig(data), { origin, data });
+        }
+
+        /** Every config.txt the directory holds for `chip`, in resolve() priority order: [{origin, data, text, keys}]. */
+        async configCandidates(chip) {
+            const out = [];
+            const add = (data, origin) => { if (data) out.push(Object.assign(BootDir.parseConfig(data), { origin, data })); };
+            const prefix = chip.prefix;
+            const tar = await this.bootfiles();
+            add(await this.readFile(`${prefix}/config.txt`), `${this.name}/${prefix}/config.txt`);
+            if (tar) add(OTP.tar.find(tar, `${prefix}/config.txt`), `bootfiles.bin:${prefix}/config.txt`);
+            add(await this.readFile('config.txt'), `${this.name}/config.txt`);
+            return out;
         }
 
         /** SHA-256 of a byte array, hex, via WebCrypto. */
