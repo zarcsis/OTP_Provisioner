@@ -13,7 +13,7 @@ server:
 
 paths:
   work: null                 # runtime state; null = %LOCALAPPDATA%\OTP_Provisioner or ~/.local/share/otp-provisioner
-  droneos: ../droneos        # droneos checkout (rpi-image-gen image definition), relative to the repo root
+  droneos: external/droneos  # droneos checkout (rpi-image-gen image definition), relative to the repo root
 
 storage:
   backend: local             # local | gsheets | gdrive

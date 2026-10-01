@@ -13,7 +13,7 @@ Boards are identified by the 8-hex USB serial the boot ROM reports (for example 
 | --- | --- | --- | --- |
 | 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, …) and reboots straight back into RPIBOOT (`set_reboot_order=0x3`, `recovery_reboot=1`). In secure-boot mode the EEPROM is signed and `program_pubkey=1` burns the key hash into OTP. | `external/usbboot/rpi-eeprom` firmware, packed by `docker/scripts/stage1.sh` | `eeprom` |
 | 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with rpi-fastbootd). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro`, or the prebuilt image from `external/rpi-sb-provisioner` | `gadget` |
-| 3 · Image | Page drives rpi-fastbootd: `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / `idpdone`) → `oem cryptsetpassword` → `reboot`. | droneos image (`../droneos`, rpi-image-gen, LUKS2 root `osroot_crypt`) built in Docker | `flashed` |
+| 3 · Image | Page drives rpi-fastbootd: `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / `idpdone`) → `oem cryptsetpassword` → `reboot`. | droneos image (`external/droneos` submodule, rpi-image-gen, LUKS2 root `osroot_crypt`) built in Docker | `flashed` |
 
 Status: the Python and page test suites pass. The server, the builds and the page have been tested
 against mocks and real Docker. **Stage 3 and the self-built gadget have not been run on a real board yet.**
@@ -38,9 +38,9 @@ against mocks and real Docker. **Stage 3 and the self-built gadget have not been
 
   then `sudo udevadm control --reload && sudo udevadm trigger`.
 * **Submodules** of this repo: `git submodule update --init --recursive` (usbboot with its nested
-  rpi-eeprom, rpi-sb-provisioner, pi-gen-micro).
-* **droneos** checked out next to this repo (`../droneos`, or set `paths.droneos`) with its own submodule:
-  `git -C ../droneos submodule update --init`. Only stage 3 needs it.
+  rpi-eeprom, rpi-sb-provisioner, pi-gen-micro, droneos with its nested rpi-image-gen). droneos is cloned
+  over SSH (`git@github.com:zarcsis/droneos.git`), so the clone needs a GitHub key with access to it.
+  `paths.droneos` can point at another droneos checkout instead.
 
 ## Quick start
 
@@ -80,9 +80,11 @@ On Windows, if the Docker engine is not running, the server starts Docker Deskto
 Build rules worth knowing:
 
 * **Rebuild triggers.** The gadget key is `<pi-gen-micro commit>-<hash of docker/gadget.Dockerfile +
-  gadget-entrypoint.sh>-<targets>`, so editing either file makes the gadget "not built". An image set split
-  with a larger `max_piece_size` than the current setting is reported as `rebuild needed: …` (status not
-  ready, stage 3 409). The stage-1 identity includes the sha256 of the selected `pieeprom-*.bin` and
+  gadget-entrypoint.sh>-<targets>`, so editing either file makes the gadget "not built". An image set is
+  reported as `rebuild needed: …` (status not ready, stage 3 409) when it was built from another droneos
+  commit than the one checked out now (`git describe --tags --always --dirty`), from another
+  `builds.image.config` file content or `overrides`, or split with a larger `max_piece_size` than the
+  current setting. The stage-1 identity includes the sha256 of the selected `pieeprom-*.bin` and
   `recovery.bin` and the content of `rpi-eeprom-config`, `rpi-eeprom-digest`, `rpi-sign-bootcode` and
   `update-pieeprom.sh`, so a firmware or usbboot submodule update rebuilds stage 1 (a quick build, about a
   minute) even when names and sizes stay the same. `builds.auto` rebuilds all of these by itself.
@@ -389,6 +391,17 @@ external/                  submodules
 | `external/usbboot` (+ nested `rpi-eeprom`) | raspberrypi/usbboot | `firmware/bootfiles.bin`, EEPROM images and recovery, `update-pieeprom.sh`, `rpi-eeprom-digest`, `rpi-sign-bootcode`, `rpi-make-boot-image` |
 | `external/rpi-sb-provisioner` | raspberrypi/rpi-sb-provisioner | prebuilt `host-support/fastboot-gadget-pi5-family.img`; reference station |
 | `external/pi-gen-micro` | raspberrypi/pi-gen-micro | source of the fastboot gadget |
+| `external/droneos` (+ nested `rpi-image-gen`) | zarcsis/droneos | the stage-3 image: `droneos.yaml`, `build.sh`, the builder `docker/Dockerfile` |
+
+The droneos submodule pins the commit the image is built from: to build newer droneos work, commit and push
+it in droneos, then move the pointer here (`git submodule update --remote external/droneos` for the tip of
+the default branch, or `git -C external/droneos fetch` + `checkout <commit>`; then
+`git submodule update --init --recursive external/droneos` for its nested rpi-image-gen) and commit
+`external/droneos`.
+The image set's version is `git describe` of that checkout: once the pointer moves (or the checkout gets
+uncommitted changes, `-dirty`), the published set is `rebuild needed` and stage 3 waits until the image is
+rebuilt — at the next server start with `builds.auto`, or with Build on the page / `python -m otp_server
+build image`.
 
 **rpi-fastbootd is deliberately not a submodule.** Its repository contains the systemd unit
 `dev-usb\x2dffs-fastboot.mount`, a file name Windows cannot check out, and building it needs Raspberry Pi

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,8 +68,18 @@ class ImageBuilder:
         blob = text + "\n" + "\n".join(self.icfg.overrides)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
 
-    def version(self) -> str:
-        return git_output(self.droneos_dir, "describe", "--tags", "--always", "--dirty") or "unknown"
+    VERSION_TTL = 10.0   # status is polled every few seconds; git describe --dirty is not free on Windows
+
+    def version(self, max_age: float | None = None) -> str:
+        """``git describe --tags --always --dirty`` of the droneos checkout (cached for a few seconds)."""
+        ttl = self.VERSION_TTL if max_age is None else max_age
+        cached = getattr(self, "_version_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < ttl:
+            return cached[1]
+        v = git_output(self.droneos_dir, "describe", "--tags", "--always", "--dirty") or "unknown"
+        self._version_cache = (now, v)
+        return v
 
     def container_config(self) -> tuple[str, list[Mount]]:
         """(-c argument, extra mounts): /src/<rel> inside the checkout, else /cfg/<name> with /cfg mounted."""
@@ -99,6 +110,11 @@ class ImageBuilder:
 
         Pieces are split to ``provisioning.max_piece_size`` at build time; a set split with a larger
         limit than the current one would hand the page pieces bigger than it was told to expect.
+
+        The set must also come from the droneos commit the checkout is at now (the ``external/droneos``
+        submodule pins it) and from the current ``builds.image`` config + overrides: a board must never
+        be flashed with an older OS than the one the station is set up to provision. A mismatch makes
+        stage 3 wait for a rebuild (the server rebuilds at start with ``builds.auto``, or via Build).
         """
         cur = int(self.cfg.provisioning.max_piece_size)
         built = int(man.get("max_piece_size") or 0)
@@ -107,6 +123,16 @@ class ImageBuilder:
         if built > cur or largest > cur:
             return (f"rebuild needed: image set {man.get('set', '')} was split into pieces of up to "
                     f"{max(built, largest)} bytes, more than provisioning.max_piece_size {cur}")
+        have_v = str(man.get("version") or "")
+        if have_v:
+            want_v = self.version()
+            if want_v != "unknown" and want_v != have_v:      # unknown = git failed: cannot tell, keep serving
+                return (f"rebuild needed: droneos is at {want_v}, image set {man.get('set', '')} was built "
+                        f"from {have_v}")
+        have_c = str(man.get("config_hash") or "")
+        if have_c and have_c != self.config_hash():
+            return (f"rebuild needed: builds.image config or overrides changed since image set "
+                    f"{man.get('set', '')} was built")
         return None
 
     def published_set(self) -> tuple[Path, dict] | None:
@@ -234,8 +260,6 @@ class ImageBuilder:
             total += sum(int(p.get("size") or 0) for p in pieces)
         detail = f"{man.get('name', '')} ({man.get('device_class', '')}, {man.get('storage_type', '')}" \
                  f"{', encrypted' if man.get('encrypted') else ''})"
-        if man.get("config_hash") and man.get("config_hash") != self.config_hash():
-            detail += "; built from different builds.image settings than the current ones (rebuild to apply)"
         base.update(ready=True, source="built", version=str(man.get("version", "")), path=str(d), size=total,
                     built=man.get("built"), detail=detail)
         return base
@@ -336,8 +360,6 @@ class ImageBuilder:
         irreversible = [{"key": "oem fwcrypto init", "value": "", "why": WHY_FWCRYPTO}]
         if prov.erase_storage:
             irreversible.append({"key": "erase", "value": disk, "why": WHY_ERASE})
-        if man.get("config_hash") and man.get("config_hash") != self.config_hash():
-            notes.append("the image was built from different builds.image settings than the current ones")
         paths = {"image.json": ij_path}
         total = ij_sf.size
         for pl in parts.values():

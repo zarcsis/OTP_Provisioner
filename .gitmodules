@@ -10,3 +10,6 @@
 	path = external/pi-gen-micro
 	url = https://github.com/raspberrypi/pi-gen-micro
 	shallow = true
+[submodule "external/droneos"]
+	path = external/droneos
+	url = git@github.com:zarcsis/droneos.git

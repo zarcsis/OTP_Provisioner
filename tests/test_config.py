@@ -28,7 +28,7 @@ def test_defaults(tmp_path):
     cfg = load_config(write(tmp_path / "c.yaml", ""), overrides={"paths": {"work": str(tmp_path / "w")}})
     assert cfg.repo_root == REPO_ROOT
     assert cfg.work_dir == tmp_path / "w"
-    assert cfg.droneos_dir == (REPO_ROOT.parent / "droneos")
+    assert cfg.droneos_dir == (REPO_ROOT / "external" / "droneos")
     assert cfg.config_path == tmp_path / "c.yaml"
     assert (cfg.server.host, cfg.server.port, cfg.server.open_browser) == ("127.0.0.1", 8765, True)
     assert cfg.storage.backend == "local"

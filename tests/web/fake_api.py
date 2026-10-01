@@ -115,7 +115,7 @@ def job_log_lines(job: dict[str, Any]) -> list[str]:
         return [
             "==> ensure docker daemon: ok (29.6.0)",
             "==> ensure arm64 emulation: aarch64",
-            "==> docker build -t droneos-builder:trixie ../droneos/docker",
+            "==> docker build -t droneos-builder:trixie external/droneos/docker",
             "#8 [5/7] RUN apt-get install -y --no-install-recommends mmdebstrap genimage ...",
             "#8 DONE 41.2s",
             "==> docker run droneos-builder:trixie --in-container -B /work -o /out -c /src/droneos.yaml -- IGconf_image_pmap=crypt",

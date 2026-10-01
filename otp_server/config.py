@@ -43,7 +43,7 @@ DEFAULT_BOOT_CONF = "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=1\nBOOT_ORDER=0xf2461
 #: The complete default configuration tree (the YAML schema).
 DEFAULTS: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8765, "open_browser": True},
-    "paths": {"work": None, "droneos": "../droneos"},
+    "paths": {"work": None, "droneos": "external/droneos"},
     "storage": {
         "backend": "local",
         "local": {"dir": None},

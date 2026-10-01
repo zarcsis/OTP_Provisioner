@@ -914,6 +914,83 @@ def test_image_set_split_larger_than_max_piece_needs_rebuild(make_env):
     assert env.arts.stage_manifest(SERIAL, 3)["max_piece_size"] == 1 << 20
 
 
+@pytest.fixture
+def droneos_git(monkeypatch):
+    """Fake ``git describe`` / ``rev-parse`` of the droneos checkout; mutate ``["describe"]`` to move it."""
+    from otp_server.artifacts import image as image_mod
+
+    state = {"describe": "368e8f0", "rev-parse": "368e8f0" + "0" * 33, "calls": 0}
+
+    def fake(repo, *args, **kw):
+        state["calls"] += 1
+        return state.get(args[0])
+
+    monkeypatch.setattr(image_mod, "git_output", fake)
+    monkeypatch.setattr(image_mod.ImageBuilder, "VERSION_TTL", 0.0)
+    return state
+
+
+def test_image_new_droneos_commit_needs_rebuild(make_env, droneos_git):
+    env = make_env()
+    build_image(env)
+    env.board()
+    old = env.arts.image.current_set()
+    assert old is not None and old[1]["version"] == "368e8f0" and "-368e8f0-" in old[1]["set"]
+    assert old[1]["droneos_commit"].startswith("368e8f0")
+    assert env.arts.status()["image"]["ready"] is True
+
+    droneos_git["describe"] = "v1.2-3-gabcdef1"          # the submodule pointer moved
+    assert env.arts.image.current_set() is None
+    with pytest.raises(NotReady, match="droneos is at v1.2-3-gabcdef1, image set .* was built from 368e8f0"):
+        env.arts.stage_manifest(SERIAL, 3)
+    st = env.arts.status()["image"]
+    assert st["ready"] is False and "rebuild needed" in st["detail"]
+    assert "image" in [j.target for j in env.arts.auto_build()]
+    env.wait_all()
+    cur = env.arts.image.current_set()
+    assert cur is not None and cur[1]["version"] == "v1.2-3-gabcdef1" and cur[0] != old[0]
+    assert env.arts.stage_manifest(SERIAL, 3)["image"]["version"] == "v1.2-3-gabcdef1"
+
+
+def test_image_unknown_droneos_version_keeps_serving(make_env, droneos_git):
+    env = make_env()
+    build_image(env)
+    env.board()
+    droneos_git["describe"] = None                       # git failed: no reason to block stage 3
+    assert env.arts.image.version() == "unknown"
+    assert env.arts.image.current_set() is not None
+    assert env.arts.stage_manifest(SERIAL, 3)["image"]["version"] == "368e8f0"
+
+
+def test_image_config_change_needs_rebuild(make_env):
+    env = make_env()
+    build_image(env)
+    env.board()
+    assert env.arts.image.current_set() is not None
+    (env.cfg.droneos_dir / "droneos.yaml").write_text("device:\n  layer: rpi5\nimage:\n  name: x\n",
+                                                      encoding="utf-8")
+    assert env.arts.image.current_set() is None
+    with pytest.raises(NotReady, match="config or overrides changed"):
+        env.arts.stage_manifest(SERIAL, 3)
+    (env.cfg.droneos_dir / "droneos.yaml").write_bytes(b"device:\r\n  layer: rpi5\r\n")   # back, CRLF
+    assert env.arts.image.current_set() is not None
+    env.cfg.builds.image.overrides = ["IGconf_image_pmap=crypt", "IGconf_x=1"]
+    with pytest.raises(NotReady, match="config or overrides changed"):
+        env.arts.stage_manifest(SERIAL, 3)
+
+
+def test_image_version_is_cached_briefly(make_env, droneos_git, monkeypatch):
+    from otp_server.artifacts import image as image_mod
+
+    env = make_env()
+    monkeypatch.setattr(image_mod.ImageBuilder, "VERSION_TTL", 3600.0)
+    n = droneos_git["calls"]
+    assert env.arts.image.version() == "368e8f0"
+    droneos_git["describe"] = "abcdef1"
+    assert env.arts.image.version() == "368e8f0" and droneos_git["calls"] == n + 1
+    assert env.arts.image.version(max_age=0) == "abcdef1"
+
+
 # #15 temporary key directories never linger silently
 def test_tempkeys_cleans_up_when_enter_fails(tmp_path):
     from otp_server.artifacts.common import TempKeys
