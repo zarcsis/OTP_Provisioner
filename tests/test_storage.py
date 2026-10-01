@@ -1,34 +1,37 @@
-"""Storage backends: local JSON (real files), Google Sheets (gspread-shaped fakes whose methods are
-checked against the real gspread 6.x signatures) and Google Drive (the real googleapiclient Drive v3
-client built from its bundled discovery document, talking to an in-memory fake HTTP transport)."""
+"""Module registry storage: the record schema and the Google Sheets store.
+
+The Sheets store is exercised with gspread-shaped fakes whose methods are checked against the real
+gspread 6.x signatures, behind the *real* :class:`~otp_server.google_account.GoogleAccount` (a test
+``client_factory`` stands in for the OAuth login), so opening the station spreadsheet by its saved id
+and explaining Google errors to the operator run the product code. No test touches the network or
+opens a browser."""
 
 from __future__ import annotations
 
-import email
-import email.policy
+import importlib.util
 import inspect
 import json
 import os
 import re
-import threading
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+import otp_server.storage as storage_pkg
+from otp_server.google_account import GoogleAccount
 from otp_server.storage import (
     FIELDS,
-    GoogleDriveStore,
     GoogleSheetsStore,
-    LocalJsonStore,
+    ModuleStore,
     StoreError,
     make_store,
     normalize_record,
     utc_now_iso,
 )
-from otp_server.storage.base import MAX_EVENTS, encode_cell
+from otp_server.storage.base import LOWER_FIELDS, MAX_EVENTS, encode_cell
 
 REPO = __import__("pathlib").Path(__file__).resolve().parent.parent
 PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nAAAA\n-----END PRIVATE KEY-----\n"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/SHEETKEY/edit"
 
 
 def sample(serial="a7eb274c", **kw):
@@ -64,21 +67,63 @@ class Clock:
         self.t += s
 
 
+@pytest.fixture(autouse=True)
+def _no_browser_no_network(monkeypatch):
+    """Every test: opening a browser, the loopback OAuth server or any real HTTP request fails loudly."""
+
+    def refuse(*a, **k):
+        raise AssertionError("a test tried to open a browser or reach the network")
+
+    import webbrowser
+
+    for name in ("open", "open_new", "open_new_tab"):
+        monkeypatch.setattr(webbrowser, name, refuse)
+    try:
+        import requests
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        monkeypatch.setattr(requests.Session, "send", refuse)
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:  # pragma: no cover
+        pass
+    else:
+        monkeypatch.setattr(InstalledAppFlow, "run_local_server", refuse)
+
+
 # ==================================================================================================
 # base / normalize
 # ==================================================================================================
 
 
+#: The header the first released version wrote (sheets in the field still carry it).
+FIELDS_V1 = ("serial", "stage", "created", "updated", "chip", "board", "duid", "mac", "factory_uuid", "boardrev",
+             "customer_key_hash", "otp_key_hash", "secure_boot_provisioned", "device_key_pem", "rsa_public_pem",
+             "rsa_private_pem", "device_secret", "metadata", "facts", "events")
+
+
+def test_fields_only_grow_at_the_end():
+    # an older sheet header must stay a prefix of the current one (it is extended in place)
+    assert FIELDS[: len(FIELDS_V1)] == FIELDS_V1
+    assert FIELDS[len(FIELDS_V1): len(FIELDS_V1) + 2] == ("device_private_pem", "mode")
+    assert len(FIELDS) == len(set(FIELDS))
+    assert "mode" in LOWER_FIELDS and "device_private_pem" not in LOWER_FIELDS
+
+
 def test_normalize_record_defaults_and_coercion():
     r = normalize_record({"serial": " A7EB274C ", "stage": "bogus", "extra": 1, "secure_boot_provisioned": "TRUE",
                           "metadata": '{"a": "b"}', "events": json.dumps([{"t": "x", "kind": "k"}, "junk"]),
-                          "chip": None, "duid": "ABCDEF"})
+                          "chip": None, "duid": "ABCDEF", "mode": " Secure ", "device_private_pem": PEM})
     assert list(r) == list(FIELDS)
     assert r["serial"] == "a7eb274c" and r["stage"] == "new" and "extra" not in r
     assert r["secure_boot_provisioned"] is True
     assert r["metadata"] == {"a": "b"} and r["facts"] == {}
     assert r["events"] == [{"t": "x", "kind": "k", "note": ""}]
     assert r["chip"] == "" and r["duid"] == "abcdef"
+    assert r["mode"] == "secure"  # lowercased and stripped
+    assert r["device_private_pem"] == PEM  # PEM kept verbatim (case and newlines)
+    assert normalize_record({})["mode"] == "" and normalize_record({})["device_private_pem"] == ""
     for v in ("false", "", "0", None):
         assert normalize_record({"secure_boot_provisioned": v})["secure_boot_provisioned"] is False
     many = [{"t": str(i), "kind": "k", "note": ""} for i in range(150)]
@@ -92,101 +137,35 @@ def test_utc_now_iso_format():
 
 def test_encode_cell():
     assert encode_cell("secure_boot_provisioned", True) == "true"
+    assert encode_cell("secure_boot_provisioned", False) == "false"
     assert encode_cell("metadata", {"b": 1, "a": 2}) == '{"a":2,"b":1}'
     assert encode_cell("chip", "BCM2712") == "BCM2712"
+    assert encode_cell("mode", "secure") == "secure"
+    assert encode_cell("device_private_pem", PEM) == PEM
+    assert encode_cell("chip", None) == ""
 
 
 # ==================================================================================================
-# local
+# the package: Google Sheets only
 # ==================================================================================================
 
 
-def test_local_round_trip(tmp_path):
-    st = LocalJsonStore(tmp_path / "reg")
-    assert st.get("a7eb274c") is None and st.list() == []
-    st.put(sample())
-    got = st.get("a7eb274c")
-    assert got == normalize_record(sample())
-    assert got["rsa_private_pem"] == PEM
-    st.put(sample(stage="gadget"))
-    assert st.get("A7EB274C")["stage"] == "gadget"
-    st.put(sample("00001234"))
-    assert [r["serial"] for r in st.list()] == ["00001234", "a7eb274c"]
-    files = sorted(p.name for p in (tmp_path / "reg").iterdir())
-    assert files == ["00001234.json", "a7eb274c.json"]  # no temp files left behind
-    d = st.describe()
-    assert d["backend"] == "local" and d["ok"] is True and d["location"] == str(tmp_path / "reg")
-    assert "2" in d["detail"]
-    if os.name == "posix":
-        assert (tmp_path / "reg" / "a7eb274c.json").stat().st_mode & 0o777 == 0o600
+def test_storage_package_has_no_local_or_drive_backend():
+    for name in ("LocalJsonStore", "GoogleDriveStore"):
+        assert not hasattr(storage_pkg, name), name
+        assert name not in storage_pkg.__all__
+    for mod in ("otp_server.storage.local", "otp_server.storage.gdrive"):
+        assert importlib.util.find_spec(mod) is None, mod
 
 
-def test_local_rejects_path_tricks(tmp_path):
-    st = LocalJsonStore(tmp_path / "reg")
-    for bad in ("../x", "a/b", "", "a\\b", "x" * 80):
-        with pytest.raises(StoreError):
-            st.put(sample(bad))
-        with pytest.raises(StoreError):
-            st.get(bad)
-
-
-def test_local_corrupt_file(tmp_path):
-    st = LocalJsonStore(tmp_path)
-    st.put(sample())
-    (tmp_path / "deadbeef.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(StoreError, match="corrupt"):
-        st.get("deadbeef")
-    assert [r["serial"] for r in st.list()] == ["a7eb274c"]  # corrupt one skipped
-
-
-def test_local_threaded_writes(tmp_path):
-    st = LocalJsonStore(tmp_path)
-    errors = []
-
-    def worker(i):
-        try:
-            for j in range(10):
-                st.put(sample(f"{i:08x}", chip=f"c{j}"))
-        except Exception as exc:  # pragma: no cover
-            errors.append(exc)
-
-    ts = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    assert not errors
-    assert len(st.list()) == 8 and all(r["chip"] == "c9" for r in st.list())
-
-
-def test_local_accepts_config(make_cfg, tmp_path):
-    cfg = make_cfg(tmp_path)
-    st = LocalJsonStore(cfg)
-    assert st.dir == cfg.storage.local_dir
-
-
-def test_make_store(make_cfg, tmp_path):
-    cfg = make_cfg(tmp_path)
-    st = make_store(cfg)
-    assert isinstance(st, LocalJsonStore) and st.backend == "local"
-    with pytest.raises(StoreError, match="spreadsheet"):
-        make_store(make_cfg(tmp_path, storage={"backend": "gsheets"}))
-    with pytest.raises(StoreError, match="credentials"):
-        make_store(make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {"spreadsheet": "K"}}))
-    with pytest.raises(StoreError, match="not found"):
-        make_store(make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {
-            "spreadsheet": "K", "credentials": str(tmp_path / "missing.json")}}))
-    with pytest.raises(StoreError, match="oauth"):
-        make_store(make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {"spreadsheet": "K", "auth": "oauth"}}))
-    with pytest.raises(StoreError, match="folder_id"):
-        make_store(make_cfg(tmp_path, storage={"backend": "gdrive"}))
-    sa = tmp_path / "sa.json"
-    sa.write_text("{}", encoding="utf-8")
-    # valid config: constructed without touching the network or importing anything heavy
-    st = make_store(make_cfg(tmp_path, storage={"backend": "gdrive", "gdrive": {"folder_id": "F", "credentials": str(sa)}}))
-    assert isinstance(st, GoogleDriveStore)
-    st = make_store(make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {"spreadsheet": "K", "credentials": str(sa)}}))
-    assert isinstance(st, GoogleSheetsStore)
+def test_make_store_returns_a_lazy_google_sheets_store(tmp_path):
+    account = GoogleAccount(tmp_path / "repo", tmp_path / "work")
+    st = make_store(account)
+    assert isinstance(st, GoogleSheetsStore) and isinstance(st, ModuleStore)
+    assert st.account is account and st.worksheet == "modules" and st.backend == "gsheets"
+    # constructing it neither connects nor writes anything locally
+    assert not (tmp_path / "work").exists()
+    assert st.location == "Google Sheets (not created yet) / modules"
 
 
 def test_google_libraries_are_imported_lazily(tmp_path):
@@ -194,17 +173,19 @@ def test_google_libraries_are_imported_lazily(tmp_path):
     import sys
 
     code = (
-        "import sys; from otp_server.config import load_config; from otp_server.storage import make_store; "
-        "from otp_server.modules import ModuleService; "
-        f"cfg = load_config(overrides={{'paths': {{'work': {str(tmp_path)!r}}}}}); "
-        "st = make_store(cfg); st.put({'serial': 'a7eb274c'}); st.list(); "
-        "print(sorted(m for m in ('gspread', 'googleapiclient', 'google_auth_oauthlib', 'google.oauth2') if m in sys.modules))"
+        "import sys, pathlib; "
+        "import otp_server.storage, otp_server.google_account, otp_server.settings, otp_server.modules; "
+        "from otp_server.google_account import GoogleAccount; from otp_server.storage import make_store; "
+        f"tmp = pathlib.Path({str(tmp_path)!r}); "
+        "acct = GoogleAccount(tmp / 'repo', tmp / 'work'); acct.status(); "
+        "st = make_store(acct); st.location; "
+        "print(sorted(m for m in ('gspread', 'googleapiclient', 'google_auth_oauthlib', 'google.oauth2', "
+        "'google.auth', 'requests_oauthlib') if m in sys.modules))"
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith("OTP_")}
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # keep bytecode out of the repository tree
-    env["OTP_CONFIG"] = str(tmp_path / "c.yaml")
-    (tmp_path / "c.yaml").write_text("{}", encoding="utf-8")
-    out = subprocess.run([sys.executable, "-B", "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True, timeout=120)
+    out = subprocess.run([sys.executable, "-B", "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True,
+                         timeout=120)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
 
@@ -218,7 +199,7 @@ from gspread.cell import Cell as RealCell  # noqa: E402
 from gspread.client import Client as RealClient  # noqa: E402
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound  # noqa: E402
 from gspread.spreadsheet import Spreadsheet as RealSpreadsheet  # noqa: E402
-from gspread.utils import a1_to_rowcol, extract_id_from_url  # noqa: E402
+from gspread.utils import a1_to_rowcol, rowcol_to_a1  # noqa: E402
 from gspread.worksheet import Worksheet as RealWorksheet  # noqa: E402
 
 
@@ -282,8 +263,9 @@ class FakeWorksheet:
         for j, v in enumerate(values):
             assert isinstance(v, str) and len(v) <= 50000
             self._set(r, j + 1, v)
-        return {"spreadsheetId": "sid", "tableRange": f"{self.title}!A1:T{r - 1}",
-                "updates": {"spreadsheetId": "sid", "updatedRange": f"{self.title}!A{r}:T{r}", "updatedRows": 1}}
+        last = rowcol_to_a1(r, len(values))
+        return {"spreadsheetId": "sid", "tableRange": f"{self.title}!A1:{rowcol_to_a1(r - 1, len(values))}",
+                "updates": {"spreadsheetId": "sid", "updatedRange": f"{self.title}!A{r}:{last}", "updatedRows": 1}}
 
     def acell(self, *a, **k):
         args = bind(RealWorksheet.acell, *a, **k)
@@ -332,56 +314,78 @@ class FakeGspreadClient:
             raise SpreadsheetNotFound("not found")
         return self.spreadsheet
 
-    def open_by_url(self, *a, **k):
-        args = bind(RealClient.open_by_url, *a, **k)
-        return self.open_by_key(extract_id_from_url(args["url"]))
+    def create(self, *a, **k):  # the account must never create a spreadsheet when an id is saved
+        bind(RealClient.create, *a, **k)
+        raise AssertionError("a new spreadsheet was created although its id is saved")
 
 
-def sheets_store(make_cfg, tmp_path, client, clock=None, **gs):
-    g = {"spreadsheet": "SHEETKEY", "worksheet": "modules"}
-    g.update(gs)
-    cfg = make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": g})
-    return GoogleSheetsStore(cfg, client=client, clock=clock or Clock())
+class FakeAccount(GoogleAccount):
+    """The real :class:`GoogleAccount` (opens the saved spreadsheet id, explains errors, drops the connection
+    on auth failures) on fake gspread clients instead of an OAuth login. ``clients`` are handed out one per
+    (re)connect, the last one repeating; ``built`` counts the connects."""
+
+    def __init__(self, tmp_path, *clients, sid="SHEETKEY"):
+        self._clients = list(clients)
+        self.built = 0
+        super().__init__(tmp_path / "repo", tmp_path / "work", client_factory=self._next_client)
+        self.sheet_file.parent.mkdir(parents=True, exist_ok=True)
+        self.sheet_file.write_text(json.dumps({"id": sid, "title": "OTP_Provisioner"}), encoding="utf-8")
+
+    def _next_client(self):
+        self.built += 1
+        return self._clients[min(self.built, len(self._clients)) - 1]
 
 
-def test_sheets_creates_worksheet_and_round_trips(make_cfg, tmp_path):
+def sheets_store(tmp_path, *clients, clock=None, worksheet="modules"):
+    return GoogleSheetsStore(FakeAccount(tmp_path, *clients), worksheet=worksheet, clock=clock or Clock())
+
+
+def test_sheets_creates_worksheet_and_round_trips(tmp_path):
     fake = FakeGspreadClient()
-    st = sheets_store(make_cfg, tmp_path, fake)
+    st = sheets_store(tmp_path, fake)
     assert st.get("a7eb274c") is None
+    assert fake.opened == ["SHEETKEY"]  # the saved spreadsheet id
     ws = fake.spreadsheet.sheets["modules"]
-    assert ws.grid[0] == list(FIELDS)
+    assert ws.grid[0] == list(FIELDS) and ws.cols == len(FIELDS)
     st.put(sample())
     st.put(sample("00001234", stage="new", secure_boot_provisioned=False))
-    assert len(ws.grid) == 3
+    st.put(sample("cccccccc", mode="Secure", device_private_pem=PEM))
+    assert len(ws.grid) == 4
     # the stored cells are RAW strings: serials / hex stay text, PEM keeps its newlines
     row = dict(zip(FIELDS, ws.grid[1]))
     assert row["serial"] == "a7eb274c" and row["secure_boot_provisioned"] == "true"
     assert row["rsa_private_pem"] == PEM and json.loads(row["metadata"])["EEPROM_UPDATE"] == "success"
+    assert row["mode"] == "" and row["device_private_pem"] == ""
     assert ws.grid[2][0] == "00001234"
+    row3 = dict(zip(FIELDS, ws.grid[3]))
+    assert row3["mode"] == "secure" and row3["device_private_pem"] == PEM
     # a second store instance (another server start) reads the same data back
-    st2 = sheets_store(make_cfg, tmp_path / "b", fake)
+    st2 = sheets_store(tmp_path / "b", fake)
     assert st2.get("a7eb274c") == normalize_record(sample())
     assert st2.get("00001234")["secure_boot_provisioned"] is False
-    assert [r["serial"] for r in st2.list()] == ["a7eb274c", "00001234"]
+    assert st2.get("cccccccc")["mode"] == "secure" and st2.get("cccccccc")["device_private_pem"] == PEM
+    assert [r["serial"] for r in st2.list()] == ["a7eb274c", "00001234", "cccccccc"]
     # upsert updates the row in place
     st2.put(sample(stage="flashed", chip="X"))
-    assert len(ws.grid) == 3 and ws.grid[1][FIELDS.index("stage")] == "flashed"
+    assert len(ws.grid) == 4 and ws.grid[1][FIELDS.index("stage")] == "flashed"
     d = st2.describe()
-    assert d == {"backend": "gsheets", "ok": True, "location": "Google Sheets SHEETKEY / modules",
-                 "detail": "2 module record(s) cached"}
+    assert d == {"backend": "gsheets", "ok": True, "location": f"Google Sheets {SHEET_URL} / modules",
+                 "detail": "3 module record(s) cached"}
+    assert fake.spreadsheet.calls.count("add_worksheet") == 1
 
 
-def test_sheets_open_by_url(make_cfg, tmp_path):
+def test_sheets_custom_worksheet_name(tmp_path):
     fake = FakeGspreadClient()
-    st = sheets_store(make_cfg, tmp_path, fake, spreadsheet="https://docs.google.com/spreadsheets/d/SHEETKEY/edit#gid=0")
+    st = sheets_store(tmp_path, fake, worksheet="registry")
     st.put(sample())
-    assert fake.opened == ["SHEETKEY"]
+    assert set(fake.spreadsheet.sheets) == {"registry"}
+    assert st.describe()["location"].endswith("/ registry")
 
 
-def test_sheets_caching_and_quota(make_cfg, tmp_path):
+def test_sheets_caching_and_quota(tmp_path):
     fake = FakeGspreadClient()
     clock = Clock()
-    st = sheets_store(make_cfg, tmp_path, fake, clock=clock)
+    st = sheets_store(tmp_path, fake, clock=clock)
     st.put(sample())  # connect (1 read) + miss refresh is suppressed (<2 s) + append
     ws = fake.spreadsheet.sheets["modules"]
     reads = lambda: ws.calls.count("get_all_values")  # noqa: E731
@@ -389,7 +393,9 @@ def test_sheets_caching_and_quota(make_cfg, tmp_path):
     for _ in range(20):
         assert st.get("a7eb274c")["stage"] == "eeprom"
         st.list()
+        st.describe()
     assert reads() == n0  # all served from cache
+    assert fake.opened == ["SHEETKEY"]  # the spreadsheet is opened once
     st.put(sample(stage="gadget"))
     assert ws.calls[-1] == "update" and reads() == n0  # known row: no re-read
     # external edit (another station) becomes visible after the cache ages
@@ -407,9 +413,31 @@ def test_sheets_caching_and_quota(make_cfg, tmp_path):
     assert st.get("cafe0000") is None and reads() == n0 + 2  # within 2 s of the last read
 
 
-def test_sheets_row_index_survives_unknown_append_response(make_cfg, tmp_path):
+def test_sheets_reset_forgets_the_cache_and_the_retry_throttle(tmp_path):
     fake = FakeGspreadClient()
-    st = sheets_store(make_cfg, tmp_path, fake)
+    st = sheets_store(tmp_path, fake)
+    st.put(sample())
+    ws = fake.spreadsheet.sheets["modules"]
+    ws.grid[1][FIELDS.index("chip")] = "EXTERNAL"
+    assert st.get("a7eb274c")["chip"] == "BCM2712"  # cached
+    lookups = fake.spreadsheet.calls.count("worksheet")
+    st.reset()
+    assert st.get("a7eb274c")["chip"] == "EXTERNAL"  # reconnected and re-read without waiting
+    assert fake.spreadsheet.calls.count("worksheet") == lookups + 1
+
+    # a failed connect is retried at most every 10 s ... unless reset() (a new login) says otherwise
+    broken = FakeGspreadClient(sid="OTHER")
+    st2 = sheets_store(tmp_path / "2", broken)
+    assert st2.describe()["ok"] is False and len(broken.opened) == 1
+    broken.spreadsheet.id = "SHEETKEY"
+    assert st2.describe()["ok"] is False and len(broken.opened) == 1  # throttled
+    st2.reset()
+    assert st2.describe()["ok"] is True and len(broken.opened) == 2
+
+
+def test_sheets_row_index_survives_unknown_append_response(tmp_path):
+    fake = FakeGspreadClient()
+    st = sheets_store(tmp_path, fake)
     st.get("x0000000")
     ws = fake.spreadsheet.sheets["modules"]
     orig = ws.append_row
@@ -424,48 +452,118 @@ def test_sheets_row_index_survives_unknown_append_response(make_cfg, tmp_path):
     assert len(ws.grid) == 2 and ws.grid[1][1] == "gadget"
 
 
-def test_sheets_header_rules(make_cfg, tmp_path):
+def test_sheets_header_rules(tmp_path):
     # wrong header, no data -> canonical header written (grid widened when too narrow)
     fake = FakeGspreadClient()
     fake.spreadsheet.sheets["modules"] = FakeWorksheet("modules", cols=5, grid=[["foo", "bar"]])
-    st = sheets_store(make_cfg, tmp_path, fake)
+    st = sheets_store(tmp_path, fake)
     st.put(sample())
     ws = fake.spreadsheet.sheets["modules"]
     assert ws.grid[0] == list(FIELDS) and "resize" in ws.calls
+    # an empty worksheet gets the header too
+    fake_e = FakeGspreadClient()
+    fake_e.spreadsheet.sheets["modules"] = FakeWorksheet("modules")
+    sheets_store(tmp_path / "e", fake_e).put(sample())
+    assert fake_e.spreadsheet.sheets["modules"].grid[0] == list(FIELDS)
     # canonical header + extra operator columns is fine
     fake2 = FakeGspreadClient()
     fake2.spreadsheet.sheets["modules"] = FakeWorksheet("modules", grid=[list(FIELDS) + ["notes"]])
-    st2 = sheets_store(make_cfg, tmp_path / "2", fake2)
+    st2 = sheets_store(tmp_path / "2", fake2)
     st2.put(sample())
     assert st2.get("a7eb274c")["chip"] == "BCM2712"
+    assert fake2.spreadsheet.sheets["modules"].grid[0][-1] == "notes"
     # wrong header with data -> refuse
     fake3 = FakeGspreadClient()
     fake3.spreadsheet.sheets["modules"] = FakeWorksheet("modules", grid=[["serial", "name"], ["a7eb274c", "x"]])
-    st3 = sheets_store(make_cfg, tmp_path / "3", fake3)
+    st3 = sheets_store(tmp_path / "3", fake3)
     with pytest.raises(StoreError, match="different header"):
         st3.get("a7eb274c")
     d = st3.describe()
     assert d["ok"] is False and "different header" in d["detail"]
     assert fake3.spreadsheet.sheets["modules"].grid[1] == ["a7eb274c", "x"]  # untouched
+    # an old header followed by an operator column is not "extended": that would overwrite the column
+    old = list(FIELDS_V1)
+    fake4 = FakeGspreadClient()
+    data = [encode_cell(f, normalize_record(sample())[f]) for f in old] + ["operator note"]
+    fake4.spreadsheet.sheets["modules"] = FakeWorksheet("modules", grid=[old + ["notes"], data])
+    with pytest.raises(StoreError, match="different header"):
+        sheets_store(tmp_path / "4", fake4).list()
+    ws4 = fake4.spreadsheet.sheets["modules"]
+    assert ws4.grid == [old + ["notes"], data] and "update" not in ws4.calls
 
 
-def test_sheets_not_shared_is_actionable_and_throttled(make_cfg, tmp_path):
-    fake = FakeGspreadClient(sid="OTHER")
+@pytest.mark.parametrize("n_old, cols", [(len(FIELDS_V1), len(FIELDS_V1)), (len(FIELDS_V1) + 1, 26)],
+                         ids=["v1-header-narrow-grid", "one-field-short-wide-grid"])
+def test_sheets_old_header_prefix_is_extended_in_place(tmp_path, n_old, cols):
+    """A header written by an older version (a strict prefix of FIELDS) gets the new columns appended;
+    existing rows keep their cells and read back with the new fields empty."""
+    old = list(FIELDS[:n_old])
+    rec_a, rec_b = normalize_record(sample()), normalize_record(sample("bbbbbbbb", chip="B"))
+    row_a = [encode_cell(f, rec_a[f]) for f in old]
+    row_b = [encode_cell(f, rec_b[f]) for f in old]
+    fake = FakeGspreadClient()
+    fake.spreadsheet.sheets["modules"] = FakeWorksheet("modules", cols=cols, grid=[old, row_a, row_b])
+    ws = fake.spreadsheet.sheets["modules"]
     clock = Clock()
-    st = sheets_store(make_cfg, tmp_path, fake, clock=clock)
-    with pytest.raises(StoreError, match="client_email"):
+    st = sheets_store(tmp_path, fake, clock=clock)
+    assert st.get("a7eb274c") == rec_a  # device_private_pem / mode read back empty
+    assert st.get("bbbbbbbb")["chip"] == "B" and st.get("bbbbbbbb")["mode"] == ""
+    assert ws.grid[0] == list(FIELDS)
+    assert ws.cols >= len(FIELDS)
+    assert ("resize" in ws.calls) is (cols < len(FIELDS))  # widened only when the grid is too narrow
+    assert ws.grid[1] == row_a and ws.grid[2] == row_b  # the data rows were not rewritten
+    assert "add_worksheet" not in fake.spreadsheet.calls
+    # the new columns are used from now on, in place
+    st.put(sample(mode="secure", device_private_pem=PEM))
+    assert len(ws.grid) == 3 and ws.calls[-2:] == ["acell", "update"]
+    row = dict(zip(FIELDS, ws.grid[1]))
+    assert row["mode"] == "secure" and row["device_private_pem"] == PEM and row["chip"] == "BCM2712"
+    # a later re-read (cache aged) accepts the extended header, and a fresh start reads it back
+    clock.advance(31)
+    assert {r["serial"]: r["mode"] for r in st.list()} == {"a7eb274c": "secure", "bbbbbbbb": ""}
+    st2 = sheets_store(tmp_path / "b", fake)
+    assert st2.get("a7eb274c")["device_private_pem"] == PEM and ws.grid[0] == list(FIELDS)
+
+
+def test_sheets_missing_spreadsheet_is_actionable_and_throttled(tmp_path):
+    fake = FakeGspreadClient(sid="OTHER")  # the saved id SHEETKEY no longer opens
+    clock = Clock()
+    st = sheets_store(tmp_path, fake, clock=clock)
+    with pytest.raises(StoreError, match="SHEETKEY is gone") as ei:
         st.list()
+    assert "Drive trash" in str(ei.value) and str(st.account.sheet_file) in str(ei.value)
     d = st.describe()
-    assert d["ok"] is False and "not shared" in d["detail"]
+    assert d["ok"] is False and "SHEETKEY is gone" in d["detail"]
     assert len(fake.opened) == 1  # retry throttled
     clock.advance(11)
     st.describe()
     assert len(fake.opened) == 2
+    # nothing was created in its place, and the saved id is kept for the operator to fix
+    assert st.account.spreadsheet_id() == "SHEETKEY"
 
 
-def test_sheets_cell_budget(make_cfg, tmp_path):
+def test_sheets_permission_errors_are_explained(tmp_path):
+    def detail(exc, sub):
+        class Raising(FakeGspreadClient):
+            def open_by_key(self, *a, **k):
+                bind(RealClient.open_by_key, *a, **k)
+                raise exc
+
+        st = sheets_store(tmp_path / sub, Raising())
+        d = st.describe()
+        assert d["ok"] is False
+        assert st.account.status()["error"] == d["detail"]  # the account remembers it for /api/status
+        return d["detail"]
+
+    d = detail(PermissionError(), "a")  # what gspread raises for an HTTP 403
+    assert "HTTP 403" in d and "sign in again" in d
+    d = detail(PermissionError(13, "Permission denied", str(tmp_path / "x.json")), "b")  # a local file problem
+    assert "HTTP 403" not in d and "PermissionError" in d
+
+
+def test_sheets_cell_budget(tmp_path):
     fake = FakeGspreadClient()
-    st = sheets_store(make_cfg, tmp_path, fake)
+    st = sheets_store(tmp_path, fake)
     big_events = [{"t": utc_now_iso(), "kind": "k", "note": "n" * 490} for _ in range(100)]
     st.put(sample(events=big_events))  # ~51 KB of events -> oldest dropped
     ws = fake.spreadsheet.sheets["modules"]
@@ -474,216 +572,12 @@ def test_sheets_cell_budget(make_cfg, tmp_path):
     assert st.get("a7eb274c")["events"] == json.loads(cell)
     with pytest.raises(StoreError, match="metadata"):
         st.put(sample("bbbbbbbb", metadata={"x": "y" * 46000}))
+    assert [r[0] for r in ws.grid[1:]] == ["a7eb274c"]  # nothing written for the refused record
 
 
-# ==================================================================================================
-# Google Drive: real googleapiclient Drive v3 client over a fake HTTP transport
-# ==================================================================================================
-
-httplib2 = pytest.importorskip("httplib2")
-discovery = pytest.importorskip("googleapiclient.discovery")
-
-
-class FakeDriveHttp:
-    """In-memory Drive v3 server speaking the HTTP the real client library produces."""
-
-    FOLDER = "FOLDER1"
-
-    def __init__(self, page_limit=2):
-        self.files = {self.FOLDER: {"id": self.FOLDER, "name": "otp-registry", "mimeType": "application/vnd.google-apps.folder",
-                                    "parents": [], "trashed": False, "content": b"", "modifiedTime": ""}}
-        self.page_limit = page_limit
-        self.log = []
-        self._n = 0
-
-    def _mtime(self):
-        self._n += 1
-        return f"2026-09-30T00:{self._n // 60:02d}:{self._n % 60:02d}.000Z"
-
-    def add_file(self, name, content: bytes, parent=None):
-        fid = f"id{len(self.files)}"
-        self.files[fid] = {"id": fid, "name": name, "mimeType": "application/json", "parents": [parent or self.FOLDER],
-                           "trashed": False, "content": content, "modifiedTime": self._mtime()}
-        return fid
-
-    def touch(self, fid, content: bytes):
-        self.files[fid]["content"] = content
-        self.files[fid]["modifiedTime"] = self._mtime()
-
-    @staticmethod
-    def _resp(status, obj):
-        body = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
-        return httplib2.Response({"status": str(status), "content-type": "application/json"}), body
-
-    def _err(self, status, msg):
-        return self._resp(status, {"error": {"code": status, "message": msg, "errors": [{"reason": "notFound"}]}})
-
-    @staticmethod
-    def _meta(f, fields):
-        keys = re.findall(r"[a-zA-Z]+", fields.replace("files(", "")) if fields else ["id", "name", "mimeType"]
-        return {k: f[k] for k in keys if k in f and k != "content"}
-
-    def _match(self, f, q):
-        for clause in q.split(" and "):
-            clause = clause.strip()
-            if m := re.fullmatch(r"'(.+)' in parents", clause):
-                if m.group(1) not in f["parents"]:
-                    return False
-            elif clause == "trashed = false":
-                if f["trashed"]:
-                    return False
-            elif m := re.fullmatch(r"name contains '(.+)'", clause):
-                if m.group(1) not in f["name"]:
-                    return False
-            elif m := re.fullmatch(r"name = '(.+)'", clause):
-                if f["name"] != m.group(1):
-                    return False
-            else:
-                raise AssertionError(f"unsupported query clause {clause!r}")
-        return True
-
-    def request(self, uri, method="GET", body=None, headers=None, redirections=5, connection_type=None):
-        u = urlsplit(uri)
-        qs = {k: v[0] for k, v in parse_qs(u.query).items()}
-        self.log.append((method, u.path, qs))
-        assert qs.get("supportsAllDrives") == "true", uri
-        path = u.path
-        if method == "GET" and path == "/drive/v3/files":
-            assert qs.get("includeItemsFromAllDrives") == "true"
-            hits = [f for f in self.files.values() if f["id"] != self.FOLDER and self._match(f, qs["q"])]
-            start = int(qs.get("pageToken", "0"))
-            size = min(int(qs.get("pageSize", "100")), self.page_limit)
-            page = hits[start:start + size]
-            out = {"files": [self._meta(f, qs.get("fields", "")) for f in page]}
-            if start + size < len(hits):
-                out["nextPageToken"] = str(start + size)
-            return self._resp(200, out)
-        m = re.fullmatch(r"/drive/v3/files/([^/]+)", path)
-        if method == "GET" and m:
-            f = self.files.get(m.group(1))
-            if f is None or f["trashed"]:
-                return self._err(404, "File not found")
-            if qs.get("alt") == "media":
-                return self._resp(200, f["content"])
-            return self._resp(200, self._meta(f, qs.get("fields", "")))
-        if method == "POST" and path == "/upload/drive/v3/files":
-            assert qs.get("uploadType") == "multipart"
-            ctype = headers.get("content-type") or headers.get("Content-Type")
-            raw = body if isinstance(body, bytes) else body.encode()
-            msg = email.message_from_bytes(b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + raw,
-                                           policy=email.policy.HTTP)
-            parts = list(msg.iter_parts())
-            meta = json.loads(parts[0].get_content())
-            assert parts[1].get_content_type() == "application/json"
-            content = parts[1].get_payload(decode=True)
-            fid = self.add_file(meta["name"], content, parent=meta["parents"][0])
-            assert meta.get("mimeType") == "application/json"
-            return self._resp(200, self._meta(self.files[fid], qs.get("fields", "")))
-        m = re.fullmatch(r"/upload/drive/v3/files/([^/]+)", path)
-        if method == "PATCH" and m:
-            assert qs.get("uploadType") == "media"
-            f = self.files.get(m.group(1))
-            if f is None or f["trashed"]:
-                return self._err(404, "File not found")
-            self.touch(f["id"], body if isinstance(body, bytes) else body.encode())
-            return self._resp(200, self._meta(f, qs.get("fields", "")))
-        raise AssertionError(f"unexpected request {method} {uri}")
-
-
-def drive_service(http):
-    return discovery.build("drive", "v3", http=http, static_discovery=True)
-
-
-def drive_store(make_cfg, tmp_path, http, clock=None, folder=FakeDriveHttp.FOLDER):
-    cfg = make_cfg(tmp_path, storage={"backend": "gdrive", "gdrive": {"folder_id": folder}})
-    return GoogleDriveStore(cfg, client=drive_service(http), clock=clock or Clock())
-
-
-def by_name(http, name):
-    return [f for f in http.files.values() if f["name"] == name and not f["trashed"]]
-
-
-def test_drive_round_trip(make_cfg, tmp_path):
-    http = FakeDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http)
-    assert st.get("a7eb274c") is None
-    st.put(sample())
-    files = by_name(http, "a7eb274c.json")
-    assert len(files) == 1 and files[0]["parents"] == [FakeDriveHttp.FOLDER]
-    assert json.loads(files[0]["content"])["rsa_private_pem"] == PEM
-    assert st.get("a7eb274c") == normalize_record(sample())
-    st.put(sample(stage="flashed"))
-    files = by_name(http, "a7eb274c.json")
-    assert len(files) == 1 and json.loads(files[0]["content"])["stage"] == "flashed"  # updated, not duplicated
-    for i in range(5):
-        st.put(sample(f"0000000{i}"))
-    st2 = drive_store(make_cfg, tmp_path / "b", http)  # fresh instance; listing is paginated (2 per page)
-    got = st2.list()
-    assert [r["serial"] for r in got] == ["00000000", "00000001", "00000002", "00000003", "00000004", "a7eb274c"]
-    assert got[-1]["stage"] == "flashed"
-    d = st2.describe()
-    assert d == {"backend": "gdrive", "ok": True, "location": "Google Drive folder otp-registry (FOLDER1)",
-                 "detail": "6 module record(s) cached"}
-
-
-def test_drive_cache_and_changed_files(make_cfg, tmp_path):
-    http = FakeDriveHttp(page_limit=100)
-    fid = http.add_file("a7eb274c.json", json.dumps(sample()).encode())
-    http.add_file("notes.txt.json", b"{}")  # not a serial -> ignored
-    http.add_file("bbbbbbbb.json", b"garbage")  # bad JSON -> ignored
-    http.add_file("cccccccc.json", json.dumps(sample("cccccccc")).encode(), parent="OTHER")  # other folder
-    clock = Clock()
-    st = drive_store(make_cfg, tmp_path, http, clock=clock)
-    assert [r["serial"] for r in st.list()] == ["a7eb274c"]
-    downloads = lambda: sum(1 for m, p, q in http.log if q.get("alt") == "media")  # noqa: E731
-    n0 = downloads()
-    calls0 = len(http.log)
-    for _ in range(10):
-        st.get("a7eb274c")
-        st.list()
-    assert len(http.log) == calls0  # served from cache
-    clock.advance(11)
-    st.list()
-    assert downloads() == n0  # listed again, content unchanged -> not downloaded again
-    http.touch(fid, json.dumps(sample(chip="EXTERNAL")).encode())
-    clock.advance(31)
-    assert st.get("a7eb274c")["chip"] == "EXTERNAL"
-    assert downloads() == n0 + 1
-
-
-def test_drive_recreates_deleted_file(make_cfg, tmp_path):
-    http = FakeDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http)
-    st.put(sample())
-    http.files[by_name(http, "a7eb274c.json")[0]["id"]]["trashed"] = True
-    st.put(sample(stage="gadget"))
-    files = by_name(http, "a7eb274c.json")
-    assert len(files) == 1 and json.loads(files[0]["content"])["stage"] == "gadget"
-
-
-def test_drive_folder_errors(make_cfg, tmp_path):
-    http = FakeDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http, folder="NOPE")
-    with pytest.raises(StoreError, match="client_email"):
-        st.get("a7eb274c")
-    d = st.describe()
-    assert d["ok"] is False and "not found" in d["detail"]
-    fid = http.add_file("x.json", b"{}")
-    st2 = drive_store(make_cfg, tmp_path / "2", http, folder=fid)
-    with pytest.raises(StoreError, match="not a folder"):
-        st2.list()
-
-
-# ==================================================================================================
-# review fixes: moved rows, HTTP timeout, no browser login on request threads, advice per auth mode
-# ==================================================================================================
-
-import otp_server.storage.gsheets as gsheets_mod  # noqa: E402
-
-
-def test_sheets_put_never_overwrites_a_row_that_moved(make_cfg, tmp_path):
+def test_sheets_put_never_overwrites_a_row_that_moved(tmp_path):
     fake = FakeGspreadClient()
-    st = sheets_store(make_cfg, tmp_path, fake)
+    st = sheets_store(tmp_path, fake)
     st.put(sample("aaaaaaaa", chip="A"))
     st.put(sample("bbbbbbbb", chip="B", device_secret="cd" * 32))
     ws = fake.spreadsheet.sheets["modules"]
@@ -705,354 +599,84 @@ def test_sheets_put_never_overwrites_a_row_that_moved(make_cfg, tmp_path):
     assert ws.calls[-2:] == ["acell", "update"] and ws.calls.count("get_all_values") == reads
 
 
-def test_sheets_client_gets_an_http_timeout(make_cfg, tmp_path, monkeypatch):
-    from google.auth.credentials import AnonymousCredentials
-
-    sa = tmp_path / "sa.json"
-    sa.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(gspread, "service_account", lambda **k: gspread.Client(auth=AnonymousCredentials()))
-    cfg = make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {"spreadsheet": "K", "credentials": str(sa)}})
-    gc = GoogleSheetsStore(cfg)._make_client()
-    assert gc.http_client.timeout == gsheets_mod.HTTP_TIMEOUT
-    assert all(t is not None and t > 0 for t in gsheets_mod.HTTP_TIMEOUT)
-
-
-def test_sheets_timeout_is_a_store_error_and_throttled(make_cfg, tmp_path):
+def test_sheets_timeout_is_a_store_error_and_throttled(tmp_path):
     import requests
 
     class TimingOut(FakeGspreadClient):
         def open_by_key(self, *a, **k):
+            bind(RealClient.open_by_key, *a, **k)
             self.opened.append(a)
             raise requests.exceptions.ReadTimeout("read timed out (read timeout=60)")
 
     fake = TimingOut()
-    st = sheets_store(make_cfg, tmp_path, fake)
-    with pytest.raises(StoreError, match="unreachable"):
+    clock = Clock()
+    st = sheets_store(tmp_path, fake, clock=clock)
+    with pytest.raises(StoreError, match="unreachable") as ei:
         st.list()
+    assert "ReadTimeout" in str(ei.value) and "sign in" not in str(ei.value)
     assert st.describe()["ok"] is False and len(fake.opened) == 1
-
-
-def _oauth_token(path, *, expired=True):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
-        "token": "old-access", "refresh_token": "r-token", "client_id": "cid.apps.googleusercontent.com",
-        "client_secret": "csecret", "token_uri": "https://oauth2.googleapis.com/token",
-        "expiry": "2020-01-01T00:00:00Z" if expired else "2999-01-01T00:00:00Z",
-    }), encoding="utf-8")
-    return path
-
-
-def _oauth_cfg(make_cfg, tmp_path, backend, *, token=True, expired=True):
-    client = tmp_path / "client.json"
-    client.write_text(json.dumps({"installed": {"client_id": "cid", "client_secret": "s",
-                                                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                                                "token_uri": "https://oauth2.googleapis.com/token",
-                                                "redirect_uris": ["http://localhost"]}}), encoding="utf-8")
-    tok = tmp_path / "tok" / f"{backend}-token.json"
-    if token:
-        _oauth_token(tok, expired=expired)
-    g = {"auth": "oauth", "credentials": str(client), "token": str(tok)}
-    g.update({"spreadsheet": "SHEETKEY"} if backend == "gsheets" else {"folder_id": FakeDriveHttp.FOLDER})
-    return make_cfg(tmp_path, storage={"backend": backend, backend: g})
-
-
-_BROWSER_FLOWS: list = []
-
-
-@pytest.fixture(autouse=True)
-def _never_open_a_real_browser(monkeypatch):
-    """No test may ever reach the real loopback OAuth server (it would open a browser and wait)."""
-    _BROWSER_FLOWS.clear()
-
-    def refuse(*a, **k):
-        _BROWSER_FLOWS.append(a)
-        raise AssertionError("interactive OAuth flow started outside 'login'")
-
-    monkeypatch.setattr(gspread, "oauth", refuse)
-    try:
-        from google_auth_oauthlib.flow import InstalledAppFlow
-    except ImportError:  # pragma: no cover
-        return refuse
-    monkeypatch.setattr(InstalledAppFlow, "run_local_server", refuse)
-    return refuse
-
-
-@pytest.fixture
-def no_browser(monkeypatch, _never_open_a_real_browser):
-    """Any interactive login attempt (including our own login flow) is recorded and fails."""
-    monkeypatch.setattr(gsheets_mod, "run_oauth_flow", _never_open_a_real_browser)
-    return _BROWSER_FLOWS
-
-
-@pytest.mark.parametrize("backend", ["gsheets", "gdrive"])
-def test_oauth_missing_token_asks_for_login_and_never_opens_a_browser(make_cfg, tmp_path, no_browser, backend):
-    cfg = _oauth_cfg(make_cfg, tmp_path, backend, token=False)
-    st = make_store(cfg)
-    d = st.describe()  # the /api/status poll path
-    assert d["ok"] is False and "python -m otp_server login" in d["detail"]
-    with pytest.raises(StoreError, match="otp_server login"):
-        st.list()
-    assert no_browser == []
-
-
-@pytest.mark.parametrize("backend", ["gsheets", "gdrive"])
-def test_oauth_refresh_network_error_is_retryable_store_error(make_cfg, tmp_path, no_browser, monkeypatch, backend):
-    from google.auth.exceptions import TransportError
-    from google.oauth2.credentials import Credentials
-
-    calls = []
-
-    def offline(self, request):
-        calls.append(1)
-        raise TransportError("Failed to establish a new connection")
-
-    monkeypatch.setattr(Credentials, "refresh", offline)
-    clock = Clock()
-    cfg = _oauth_cfg(make_cfg, tmp_path, backend)
-    st = GoogleSheetsStore(cfg, clock=clock) if backend == "gsheets" else GoogleDriveStore(cfg, clock=clock)
-    d = st.describe()
-    assert d["ok"] is False and "cannot reach Google" in d["detail"] and "login" not in d["detail"]
-    st.describe()
-    assert len(calls) == 1  # throttled
     clock.advance(11)
-    st.describe()
-    assert len(calls) == 2 and no_browser == []
+    assert st.describe()["ok"] is False and len(fake.opened) == 2
+    assert st.account.built == 1  # a network hiccup keeps the login / client
 
 
-@pytest.mark.parametrize("backend", ["gsheets", "gdrive"])
-def test_oauth_revoked_token_asks_for_login(make_cfg, tmp_path, no_browser, monkeypatch, backend):
-    from google.auth.exceptions import RefreshError
-    from google.oauth2.credentials import Credentials
+def test_sheets_write_failure_is_a_store_error_and_forces_a_reread(tmp_path):
+    import requests
 
-    def revoked(self, request):
-        raise RefreshError("invalid_grant: Token has been expired or revoked.")
-
-    monkeypatch.setattr(Credentials, "refresh", revoked)
-    st = make_store(_oauth_cfg(make_cfg, tmp_path, backend))
-    d = st.describe()
-    assert d["ok"] is False and "rejected" in d["detail"] and "python -m otp_server login" in d["detail"]
-    assert no_browser == []
-
-
-def test_oauth_refreshed_token_is_saved(make_cfg, tmp_path, no_browser, monkeypatch):
-    import datetime as dt
-
-    from google.oauth2.credentials import Credentials
-
-    def ok(self, request):
-        self.token = "new-access"
-        self.expiry = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) + dt.timedelta(hours=1)
-
-    monkeypatch.setattr(Credentials, "refresh", ok)
     fake = FakeGspreadClient()
-    fake.http_client = gspread.http_client.HTTPClient(auth=None, session=object())
-    got = []
-    monkeypatch.setattr(gspread, "authorize", lambda creds, **k: got.append(creds) or fake)
-    cfg = _oauth_cfg(make_cfg, tmp_path, "gsheets")
-    st = GoogleSheetsStore(cfg)
-    assert st.describe()["ok"] is True
-    assert got[0].token == "new-access" and fake.http_client.timeout == gsheets_mod.HTTP_TIMEOUT
-    assert json.loads(cfg.storage.gsheets.token.read_text(encoding="utf-8"))["token"] == "new-access"
-    assert no_browser == []
-
-
-class _FlowCreds:
-    def to_json(self):
-        return json.dumps({"token": "t", "refresh_token": "r", "client_id": "c", "client_secret": "s"})
-
-
-def test_sheets_login_oauth_runs_the_flow_with_a_timeout(make_cfg, tmp_path, monkeypatch):
-    seen = {}
-
-    def flow(client_file, scopes, *, timeout, open_browser=True):
-        seen.update(client=client_file, scopes=scopes, timeout=timeout)
-        return _FlowCreds()
-
-    monkeypatch.setattr(gsheets_mod, "run_oauth_flow", flow)
-    fake = FakeGspreadClient()
-    monkeypatch.setattr(gspread, "authorize", lambda creds, **k: fake)
-    cfg = _oauth_cfg(make_cfg, tmp_path, "gsheets", token=False)
-    st = make_store(cfg)
-    assert st.describe()["ok"] is False  # not logged in yet
-    msg = st.login(timeout=42)
-    assert seen["timeout"] == 42 and "https://www.googleapis.com/auth/spreadsheets" in seen["scopes"]
-    assert "token saved" in msg and "reachable" in msg
-    assert json.loads(cfg.storage.gsheets.token.read_text(encoding="utf-8"))["refresh_token"] == "r"
-    assert st.describe()["ok"] is True  # the throttled earlier failure does not stick
-
-
-def test_login_timeout_is_a_store_error(make_cfg, tmp_path, monkeypatch):
-    class WSGITimeoutError(AttributeError):
-        pass
-
-    def slow(*a, **k):
-        raise WSGITimeoutError("Timed out waiting for response from authorization server")
-
-    monkeypatch.setattr(gsheets_mod, "run_oauth_flow", slow)
-    st = make_store(_oauth_cfg(make_cfg, tmp_path, "gdrive", token=False))
-    with pytest.raises(StoreError, match="no answer from the browser within 5 s"):
-        st.login(timeout=5)
-
-
-def test_run_oauth_flow_passes_a_timeout(monkeypatch, tmp_path):
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    seen = {}
-
-    class Flow:
-        def run_local_server(self, **k):
-            seen.update(k)
-            return _FlowCreds()
-
-    monkeypatch.setattr(InstalledAppFlow, "from_client_secrets_file", classmethod(lambda cls, f, s: Flow()))
-    gsheets_mod.run_oauth_flow(tmp_path / "c.json", ["s"], timeout=30, open_browser=False)
-    assert seen["timeout_seconds"] == 30 and seen["port"] == 0 and seen["open_browser"] is False
-
-
-def test_sheets_login_service_account_checks_access(make_cfg, tmp_path):
-    sa = tmp_path / "sa.json"
-    sa.write_text(json.dumps({"client_email": "otp@proj.iam.gserviceaccount.com"}), encoding="utf-8")
-    fake = FakeGspreadClient(sid="OTHER")
-    cfg = make_cfg(tmp_path, storage={"backend": "gsheets", "gsheets": {"spreadsheet": "SHEETKEY", "credentials": str(sa)}})
-    st = GoogleSheetsStore(cfg, client=fake)
-    with pytest.raises(StoreError, match="client_email"):
-        st.login()
-    fake.spreadsheet.id = "SHEETKEY"
-    msg = st.login()  # no 10 s retry throttle for an explicit login
-    assert msg.startswith("service account otp@proj.iam.gserviceaccount.com") and "reachable" in msg
-
-
-def test_sheets_explain_per_auth_mode(make_cfg, tmp_path):
-    from google.auth.exceptions import RefreshError
-
-    def detail(exc, auth, sub):
-        class Raising(FakeGspreadClient):
-            def open_by_key(self, *a, **k):
-                raise exc
-
-        st = sheets_store(make_cfg, tmp_path / sub, Raising(), auth=auth, token=str(tmp_path / "tok.json"))
-        return st.describe()["detail"]
-
-    d = detail(RefreshError("invalid_grant: Invalid JWT Signature."), "service_account", "a")
-    assert "service-account key" in d and "new JSON key" in d and "tok.json" not in d and "login" not in d
-    d = detail(RefreshError("invalid_grant: Token has been expired or revoked."), "oauth", "b")
-    assert "OAuth token" in d and "python -m otp_server login" in d
-    d = detail(PermissionError(13, "Permission denied", str(tmp_path / "tok.json")), "oauth", "c")
-    assert "file-system" in d and "share" not in d
-    d = detail(PermissionError(), "service_account", "d")  # gspread's HTTP 403
-    assert "share it with the service account's client_email" in d
-    d = detail(PermissionError(), "oauth", "e")
-    assert "logged in with" in d and "client_email" not in d
-
-
-class QuotaDriveHttp(FakeDriveHttp):
-    """A folder in a user's My Drive: a service account may read it but every create is refused."""
-
-    def request(self, uri, method="GET", body=None, headers=None, redirections=5, connection_type=None):
-        if method == "POST" and urlsplit(uri).path == "/upload/drive/v3/files":
-            msg = ("Service Accounts do not have storage quota. Leverage shared drives "
-                   "(https://developers.google.com/workspace/drive/api/guides/about-shareddrives), "
-                   "or use OAuth delegation instead.")
-            return self._resp(403, {"error": {"code": 403, "message": msg, "errors": [
-                {"message": msg, "domain": "usageLimits", "reason": "storageQuotaExceeded"}]}})
-        return super().request(uri, method, body, headers, redirections, connection_type)
-
-
-def test_drive_service_account_in_my_drive_explains_storage_quota(make_cfg, tmp_path, caplog):
-    http = QuotaDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http)
-    with caplog.at_level("WARNING", logger="otp_server.storage.gdrive"):
-        assert st.get("a7eb274c") is None  # reading works
-    assert "My Drive" in caplog.text
-    with pytest.raises(StoreError) as ei:
-        st.put(sample())
-    msg = str(ei.value)
-    assert "storage quota" in msg and "Shared Drive" in msg and "oauth" in msg
-    assert "share the folder with the account as Editor" not in msg
-
-
-def test_drive_storage_full_with_oauth(make_cfg, tmp_path):
-    http = QuotaDriveHttp()
-    cfg = make_cfg(tmp_path, storage={"backend": "gdrive", "gdrive": {
-        "folder_id": FakeDriveHttp.FOLDER, "auth": "oauth", "token": str(tmp_path / "t.json")}})
-    st = GoogleDriveStore(cfg, client=drive_service(http), clock=Clock())
-    with pytest.raises(StoreError, match="storage of the logged-in account is full"):
-        st.put(sample())
-
-
-def test_drive_login_service_account_warns_outside_shared_drive(make_cfg, tmp_path):
-    http = FakeDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http)
-    msg = st.login()
-    assert "reachable" in msg and "not in a Shared Drive" in msg
-    http.files[FakeDriveHttp.FOLDER]["driveId"] = "0AShared"
-    msg = drive_store(make_cfg, tmp_path / "b", http).login()
-    assert "reachable" in msg and "WARNING" not in msg
-
-
-def test_drive_login_oauth(make_cfg, tmp_path, monkeypatch):
-    http = FakeDriveHttp()
-    monkeypatch.setattr(gsheets_mod, "run_oauth_flow", lambda *a, **k: _FlowCreds())
-    monkeypatch.setattr(GoogleDriveStore, "_build", staticmethod(lambda creds: drive_service(http)))
-    cfg = _oauth_cfg(make_cfg, tmp_path, "gdrive", token=False)
-    st = make_store(cfg)
-    msg = st.login()
-    assert "token saved" in msg and "otp-registry" in msg and "WARNING" not in msg
-    assert cfg.storage.gdrive.token.is_file()
+    st = sheets_store(tmp_path, fake)
     st.put(sample())
-    assert by_name(http, "a7eb274c.json")
+    ws = fake.spreadsheet.sheets["modules"]
+
+    def offline(*a, **k):
+        raise requests.exceptions.ConnectionError("connection reset")
+
+    ws.update = offline
+    with pytest.raises(StoreError, match="unreachable"):
+        st.put(sample(stage="gadget"))
+    del ws.update  # back online
+    reads = ws.calls.count("get_all_values")
+    st.put(sample(stage="flashed"))
+    assert ws.calls.count("get_all_values") == reads + 1  # the cache was invalidated by the failure
+    assert len(ws.grid) == 2 and ws.grid[1][FIELDS.index("stage")] == "flashed"
 
 
-def test_sheets_login_during_run_takes_effect_without_restart(make_cfg, tmp_path, no_browser, monkeypatch):
-    """A token revoked mid-run: after 'python -m otp_server login' the running store rebuilds its own
-    client on the next connect (it must not keep the rejected one until a server restart)."""
+def test_sheets_not_signed_in_asks_for_login_without_a_browser(tmp_path):
+    account = GoogleAccount(tmp_path / "repo", tmp_path / "work")  # no token, no test client
+    st = make_store(account)
+    d = st.describe()  # the /api/status poll path
+    assert d["ok"] is False and "not signed in" in d["detail"] and "sign in" in d["detail"]
+    with pytest.raises(StoreError, match="not signed in"):
+        st.list()
+    with pytest.raises(StoreError, match="not signed in"):
+        st.put(sample())
+
+
+def test_sheets_auth_failure_drops_the_connection_and_a_new_login_takes_effect(tmp_path):
+    """A token revoked mid-run: the store explains it, the account forgets its client, and the next call
+    after the operator signs in again reconnects by itself (no server restart)."""
     from google.auth.exceptions import RefreshError
 
     clock = Clock()
-    st = GoogleSheetsStore(_oauth_cfg(make_cfg, tmp_path, "gsheets", expired=False), clock=clock)
-    good = FakeGspreadClient()
-    built = []
-
-    def make_client():
-        built.append(1)
-        return good if len(built) != 1 else first
-
-    first = FakeGspreadClient()
-    monkeypatch.setattr(st, "_make_client", make_client)
-    st.put(normalize_record({"serial": "a7eb274c", "stage": "new", "created": "x", "updated": "x"}))
-    assert len(built) == 1
+    first, good = FakeGspreadClient(), FakeGspreadClient()
+    account = FakeAccount(tmp_path, first, good)
+    st = GoogleSheetsStore(account, clock=clock)
+    st.put(sample())
+    assert account.built == 1
 
     # the token gets revoked: every Sheets call of the first client now fails with a non-retryable RefreshError
     def revoked(*a, **k):
         raise RefreshError("invalid_grant: Token has been expired or revoked.")
-    for ws in first.spreadsheet.sheets.values():
-        ws.get_all_values = revoked
+
+    first.spreadsheet.sheets["modules"].get_all_values = revoked
     clock.advance(31)
-    with pytest.raises(StoreError, match="otp_server login"):
+    with pytest.raises(StoreError, match="rejected the saved login") as ei:
         st.list()
+    assert "sign in again" in str(ei.value)
+    assert "rejected" in account.status()["error"]
 
-    # the operator logs in (new token on disk); after the retry throttle the store reconnects by itself
-    good.spreadsheet.sheets = first.spreadsheet.sheets.copy()
+    # signed in again: the next call reconnects with a fresh client, without waiting for the retry throttle
     good.spreadsheet.sheets["modules"] = FakeWorksheet("modules", grid=[list(FIELDS)])
-    clock.advance(11)
-    assert st.list() == [] and len(built) == 2
-    assert no_browser == []
-
-
-def test_drive_auth_failure_drops_the_service(make_cfg, tmp_path):
-    """A 401 from Drive forgets an own service (rebuilt on the next connect); an injected one is kept."""
-    http = FakeDriveHttp()
-    st = drive_store(make_cfg, tmp_path, http)
-    st._connected = True
-
-    class Unauthorized(Exception):
-        def __init__(self):
-            super().__init__("401 Unauthorized")
-            self.resp = type("R", (), {"status": 401})()
-
-    st._explain(Unauthorized())
-    assert st._connected is False and st._svc is not None   # injected client is not dropped
-    st._own_client = True
-    st._connected = True
-    st._explain(Unauthorized())
-    assert st._connected is False and st._svc is None
+    assert st.list() == [] and account.built == 2
+    st.put(sample("bbbbbbbb"))
+    assert good.spreadsheet.sheets["modules"].grid[1][0] == "bbbbbbbb"

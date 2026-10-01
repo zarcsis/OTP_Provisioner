@@ -99,6 +99,9 @@ RUN /native/bin/zstd --version && /native/bin/cpio --version | head -n1
 
 COPY gadget-entrypoint.sh /usr/local/bin/gadget-entrypoint
 RUN sed -i 's/\r$//' /usr/local/bin/gadget-entrypoint && chmod 0755 /usr/local/bin/gadget-entrypoint
+# Our pi-gen-micro helper packages (otp-keyexport): the entrypoint adds them to the fastboot
+# configuration of the staged pi-gen-micro tree, the submodule itself is never touched.
+COPY gadget-helpers /opt/otp-gadget-helpers
 
 VOLUME ["/work"]
 WORKDIR /work

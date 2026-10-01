@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from memstore import MemoryStore
 
 import otp_server.__main__ as cli
+import otp_server.app as app_mod
 from otp_server import __version__, winusb
 from otp_server.app import Services
+from otp_server.google_account import GoogleAccount
 from otp_server.jobs import JobManager
 from otp_server.modules import ModuleService
-from otp_server.storage.local import LocalJsonStore
+from otp_server.storage.base import StoreError
 
 REPO = Path(__file__).resolve().parent.parent
+OTP_ENV = ("OTP_CONFIG", "OTP_WORK_DIR", "OTP_STORAGE", "OTP_PORT")
+NO_CLIENT = "no Google OAuth client"
+SIGN_IN_FIRST = "sign in to Google first"
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -25,19 +34,25 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 @pytest.mark.parametrize("argv, expect", [
-    ([], {"command": "serve", "config": None, "host": None, "port": None, "no_browser": False, "no_auto_build": False}),
-    (["serve"], {"command": "serve", "config": None}),
+    ([], {"command": "serve", "work": None, "host": None, "port": None, "browser": None, "no_browser": False,
+          "no_auto_build": False}),
+    (["serve"], {"command": "serve", "work": None}),
     (["--no-browser", "--no-auto-build"], {"command": "serve", "no_browser": True, "no_auto_build": True}),
-    (["--config", "c.yaml", "--host", "0.0.0.0", "--port", "8799"],
-     {"command": "serve", "config": "c.yaml", "host": "0.0.0.0", "port": 8799}),
-    (["--config=c.yaml", "--port", "1"], {"command": "serve", "config": "c.yaml", "port": 1}),
-    (["serve", "--config", "c.yaml", "--port", "9"], {"command": "serve", "config": "c.yaml", "port": 9}),
-    (["build", "gadget"], {"command": "build", "target": "gadget", "force": False, "config": None}),
-    (["build", "image", "--force", "--config", "x"], {"command": "build", "target": "image", "force": True, "config": "x"}),
-    (["--config", "x", "build", "tools"], {"command": "build", "target": "tools", "config": "x"}),
-    (["modules"], {"command": "modules", "json": False}),
+    (["--host", "0.0.0.0", "--port", "8799"], {"command": "serve", "host": "0.0.0.0", "port": 8799}),
+    (["--browser", "D:/portable/chrome.exe"], {"command": "serve", "browser": "D:/portable/chrome.exe"}),
+    (["--work", "w"], {"command": "serve", "work": "w"}),
+    (["--work", "w", "--port", "1"], {"command": "serve", "work": "w", "port": 1}),
+    (["--work=w", "--port", "1"], {"command": "serve", "work": "w", "port": 1}),
+    (["serve", "--work", "w", "--port", "9"], {"command": "serve", "work": "w", "port": 9}),
+    (["--port", "9", "--work", "w"], {"command": "serve", "work": "w", "port": 9}),
+    (["build", "gadget"], {"command": "build", "target": "gadget", "force": False, "work": None}),
+    (["build", "image", "--force", "--work", "x"], {"command": "build", "target": "image", "force": True, "work": "x"}),
+    (["--work", "x", "build", "tools"], {"command": "build", "target": "tools", "work": "x"}),
+    (["modules"], {"command": "modules", "json": False, "work": None}),
     (["modules", "--json"], {"command": "modules", "json": True}),
-    (["--config", "y", "status"], {"command": "status", "config": "y"}),
+    (["--work", "y", "status"], {"command": "status", "work": "y"}),
+    (["status", "--work", "y"], {"command": "status", "work": "y"}),
+    (["login"], {"command": "login", "work": None}),
 ])
 def test_parse_args(argv, expect):
     ns = cli.parse_args(argv)
@@ -46,31 +61,59 @@ def test_parse_args(argv, expect):
 
 
 @pytest.mark.parametrize("argv", [["build"], ["build", "firmware"], ["modules", "--xml"], ["--port", "abc"],
-                                  ["frobnicate"]])
+                                  ["frobnicate"], ["--work"],
+                                  # there is no config file any more
+                                  ["--config", "c.yaml"], ["status", "--config", "c.yaml"],
+                                  # serve flags belong to serve
+                                  ["status", "--port", "1"], ["build", "tools", "--browser", "x.exe"]])
 def test_parse_args_errors(argv, capsys):
     with pytest.raises(SystemExit) as ei:
         cli.parse_args(argv)
     assert ei.value.code == 2
 
 
-def test_overrides_from_flags():
+def test_overrides_from_flags(tmp_path):
     ns = cli.parse_args(["--host", "::1", "--port", "9000", "--no-browser", "--no-auto-build"])
     assert cli._overrides(ns) == {"server": {"host": "::1", "port": 9000, "open_browser": False},
                                   "builds": {"auto": False}}
+    ns = cli.parse_args(["--work", str(tmp_path / "w"), "--browser", str(tmp_path / "x" / "chrome.exe")])
+    assert cli._overrides(ns) == {"server": {"browser": str((tmp_path / "x" / "chrome.exe").resolve())},
+                                  "paths": {"work": str((tmp_path / "w").resolve())}}
     assert cli._overrides(cli.parse_args([])) == {}
     assert cli._overrides(cli.parse_args(["status"])) == {}
 
 
-def test_flags_reach_config(make_cfg, tmp_path, monkeypatch):
-    for n in ("OTP_CONFIG", "OTP_WORK_DIR", "OTP_STORAGE", "OTP_PORT"):
+def test_flags_reach_config(tmp_path, monkeypatch):
+    for n in OTP_ENV:
         monkeypatch.delenv(n, raising=False)
-    cfg_file = tmp_path / "c.yaml"
-    cfg_file.write_text(f"paths: {{work: '{(tmp_path / 'w').as_posix()}'}}\nserver: {{port: 8111}}\n", encoding="utf-8")
-    cfg = cli._load(cli.parse_args(["--config", str(cfg_file), "--port", "8799", "--no-browser", "--no-auto-build"]))
+    exe = tmp_path / "Chromium" / "chrome.exe"
+    ns = cli.parse_args(["--work", str(tmp_path / "w"), "--port", "8799", "--no-browser", "--no-auto-build",
+                         "--browser", str(exe)])
+    cfg = cli._load(ns)
     assert cfg.server.port == 8799 and cfg.server.open_browser is False and cfg.builds.auto is False
-    assert cfg.work_dir == tmp_path / "w"
-    cfg = cli._load(cli.parse_args(["--config", str(cfg_file)]))
-    assert cfg.server.port == 8111 and cfg.server.open_browser is True
+    assert cfg.work_dir == (tmp_path / "w").resolve()
+    assert cfg.server.browser == exe
+    # the flags are kept as the bootstrap layer that stays on top of the sheet settings
+    assert cfg.bootstrap == cli._overrides(ns) and cfg.bootstrap["paths"] == {"work": str((tmp_path / "w").resolve())}
+    # --work after the command
+    cfg = cli._load(cli.parse_args(["status", "--work", str(tmp_path / "w2")]))
+    assert cfg.work_dir == (tmp_path / "w2").resolve()
+    assert cfg.server.port == 8765 and cfg.server.open_browser is True and cfg.server.browser is None
+    assert cfg.bootstrap == {"paths": {"work": str((tmp_path / "w2").resolve())}}
+    # the environment, then the flags on top of it
+    monkeypatch.setenv("OTP_WORK_DIR", str(tmp_path / "envwork"))
+    monkeypatch.setenv("OTP_PORT", "8800")
+    cfg = cli._load(cli.parse_args(["status"]))
+    assert cfg.work_dir == (tmp_path / "envwork").resolve() and cfg.server.port == 8800 and cfg.bootstrap == {}
+    cfg = cli._load(cli.parse_args(["--work", str(tmp_path / "w3"), "--port", "8801"]))
+    assert cfg.work_dir == (tmp_path / "w3").resolve() and cfg.server.port == 8801
+    # a relative --work / --browser is relative to the current directory, not to the repository
+    monkeypatch.delenv("OTP_WORK_DIR")
+    monkeypatch.chdir(tmp_path)
+    cfg = cli._load(cli.parse_args(["modules", "--work", "rel"]))
+    assert cfg.work_dir == (tmp_path / "rel").resolve()
+    cfg = cli._load(cli.parse_args(["--browser", "bin/chrome.exe"]))
+    assert cfg.server.browser == (tmp_path / "bin" / "chrome.exe").resolve()
 
 
 @pytest.mark.parametrize("host, url", [("127.0.0.1", "http://127.0.0.1:8765/"), ("0.0.0.0", "http://127.0.0.1:8765/"),
@@ -80,17 +123,19 @@ def test_page_url(host, url):
     assert cli.page_url(host, 8765) == url
 
 
-def test_main_missing_config_is_exit_2(tmp_path, capsys):
-    rc = cli.main(["status", "--config", str(tmp_path / "missing.yaml")])
-    assert rc == 2
-    assert "config file not found" in capsys.readouterr().err
-
-
-def test_main_invalid_config_is_exit_2(tmp_path, capsys):
-    p = tmp_path / "bad.yaml"
-    p.write_text("storage: {backend: floppy}\n", encoding="utf-8")
-    assert cli.main(["modules", "--config", str(p)]) == 2
-    assert "storage.backend" in capsys.readouterr().err
+def test_main_bad_values_are_exit_2(tmp_path, monkeypatch, capsys):
+    """An invalid flag / environment value is a user error: exit 2 with the reason, no traceback."""
+    for n in OTP_ENV:
+        monkeypatch.delenv(n, raising=False)
+    monkeypatch.setattr(cli, "cmd_serve", lambda ns, cfg: pytest.fail("must not get as far as serving"))
+    monkeypatch.setattr(cli, "cmd_status", lambda ns, cfg: pytest.fail("must not get as far as the status"))
+    monkeypatch.setenv("OTP_PORT", "eighty")
+    assert cli.main(["status", "--work", str(tmp_path / "w")]) == 2
+    err = capsys.readouterr().err
+    assert "ERROR:" in err and "OTP_PORT" in err and "Traceback" not in err
+    monkeypatch.delenv("OTP_PORT")
+    assert cli.main(["--port", "70000", "--work", str(tmp_path / "w")]) == 2
+    assert "server.port" in capsys.readouterr().err
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -99,6 +144,9 @@ def test_main_invalid_config_is_exit_2(tmp_path, capsys):
 
 
 class _FakeDocker:
+    def __init__(self, cfg=None):
+        pass
+
     def status(self, max_age=5.0):
         return {"ok": False, "version": "", "detail": "docker down", "arm64": None}
 
@@ -106,6 +154,7 @@ class _FakeDocker:
 class _FakeArtifacts:
     def __init__(self, jobs, fn):
         self.jobs, self.fn, self.calls = jobs, fn, []
+        self.auto_calls = 0
 
     def status(self):
         return {t: {"target": t, "ready": False, "source": None, "version": "", "path": "", "size": None,
@@ -115,14 +164,20 @@ class _FakeArtifacts:
         self.calls.append((target, force))
         return self.jobs.submit(target, f"Build {target}", self.fn)
 
+    def auto_build(self):
+        self.auto_calls += 1
+        return []
+
 
 @pytest.fixture
 def services(make_cfg, tmp_path, monkeypatch):
+    """The real ``_services`` over injected services without a Google account (nothing gated)."""
     cfg = make_cfg(tmp_path)
-    store = LocalJsonStore(cfg.storage.local_dir)
+    store = MemoryStore()
     jobs = JobManager(cfg.work_dir)
     svc = Services(cfg=cfg, store=store, modules=ModuleService(cfg, store), docker=_FakeDocker(), jobs=jobs)
-    monkeypatch.setattr(cli, "_services", lambda c: svc)
+    assert svc.account is None
+    monkeypatch.setattr(app_mod, "create_services", lambda c, **kw: svc)
     monkeypatch.setattr(cli, "_load", lambda ns: cfg)
     # never talk to a real OTP_Provisioner that may be running on this machine's default port
     monkeypatch.setattr(cli, "_existing_server", lambda url: None)
@@ -135,6 +190,8 @@ def test_cmd_status(services, capsys, monkeypatch):
     assert cli.main(["status"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["version"] == __version__
+    assert out["google"] is None and out["google_ready"] is True and out["settings"]["ok"] is True
+    assert out["storage"]["backend"] == "memory"
     assert out["docker"]["detail"] == "docker down"
     assert set(out["artifacts"]) == {"tools", "gadget", "image"}
     assert out["usb_driver"] is None and out["jobs"] == []
@@ -210,10 +267,26 @@ def test_serve_port_in_use_by_our_server_opens_browser(make_cfg, tmp_path, monke
     monkeypatch.setattr(cli, "_load", lambda ns: cfg)
     monkeypatch.setattr(cli, "_port_in_use", lambda h, p: True)
     monkeypatch.setattr(cli, "_existing_server", lambda url: "0.2.0")
-    monkeypatch.setattr(cli, "open_browser", lambda url: opened.append(url) or "test")
+    monkeypatch.setattr(cli, "open_browser", lambda url, configured=None: opened.append((url, configured)) or "test")
     assert cli.main([]) == 0
-    assert opened == ["http://127.0.0.1:8799/"]
+    assert opened == [("http://127.0.0.1:8799/", None)]
     assert "already running at http://127.0.0.1:8799/" in capsys.readouterr().out
+
+
+def test_serve_browser_flag_reaches_open_browser(tmp_path, monkeypatch, capsys):
+    """``--browser`` (and ``--work``/``--port``) through the real ``_load`` into ``open_browser``."""
+    for n in OTP_ENV:
+        monkeypatch.delenv(n, raising=False)
+    exe = tmp_path / "Portable Chrome" / "chrome.exe"
+    opened = []
+    monkeypatch.setattr(cli, "_port_in_use", lambda h, p: True)
+    monkeypatch.setattr(cli, "_existing_server", lambda url: "0.2.0")
+    monkeypatch.setattr(cli, "open_browser", lambda url, configured=None: opened.append((url, configured)) or "test")
+    assert cli.main(["--work", str(tmp_path / "w"), "--port", "8799", "--browser", str(exe)]) == 0
+    assert opened == [("http://127.0.0.1:8799/", exe)]
+    assert cli.main(["serve", "--work", str(tmp_path / "w"), "--port", "8799", "--no-browser"]) == 0
+    assert len(opened) == 1  # --no-browser: nothing opened
+    assert "already running" in capsys.readouterr().out
 
 
 def test_serve_port_in_use_by_someone_else(make_cfg, tmp_path, monkeypatch, capsys):
@@ -257,45 +330,97 @@ def test_quiet_polls_filter():
 # ----------------------------------------------------------------------------------------------------
 
 
-def test_find_browser_windows_program_files(tmp_path, monkeypatch):
-    chrome = tmp_path / "PF" / "Google" / "Chrome" / "Application" / "chrome.exe"
-    chrome.parent.mkdir(parents=True)
-    chrome.write_bytes(b"")
+def _touch(p: Path) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"")
+    return p
+
+
+@pytest.fixture
+def fake_windows(tmp_path, monkeypatch):
+    """``sys.platform == "win32"`` with Program Files / LOCALAPPDATA pointing at empty dirs under tmp_path,
+    and a ``winreg`` that fails the test on any use."""
+
+    class NoRegistry:
+        def __getattr__(self, name):
+            raise AssertionError(f"the Windows registry must not be read (winreg.{name})")
+
     monkeypatch.setattr(cli.sys, "platform", "win32")
-    monkeypatch.setattr(cli, "_win_app_path", lambda exe: None)
+    monkeypatch.setitem(sys.modules, "winreg", NoRegistry())
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "PF"))
     monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "PF86"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LA"))
-    assert cli.find_browser() == ("chrome", str(chrome))
-    chrome.unlink()
-    edge = tmp_path / "PF86" / "Microsoft" / "Edge" / "Application" / "msedge.exe"
-    edge.parent.mkdir(parents=True)
-    edge.write_bytes(b"")
-    assert cli.find_browser() == ("msedge", str(edge))
-    edge.unlink()
+    return SimpleNamespace(
+        chrome_pf=tmp_path / "PF" / "Google" / "Chrome" / "Application" / "chrome.exe",
+        chrome_pf86=tmp_path / "PF86" / "Google" / "Chrome" / "Application" / "chrome.exe",
+        chrome_local=tmp_path / "LA" / "Google" / "Chrome" / "Application" / "chrome.exe",
+        edge_pf86=tmp_path / "PF86" / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        edge_pf=tmp_path / "PF" / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+    )
+
+
+def test_find_browser_windows_program_files(fake_windows):
+    w = fake_windows
+    assert cli.find_browser() is None  # nothing installed, and no registry fallback
+    for p in (w.edge_pf, w.edge_pf86, w.chrome_local, w.chrome_pf86, w.chrome_pf):
+        _touch(p)
+    # Chrome first (Program Files, Program Files (x86), per-user install), then Edge
+    for p, name in ((w.chrome_pf, "chrome"), (w.chrome_pf86, "chrome"), (w.chrome_local, "chrome"),
+                    (w.edge_pf86, "msedge"), (w.edge_pf, "msedge")):
+        assert cli.find_browser() == (name, str(p))
+        p.unlink()
     assert cli.find_browser() is None
 
 
-def test_find_browser_windows_app_paths_first(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli.sys, "platform", "win32")
-    monkeypatch.setattr(cli, "_win_app_path", lambda exe: r"D:\chrome\chrome.exe" if exe == "chrome.exe" else None)
-    assert cli.find_browser() == ("chrome", r"D:\chrome\chrome.exe")
+def test_find_browser_never_reads_the_registry():
+    assert not hasattr(cli, "_win_app_path")
+    assert "winreg" not in vars(cli)
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert not imported & {"winreg", "_winreg"}
 
 
-def test_find_browser_linux(monkeypatch):
+def test_find_browser_configured_wins(tmp_path, fake_windows):
+    _touch(fake_windows.chrome_pf)
+    portable = _touch(tmp_path / "Portable" / "Chromium.exe")
+    assert cli.find_browser(portable) == ("chromium", str(portable))
+    assert cli.find_browser(str(portable)) == ("chromium", str(portable))
+    assert cli.find_browser(None) == ("chrome", str(fake_windows.chrome_pf))
+
+
+def test_find_browser_missing_configured_falls_back(tmp_path, fake_windows, caplog):
+    _touch(fake_windows.edge_pf86)
+    missing = tmp_path / "gone" / "chrome.exe"
+    with caplog.at_level(logging.WARNING, logger="otp_server"):
+        assert cli.find_browser(missing) == ("msedge", str(fake_windows.edge_pf86))
+    assert any(r.levelno == logging.WARNING and str(missing) in r.getMessage() for r in caplog.records)
+    # a directory is not an executable either
+    assert cli.find_browser(tmp_path) == ("msedge", str(fake_windows.edge_pf86))
+
+
+def test_find_browser_linux(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.sys, "platform", "linux")
     monkeypatch.setattr(cli.shutil, "which", lambda n: "/usr/bin/chromium" if n == "chromium" else None)
     assert cli.find_browser() == ("chromium", "/usr/bin/chromium")
+    configured = _touch(tmp_path / "bin" / "google-chrome-beta")
+    assert cli.find_browser(configured) == ("google-chrome-beta", str(configured))
     monkeypatch.setattr(cli.shutil, "which", lambda n: None)
     assert cli.find_browser() is None
 
 
 def test_open_browser_falls_back_to_default(monkeypatch):
-    opened = []
-    monkeypatch.setattr(cli, "find_browser", lambda: None)
+    opened, seen = [], []
+    monkeypatch.setattr(cli, "find_browser", lambda configured=None: seen.append(configured))
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
     assert "default browser" in cli.open_browser("http://127.0.0.1:1/")
-    assert opened == ["http://127.0.0.1:1/"]
+    assert "default browser" in cli.open_browser("http://127.0.0.1:1/", Path("X:/nope/chrome.exe"))
+    assert opened == ["http://127.0.0.1:1/"] * 2
+    assert seen == [None, Path("X:/nope/chrome.exe")]  # the configured browser is handed to find_browser
 
 
 def test_open_browser_windows_launches_exe(monkeypatch):
@@ -306,10 +431,64 @@ def test_open_browser_windows_launches_exe(monkeypatch):
             launched.append(argv)
 
     monkeypatch.setattr(cli.sys, "platform", "win32")
-    monkeypatch.setattr(cli, "find_browser", lambda: ("chrome", r"C:\c\chrome.exe"))
+    monkeypatch.setattr(cli, "find_browser", lambda configured=None: ("chrome", r"C:\c\chrome.exe"))
     monkeypatch.setattr(cli.subprocess, "Popen", P)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: pytest.fail("the found browser must be used"))
     assert cli.open_browser("http://127.0.0.1:2/").startswith("chrome")
     assert launched == [[r"C:\c\chrome.exe", "http://127.0.0.1:2/"]]
+
+
+def test_open_browser_windows_configured_exe(tmp_path, fake_windows, monkeypatch):
+    launched = []
+
+    class P:
+        def __init__(self, argv, **kw):
+            launched.append(argv)
+
+    _touch(fake_windows.chrome_pf)
+    portable = _touch(tmp_path / "Portable" / "chrome.exe")
+    monkeypatch.setattr(cli.subprocess, "Popen", P)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: pytest.fail("the configured browser must be used"))
+    assert cli.open_browser("http://127.0.0.1:3/", portable) == f"chrome ({portable})"
+    assert launched == [[str(portable), "http://127.0.0.1:3/"]]
+
+
+def test_open_browser_windows_start_failure_falls_back(monkeypatch):
+    opened = []
+
+    def boom(argv, **kw):
+        raise OSError("access denied")
+
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli, "find_browser", lambda configured=None: ("chrome", r"C:\c\chrome.exe"))
+    monkeypatch.setattr(cli.subprocess, "Popen", boom)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
+    assert "default browser" in cli.open_browser("http://127.0.0.1:4/")
+    assert opened == ["http://127.0.0.1:4/"]
+
+
+def test_open_browser_posix_uses_the_found_browser(monkeypatch):
+    started, opened = [], []
+
+    class Controller:
+        ok = True
+
+        def __init__(self, exe):
+            self.exe = exe
+
+        def open(self, url):
+            started.append((self.exe, url))
+            return Controller.ok
+
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli, "find_browser", lambda configured=None: ("chromium", "/usr/bin/chromium"))
+    monkeypatch.setattr(cli.webbrowser, "BackgroundBrowser", Controller)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
+    assert cli.open_browser("http://127.0.0.1:5/") == "chromium (/usr/bin/chromium)"
+    assert started == [("/usr/bin/chromium", "http://127.0.0.1:5/")] and opened == []
+    Controller.ok = False  # the browser did not start: the default one is used
+    assert "default browser" in cli.open_browser("http://127.0.0.1:5/")
+    assert opened == ["http://127.0.0.1:5/"]
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -325,8 +504,9 @@ def _run(args, **kw):
 def test_server_py_help():
     cp = _run(["server.py", "--help"])
     assert cp.returncode == 0, cp.stderr
-    for flag in ("--config", "--host", "--port", "--no-browser", "--no-auto-build"):
+    for flag in ("--work", "--host", "--port", "--browser", "--no-browser", "--no-auto-build"):
         assert flag in cp.stdout
+    assert "--config" not in cp.stdout
     assert "python server.py" in cp.stdout
 
 
@@ -461,12 +641,13 @@ def test_winusb_real_driver_store_does_not_raise():
 @pytest.mark.parametrize("argv, expect", [
     (["modules", "mark-locked", "a7eb274c"], {"command": "modules", "modules_action": "mark-locked",
                                               "serial": "a7eb274c", "yes": False}),
-    (["--config", "x", "modules", "mark-unlocked", "A7EB274C", "--yes"],
-     {"command": "modules", "modules_action": "mark-unlocked", "serial": "A7EB274C", "yes": True, "config": "x"}),
-    (["modules", "mark-locked", "a7eb274c", "--config", "y"], {"modules_action": "mark-locked", "config": "y"}),
+    (["--work", "x", "modules", "mark-unlocked", "A7EB274C", "--yes"],
+     {"command": "modules", "modules_action": "mark-unlocked", "serial": "A7EB274C", "yes": True, "work": "x"}),
+    (["modules", "mark-locked", "a7eb274c", "--work", "y"], {"modules_action": "mark-locked", "work": "y"}),
     (["modules", "--json"], {"modules_action": None, "json": True}),
-    (["login"], {"command": "login", "config": None}),
-    (["login", "--config", "z"], {"command": "login", "config": "z"}),
+    (["login"], {"command": "login", "work": None}),
+    (["login", "--work", "z"], {"command": "login", "work": "z"}),
+    (["--work", "z", "login"], {"command": "login", "work": "z"}),
 ])
 def test_parse_args_new_commands(argv, expect):
     ns = cli.parse_args(argv)
@@ -526,56 +707,229 @@ def test_cmd_mark_errors(services, capsys):
     assert "spreadsheet not shared" in capsys.readouterr().err
 
 
-def _login_cfg(monkeypatch, backend):
-    from types import SimpleNamespace
-
-    cfg = SimpleNamespace(storage=SimpleNamespace(backend=backend))
-    monkeypatch.setattr(cli, "_load", lambda ns: cfg)
-    return cfg
+# ----------------------------------------------------------------------------------------------------
+# Google: the real _load / _services / GoogleAccount wiring (fake repo root; no network, no browser)
+# ----------------------------------------------------------------------------------------------------
 
 
-def test_cmd_login_local_needs_none(monkeypatch, capsys):
-    _login_cfg(monkeypatch, "local")
-    monkeypatch.setattr(cli, "_make_store", lambda cfg: pytest.fail("no store for the local backend"))
-    assert cli.main(["login"]) == 0
-    assert "backend local needs no login" in capsys.readouterr().out
+@pytest.fixture
+def gcli(tmp_path, monkeypatch):
+    """The real ``_load`` (``--work``) and ``create_services`` with a fake repository root (no OAuth client
+    unless a test writes one), fake Docker / artifacts and a fake ``settings`` worksheet. Google itself is
+    never contacted: without a token the account stops before any request, and the settings sheet is fake."""
+    import otp_server.artifacts as artifacts_mod
+    import otp_server.config as config_mod
+    import otp_server.docker as docker_mod
+    import otp_server.settings as settings_mod
+
+    for n in OTP_ENV:
+        monkeypatch.delenv(n, raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    work = tmp_path / "work"
+    monkeypatch.setattr(config_mod, "REPO_ROOT", repo)
+    monkeypatch.setattr(docker_mod, "DockerRunner", _FakeDocker)
+    made: list[_FakeArtifacts] = []
+
+    def make_artifacts(cfg, docker, jobs, modules):
+        made.append(_FakeArtifacts(jobs, lambda job: job.log("building")))
+        return made[-1]
+
+    monkeypatch.setattr(artifacts_mod, "Artifacts", make_artifacts)
+    sheet = SimpleNamespace(rows={"builds.auto": "false"}, error=None, reads=0)
+
+    class Sheet:
+        def __init__(self, account, **kw):
+            self.account = account
+
+        def read(self):
+            sheet.reads += 1
+            if sheet.error:
+                raise StoreError(sheet.error)
+            return dict(sheet.rows)
+
+    monkeypatch.setattr(settings_mod, "SettingsSheet", Sheet)
+
+    def no_network(self):
+        raise StoreError("tests: Google is never contacted")
+
+    monkeypatch.setattr(GoogleAccount, "client", no_network)  # the registry store connects lazily through it
+    monkeypatch.setattr(winusb, "check_usb_driver", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_existing_server", lambda url: None)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda *a, **k: pytest.fail("no browser may be opened in tests"))
+    monkeypatch.setattr(cli.webbrowser, "open_new", lambda *a, **k: pytest.fail("no browser may be opened in tests"))
+    return SimpleNamespace(repo=repo, work=work, argv=["--work", str(work)], sheet=sheet, artifacts=made,
+                           client_file=repo / "google-oauth-client.json",
+                           token_file=work.resolve() / "google" / "token.json",
+                           sheet_file=work.resolve() / "google" / "spreadsheet.json")
 
 
-@pytest.mark.parametrize("backend", ["gsheets", "gdrive"])
-def test_cmd_login_google(monkeypatch, capsys, backend):
-    from otp_server.storage.base import StoreError
+def _write_client(g) -> None:
+    g.client_file.write_text(json.dumps({"installed": {
+        "client_id": "station.apps.googleusercontent.com", "client_secret": "not-secret",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"]}}), encoding="utf-8")
 
-    _login_cfg(monkeypatch, backend)
 
-    class WithLogin:
-        calls = 0
+def _sign_in(g, spreadsheet_id: str = "") -> None:
+    """An OAuth client and a saved token (as after an earlier login)."""
+    _write_client(g)
+    g.token_file.parent.mkdir(parents=True, exist_ok=True)
+    g.token_file.write_text(json.dumps({"token": "t", "refresh_token": "r"}), encoding="utf-8")
+    if spreadsheet_id:
+        g.sheet_file.write_text(json.dumps({"id": spreadsheet_id}), encoding="utf-8")
 
-        def login(self):
-            WithLogin.calls += 1
-            return f"signed in; token saved for {backend}"
 
-    monkeypatch.setattr(cli, "_make_store", lambda cfg: WithLogin())
-    assert cli.main(["login"]) == 0
-    assert WithLogin.calls == 1 and f"signed in; token saved for {backend}" in capsys.readouterr().out
+def test_status_works_without_google(gcli, capsys):
+    assert cli.main(["status", *gcli.argv]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["version"] == __version__
+    assert out["google"]["client"] is False and out["google"]["signed_in"] is False
+    assert out["google"]["client_file"] == str(gcli.client_file)
+    assert out["google_ready"] is False
+    assert out["settings"]["ok"] is False and out["settings"]["error"] == "not signed in to Google"
+    assert out["storage"]["backend"] == "gsheets" and out["storage"]["ok"] is False
+    assert out["config"]["work_dir"] == str(gcli.work.resolve())
+    assert gcli.sheet.reads == 0
+    # --work before the command, and signed in (the sheet is read)
+    _sign_in(gcli, "1AbC")
+    assert cli.main([*gcli.argv, "status"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["google"]["signed_in"] is True and out["google_ready"] is True
+    assert out["google"]["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/1AbC/edit"
+    assert out["settings"]["ok"] is True and gcli.sheet.reads >= 1
 
-    monkeypatch.setattr(cli, "_make_store", lambda cfg: object())
-    assert cli.main(["login"]) == 0
-    assert f"backend {backend} needs no login" in capsys.readouterr().out
 
-    class Failing:
-        def login(self):
-            raise StoreError("credentials file not found: x.json")
+def test_services_exits_2_when_google_is_not_usable(gcli, capsys):
+    cfg = cli._load(cli.parse_args(["modules", *gcli.argv]))
+    with pytest.raises(SystemExit) as ei:
+        cli._services(cfg)
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR: ") and NO_CLIENT in err and str(gcli.client_file) in err
+    _write_client(gcli)
+    with pytest.raises(SystemExit) as ei:
+        cli._services(cfg)
+    assert ei.value.code == 2 and SIGN_IN_FIRST in capsys.readouterr().err
+    # signed in, but the settings sheet cannot be used: refused with the reason
+    _sign_in(gcli)
+    gcli.sheet.error = "worksheet 'settings': row 1 must be: key | value | description"
+    with pytest.raises(SystemExit) as ei:
+        cli._services(cfg)
+    assert ei.value.code == 2 and "row 1 must be" in capsys.readouterr().err
+    gcli.sheet.error = None
+    gcli.sheet.rows = {"provisioning.default_mode": "maybe"}
+    with pytest.raises(SystemExit) as ei:
+        cli._services(cfg)
+    assert ei.value.code == 2 and "invalid value in the settings sheet" in capsys.readouterr().err
+    # need_google=False never refuses
+    gcli.client_file.unlink()
+    gcli.token_file.unlink()
+    svc = cli._services(cfg, need_google=False)
+    assert svc.google_ready() is False and svc.account.client_configured() is False
 
-    monkeypatch.setattr(cli, "_make_store", lambda cfg: Failing())
-    assert cli.main(["login"]) == 1
-    assert "credentials file not found" in capsys.readouterr().err
 
-    def bad_cfg(cfg):
-        raise StoreError("storage.gsheets.spreadsheet is not set")
+def test_services_applies_the_sheet_settings(gcli):
+    _sign_in(gcli)
+    gcli.sheet.rows = {"provisioning.erase_storage": "false", "provisioning.default_mode": "secure",
+                       "builds.auto": "false"}
+    cfg = cli._load(cli.parse_args(["build", "tools", *gcli.argv]))
+    assert cfg.provisioning.erase_storage is True  # the default, until the sheet is read
+    svc = cli._services(cfg)
+    assert isinstance(svc.account, GoogleAccount) and svc.store.backend == "gsheets"
+    assert svc.google_ready() is True and gcli.sheet.reads >= 1
+    assert svc.cfg is cfg and cfg.provisioning.erase_storage is False and cfg.provisioning.default_mode == "secure"
+    assert cfg.work_dir == gcli.work.resolve()  # the --work flag stays on top of the sheet
 
-    monkeypatch.setattr(cli, "_make_store", bad_cfg)
-    assert cli.main(["login"]) == 1
-    assert "spreadsheet is not set" in capsys.readouterr().err
+
+@pytest.mark.parametrize("argv", [["modules"], ["modules", "--json"], ["build", "tools"], ["build", "image", "--force"],
+                                  ["modules", "mark-locked", "a7eb274c", "--yes"]])
+def test_modules_and_build_refuse_without_google(gcli, capsys, argv):
+    with pytest.raises(SystemExit) as ei:
+        cli.main([*argv, *gcli.argv])
+    assert ei.value.code == 2
+    assert NO_CLIENT in capsys.readouterr().err
+    _write_client(gcli)
+    with pytest.raises(SystemExit) as ei:
+        cli.main([*gcli.argv, *argv])
+    assert ei.value.code == 2
+    cap = capsys.readouterr()
+    assert SIGN_IN_FIRST in cap.err and "PRIVATE" not in cap.out
+    assert all(a.calls == [] for a in gcli.artifacts)  # no build was started
+
+
+def test_build_runs_once_google_is_ready(gcli, capsys):
+    _sign_in(gcli)
+    assert cli.main(["build", "gadget", "--force", *gcli.argv]) == 0
+    out = capsys.readouterr().out
+    assert gcli.artifacts[-1].calls == [("gadget", True)]
+    assert "building" in out and out.splitlines()[-1] == "==> Build gadget: succeeded"
+
+
+def test_cmd_login(gcli, monkeypatch, capsys):
+    _write_client(gcli)
+    gcli.sheet_file.parent.mkdir(parents=True, exist_ok=True)
+    gcli.sheet_file.write_text(json.dumps({"id": "1AbC"}), encoding="utf-8")
+    gcli.sheet.rows = {"provisioning.erase_storage": "false", "builds.auto": "false"}
+    calls = []
+
+    class Creds:
+        def to_json(self):
+            return json.dumps({"token": "t", "refresh_token": "r"})
+
+    def fake_login(self, **kw):
+        calls.append(kw)
+        self.save_credentials(Creds())
+
+    monkeypatch.setattr(GoogleAccount, "login_interactive", fake_login)
+    assert not gcli.token_file.exists()
+    assert cli.main(["login", *gcli.argv]) == 0
+    cap = capsys.readouterr()
+    assert calls == [{}]
+    assert gcli.token_file.is_file()
+    assert gcli.sheet.reads >= 1  # the settings were read right after the login
+    assert "signed in to Google" in cap.out
+    # a new login may be another account: the station's last spreadsheet is not shown as this account's
+    # until the server has connected with it (the fake settings sheet here never opens the spreadsheet)
+    assert "https://docs.google.com/spreadsheets/d/1AbC/edit" not in cap.out
+    assert "station spreadsheet: (found or created when the station connects)" in cap.out
+    # --work before the command
+    assert cli.main([*gcli.argv, "login"]) == 0 and len(calls) == 2
+
+
+def test_cmd_login_failures(gcli, monkeypatch, capsys):
+    # no OAuth client: the real login_interactive refuses before anything is opened
+    assert cli.main(["login", *gcli.argv]) == 1
+    err = capsys.readouterr().err
+    assert "no OAuth client" in err and str(gcli.client_file) in err
+    assert not gcli.token_file.exists()
+
+    _write_client(gcli)
+
+    def fails(self, **kw):
+        raise StoreError("no answer from the browser within 300 s; run 'python -m otp_server login' again")
+
+    monkeypatch.setattr(GoogleAccount, "login_interactive", fails)
+    assert cli.main(["login", *gcli.argv]) == 1
+    assert "no answer from the browser" in capsys.readouterr().err
+
+    def interrupted(self, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(GoogleAccount, "login_interactive", interrupted)
+    assert cli.main(["login", *gcli.argv]) == 130
+    assert "interrupted" in capsys.readouterr().err
+
+    # signed in, but the settings sheet is broken: reported, exit 1
+    def ok(self, **kw):
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        self.token_file.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(GoogleAccount, "login_interactive", ok)
+    gcli.sheet.error = "Google Sheets API error: quota exceeded"
+    assert cli.main(["login", *gcli.argv]) == 1
+    err = capsys.readouterr().err
+    assert "signed in, but" in err and "quota exceeded" in err
 
 
 def test_server_py_rejects_login():
@@ -620,8 +974,8 @@ def test_api_otp_override_endpoint(make_cfg, tmp_path):
     from otp_server.app import create_app
 
     cfg = make_cfg(tmp_path)
-    c = TestClient(create_app(cfg, docker=_FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False),
-                   base_url="http://127.0.0.1:8765")
+    c = TestClient(create_app(cfg, store=MemoryStore(), docker=_FakeDocker(), jobs=JobManager(cfg.work_dir),
+                              artifacts=None, auto_build=False), base_url="http://127.0.0.1:8765")
     assert c.post("/api/modules/hello", json={"serial": "a7eb274c"}).status_code == 200
     r = c.post("/api/modules/a7eb274c/otp", json={"action": "mark-locked", "note": "CLI"})
     assert r.status_code == 200 and r.json()["module"]["otp"]["locked_to_our_key"] is True

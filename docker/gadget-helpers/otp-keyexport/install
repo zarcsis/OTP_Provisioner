@@ -1,0 +1,4 @@
+otp-keyexport /usr/local/bin 0755
+otp-keyexport-boot.service /etc/systemd/system 0644
+otp-keyexport-request.path /etc/systemd/system 0644
+otp-keyexport-request.service /etc/systemd/system 0644

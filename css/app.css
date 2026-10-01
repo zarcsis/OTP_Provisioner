@@ -253,3 +253,19 @@ dialog input[type="text"] { width: 100%; }
 dialog .row { justify-content: flex-end; margin-top: 14px; }
 
 footer { padding: 4px 20px 20px; color: var(--muted); font-size: 12px; }
+
+/* Google sign-in gate: nothing but Advanced (manual) works until the station is signed in */
+.gate { margin: 12px 16px 0; padding: 14px 16px; border-radius: 10px; border: 1px solid rgba(88, 166, 255, 0.55);
+    background: rgba(88, 166, 255, 0.08); display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-size: 14px; }
+.gate.err { border-color: rgba(248, 81, 73, 0.6); background: rgba(248, 81, 73, 0.07); }
+.gate > .gate-text { flex: 1 1 380px; }
+.gate a.button { display: inline-block; text-decoration: none; }
+body.gated #main-layout { opacity: 0.35; pointer-events: none; user-select: none; }
+
+/* scenario switch (Open / Secure) */
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.segmented label { padding: 3px 12px; cursor: pointer; font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+.segmented label + label { border-left: 1px solid var(--border); }
+.segmented input { margin: 0; }
+.segmented label:has(input:checked) { background: rgba(88, 166, 255, 0.16); }
+.segmented label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }

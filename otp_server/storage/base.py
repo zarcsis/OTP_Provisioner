@@ -8,9 +8,12 @@ header row uses exactly these names):
 * ``metadata`` and ``facts`` are ``dict``,
 * ``events`` is a list of ``{"t": iso, "kind": str, "note": str}`` (last :data:`MAX_EVENTS` kept),
 * ``stage`` is one of :data:`STAGES`,
+* ``mode`` is the provisioning scenario chosen for the board (``open`` / ``secure``, ``''`` = not chosen),
 * timestamps are UTC ISO-8601 with seconds: ``2026-09-30T12:34:56Z``.
 
-Records contain secrets (``rsa_private_pem``, ``device_secret``): never log a record.
+Records contain secrets (``rsa_private_pem``, ``device_secret``, ``device_private_pem``): never log a
+record. New fields are only ever appended to :data:`FIELDS`, so an older sheet header is a prefix of
+the current one and is extended in place.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ FIELDS: tuple[str, ...] = (
     "metadata",
     "facts",
     "events",
+    "device_private_pem",
+    "mode",
 )
 
 STAGES: tuple[str, ...] = ("new", "eeprom", "gadget", "flashed")
@@ -52,7 +57,7 @@ BOOL_FIELDS = frozenset({"secure_boot_provisioned"})
 DICT_FIELDS = frozenset({"metadata", "facts"})
 LIST_FIELDS = frozenset({"events"})
 #: Fields stored lowercase (hex values and the serial).
-LOWER_FIELDS = frozenset({"serial", "duid", "customer_key_hash", "otp_key_hash", "device_secret", "boardrev"})
+LOWER_FIELDS = frozenset({"serial", "duid", "customer_key_hash", "otp_key_hash", "device_secret", "boardrev", "mode"})
 MAX_EVENTS = 100
 
 # Store keys are file names / sheet keys: keep them boring.

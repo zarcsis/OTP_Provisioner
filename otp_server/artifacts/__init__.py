@@ -1,9 +1,14 @@
 """Artifacts facade used by the HTTP API: build status, build jobs, per-board stage manifests and files.
 
+Scenarios: every board is provisioned in the scenario chosen for it (``ModuleService.mode_of``):
+``open`` = unsigned EEPROM, clear image, nothing written to OTP; ``secure`` = signed EEPROM with
+``program_pubkey=1``, the crypt image and the OTP device key exported to the server. Both are always
+available: the gadget and both image variants are built up front.
+
 Signing rules (SPEC §10): a board whose OTP holds another key is refused (NotReady). Stage 1 is signed
-when ``provisioning.secure_boot`` is set or the board is already locked to our key (``program_pubkey=1``
-only when not locked yet; ``bootcode5.bin`` counter-signed only when locked). Stages 2 and 3 are signed
-iff the board is locked to our key (a locked board only runs signed code).
+in the secure scenario or when the board is already locked to our key (``program_pubkey=1`` only when
+not locked yet; ``bootcode5.bin`` counter-signed only when locked). Stages 2 and 3 are signed iff the
+board is locked to our key (a locked board only runs signed code).
 
 File downloads are pinned to the manifest: ``stage_file`` serves the files the last manifest issued for
 that board and stage named (path + sha256), never a re-resolved newer artifact. Superseded artifact
@@ -28,7 +33,7 @@ from .tools import TITLE as TOOLS_TITLE, ToolsImage
 __all__ = ["Artifacts", "NotReady", "StageFile", "TARGETS"]
 
 TARGETS = ("tools", "gadget", "image")
-TITLES = {"tools": TOOLS_TITLE, "gadget": "Build fastboot gadget", "image": "Build droneos image"}
+TITLES = {"tools": TOOLS_TITLE, "gadget": "Build fastboot gadget", "image": "Build droneos images (clear + crypt)"}
 MAX_PINNED = 1024       # (board, stage) manifests remembered for downloads
 
 log = logging.getLogger(__name__)
@@ -91,13 +96,13 @@ class Artifacts:
         return self.jobs.submit(target, TITLES[target], fn, dedupe=True)
 
     def auto_build(self) -> list:
-        """Start what is missing: tools image, gadget (unless source is prebuilt), droneos image."""
+        """Start what is missing: tools image, gadget, the droneos images (both variants)."""
         started = []
         if not self.tools.ready():
             started.append(self.start_build("tools"))
-        if self.cfg.builds.gadget.source != "prebuilt" and self.gadget.built_image() is None:
+        if self.gadget.built_image() is None:
             started.append(self.start_build("gadget"))
-        if self.image.current_set() is None:
+        if self.image.missing_variants():
             started.append(self.start_build("image"))
         return started
 
@@ -116,16 +121,22 @@ class Artifacts:
         record = self.modules.require(serial)
         serial = str(record.get("serial") or serial)
         ours = self._board(record)
+        secure = self.modules.mode_of(record) == "secure"
+        if secure and stage in (2, 3) and not ours:
+            # The secure scenario means a signed boot chain: whatever the page does (a scenario switch on a
+            # board that runs the gadget, a stage run on its own), stages 2 and 3 wait for stage 1.
+            raise NotReady(f"board {serial} is in the secure scenario but its OTP does not hold this board's key "
+                           "hash yet: run stage 1 first (signed EEPROM + program_pubkey)")
         secrets_fn = lambda: self.modules.secrets_for(serial)  # noqa: E731
         if stage == 1:
-            plan = self.stage1.plan(record, locked_to_ours=ours)
+            plan = self.stage1.plan(record, locked_to_ours=ours, secure=secure)
             self.stage1.ensure(plan, serial, secrets_fn)
             files = self.stage1.files(plan)
             return self.stage1.manifest(plan, record, files, base_url), {f.name: f.path for f in files}
         if stage == 2:
-            return self.gadget.stage2(record, signed=ours, secrets_fn=secrets_fn, base_url=base_url)
+            return self.gadget.stage2(record, signed=ours, secure=secure, secrets_fn=secrets_fn, base_url=base_url)
         if stage == 3:
-            return self.image.stage3(record, signed=ours, secrets_fn=secrets_fn, base_url=base_url)
+            return self.image.stage3(record, secure=secure, signed=ours, secrets_fn=secrets_fn, base_url=base_url)
         raise ValueError(f"stage must be 1, 2 or 3 (got {stage!r})")
 
     def stage_manifest(self, serial: str, stage: int, base_url: str = "") -> dict:
@@ -143,6 +154,13 @@ class Artifacts:
             while len(self._pins) > MAX_PINNED:
                 self._pins.popitem(last=False)
         return manifest
+
+    def forget_board(self, serial: str) -> None:
+        """Drop the pinned manifests of a board (its scenario changed: every file is resolved afresh)."""
+        key = str(serial).replace("\x00", "").strip().lower()
+        with self._pins_lock:
+            for k in [k for k in self._pins if k[0] == key]:
+                del self._pins[k]
 
     def stage_file(self, serial: str, stage: int, name: str) -> Path:
         """Path of a file named in the last manifest issued for this board and stage.

@@ -1,0 +1,11 @@
+Package: otp-keyexport
+Architecture: arm64
+Maintainer: OTP_Provisioner <otp-provisioner@localhost>
+Depends: rpifwcrypto
+Section: misc
+Priority: optional
+Description: Export the OTP device key to the provisioning station
+ Reads the device-unique private key (rpi-fw-crypto key-id 1) before
+ rpi-fastbootd READ-locks it at startup, or generates it when the station
+ asks for it, and leaves it in /run/otp-keyexport for "fastboot oem
+ upload-file". Part of the OTP_Provisioner secure scenario.

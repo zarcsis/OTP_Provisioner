@@ -6,7 +6,7 @@
 #          /out  rw  output dir
 # Env:     PGM_TARGETS (default pi5-family)   PGM_COMMIT (pi-gen-micro commit, from the host)
 # Outputs: /out/fastboot-gadget-${PGM_TARGETS}.img  (= /work/build/boot.img)
-#          /out/build-info.json {"targets","built","pi_gen_micro_commit","fastbootd_deb","size"}
+#          /out/build-info.json {"targets","built","pi_gen_micro_commit","fastbootd_deb","helpers","size"}
 set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -50,6 +50,27 @@ done < <(find "${STAGE}" -type f -not -path "${STAGE}/internal/packages/*" -prin
 find "${STAGE}/configurations" -type f \( -name installer_scripts.list -o -name post_creation.sh -o -name '*.sh' \) \
     -exec chmod 0755 {} +
 [ -x "${STAGE}/pi-gen-micro" ] || die "staged pi-gen-micro is not executable"
+
+# Our helper packages (docker/gadget-helpers, baked into this image at /opt/otp-gadget-helpers):
+# copy each into helper-packages/ (pi-gen-micro builds them into its local apt repo) and install it
+# through the fastboot configuration's packages.list.
+HELPERS="${PGM_HELPERS:-/opt/otp-gadget-helpers}"
+PKGLIST="${STAGE}/configurations/fastboot/packages.list"
+HELPER_PKGS=()
+if [ -d "${HELPERS}" ]; then
+    for d in "${HELPERS}"/*/; do
+        [ -f "${d}control" ] || continue
+        name="$(basename "${d}")"
+        rsync -a --delete --chmod=D0755,F0644 "${d}" "${STAGE}/helper-packages/${name}/"
+        find "${STAGE}/helper-packages/${name}" -type f -exec sed -i 's/\r$//' {} +
+        pkg="$(sed -n 's/^Package: *//p' "${STAGE}/helper-packages/${name}/control")"
+        [ -n "${pkg}" ] || die "helper package ${name} has no Package: line"
+        if [ -s "${PKGLIST}" ] && [ -n "$(tail -c1 "${PKGLIST}")" ]; then echo >> "${PKGLIST}"; fi
+        grep -qx "${pkg}" "${PKGLIST}" || echo "${pkg}" >> "${PKGLIST}"
+        HELPER_PKGS+=("${pkg}")
+    done
+fi
+echo "    helper packages: ${HELPER_PKGS[*]:-none}"
 FASTBOOTD_DEB="$(find "${STAGE}/internal/packages" -maxdepth 1 -name 'rpi-fastbootd_*.deb' -printf '%f\n' | sort | tail -n1)"
 [ -n "${FASTBOOTD_DEB}" ] || die "internal/packages/rpi-fastbootd_*.deb missing from the pi-gen-micro checkout"
 echo "    rpi-fastbootd: ${FASTBOOTD_DEB}"
@@ -58,6 +79,10 @@ step "pi-gen-micro fastboot ${TARGETS} (in ${BUILD})"
 mkdir -p "${BUILD}"
 cd "${BUILD}"
 rm -f boot.img 2710_bootfiles.bin
+# pi-gen-micro's local repo (helper packages + vendored debs) has a Release file without hashes or a
+# date, so "apt-get update" against the apt lists kept in this volume never notices a new or changed
+# package ("Unable to locate package"). Drop the cached index of that repo before every build.
+rm -f "${BUILD}"/apt_lists/*_build_packages_*
 env CONFIGURATION_ROOT="${STAGE}/configurations/" \
     APT_DPKG_CFG="${STAGE}/internal/apt" \
     PREBUILTS_DIR="${STAGE}/internal/prebuilts" \
@@ -77,8 +102,10 @@ jq -n \
     --arg built "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg commit "${COMMIT}" \
     --arg deb "${FASTBOOTD_DEB}" \
+    --arg helpers "${HELPER_PKGS[*]:-}" \
     --argjson size "${SIZE}" \
-    '{targets: $targets, built: $built, pi_gen_micro_commit: $commit, fastbootd_deb: $deb, size: $size}' \
+    '{targets: $targets, built: $built, pi_gen_micro_commit: $commit, fastbootd_deb: $deb,
+      helpers: ($helpers | split(" ") | map(select(length > 0))), size: $size}' \
     > "${OUT}/build-info.json"
 cat "${OUT}/build-info.json"
 step "gadget done in $(( $(date -u +%s) - START )) s: ${OUT}/${IMG} (${SIZE} bytes)"

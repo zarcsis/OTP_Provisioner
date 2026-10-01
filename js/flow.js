@@ -6,8 +6,12 @@
  *   provision()     runs the stages that are not done yet, in order:
  *     1  EEPROM / OTP   rpiboot with the server's stage-1 directory; the board reboots back into RPIBOOT
  *     2  gadget         rpiboot with the stage-2 directory; the board boots the fastboot gadget
- *     3  image          fastboot IDP (FastbootClient.idpProvision) with the server's image set
+ *     3  image          fastboot IDP (FastbootClient.idpProvision) with the server's image set; in the
+ *                       secure scenario the OTP device key is exported to the server first
  *   runStage(n)     one stage on its own (the per-stage "Run" buttons).
+ *   Before a run the operator's scenario (options.scenario: "open" | "secure") is sent to the server
+ *   (api.setMode); the server plans every stage for it (open: unsigned EEPROM + clear image, OTP untouched;
+ *   secure: signed EEPROM + program_pubkey, LUKS image, device key export).
  *   selectDevice() / connectFastboot()   user-gesture handlers for when Chrome needs a new permission.
  *   abort()
  *
@@ -34,6 +38,8 @@
         'mmc-cid', 'mac-ethernet', 'rpi-duid', 'otp-lock-status', 'block-devices', 'max-download-size'];
     const USB_FILTERS = [...OTP.rpiboot.USB_FILTERS, ...OTP.fastboot.FILTERS];
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    /** Uint8Array -> base64 (small payloads: the exported device key). */
+    const toBase64 = (bytes) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
 
     class FlowAbort extends Error { constructor(msg) { super(msg || 'aborted by the operator'); this.name = 'FlowAbort'; } }
     class FlowCancelled extends Error { constructor(msg) { super(msg || 'cancelled by the operator'); this.name = 'FlowCancelled'; } }
@@ -74,7 +80,10 @@
                 eraseSettleMs: 3000,
                 fileServerIdleMs: 180000,    // rpiboot file server: give up when an attached board asks for nothing this long
                 fileServerRetryMs: 1000,     // rpiboot file server: pause between failed reads (usbboot: sleep(1))
+                rpibootSettleMs: 1000,       // rpiboot: leave a freshly enumerated board alone this long before opening it (usbboot: sleep(1))
                 confirmIrreversible: null,   // null → from /api/status config (default true)
+                scenario: null,              // "open" | "secure" (or a function returning it): sent to the server before a run
+                keyExportTimeoutMs: 30000,   // secure scenario: the gadget generating + exporting the OTP device key
             }, opts.options || {});
             this.module = null;
             this.serial = '';
@@ -293,11 +302,30 @@
         }
 
         /** Stages that still have to run for the current board and device. */
+        /** The scenario the operator picked on the page ("open" | "secure"), or "" when none is set. */
+        scenario() {
+            const s = typeof this.opt.scenario === 'function' ? this.opt.scenario() : this.opt.scenario;
+            return s === 'open' || s === 'secure' ? s : '';
+        }
+
+        /**
+         * The picked scenario differs from the one the board's stages ran in (module.mode: the chosen one, or
+         * the server's default for a board without a choice) on a board with progress: every stage is redone.
+         */
+        scenarioChanges() {
+            const want = this.scenario();
+            const m = this.module;
+            return !!(m && want && m.mode && m.mode !== want && (STAGE_INDEX[m.stage] || 0) > 0);
+        }
+
         plan() {
             if (!this.module) return [];
+            if (this.scenarioChanges()) return [1, 2, 3];
             const st = STAGE_INDEX[this.module.stage] || 0;
             if (st >= 3) return [];
-            if (this.deviceKind === 'fastboot') return [3];
+            // A board that runs the gadget has done stage 2 -- unless the server just reset it to "new" (a
+            // scenario switch): then every stage is redone, starting in RPIBOOT mode.
+            if (this.deviceKind === 'fastboot') return st >= 1 ? [3] : [1, 2, 3];
             return st >= 1 ? [2, 3] : [1, 2, 3];
         }
 
@@ -330,9 +358,25 @@
         // ---------------------------------------------------------------- running
 
         /** Run the given stages (default: plan()) in order; stops at the first failure. Returns true when all succeeded. */
+        /** Tell the server which scenario this board is provisioned in (the operator's choice on the page). */
+        async _applyScenario() {
+            const want = this.scenario();
+            if (!want || !this.module) return;
+            if (this.module.mode_locked && want !== 'secure') {
+                throw new Error(`board ${this.serial}: its OTP holds a key hash (secure boot is on), so only the secure scenario is possible`);
+            }
+            if (this.module.mode_chosen === want) return;
+            const before = this.module.stage;
+            const r = await this.api.setMode(this.serial, want);
+            this._setModule(r.module);
+            const reset = before !== 'new' && r.module && r.module.stage === 'new';
+            this.log('info', `Board ${this.serial}: ${want} scenario${reset ? ' (every stage is redone, starting with stage 1)' : ''}`);
+        }
+
         async provision(stages) {
             if (this.running) throw new Error('a provisioning run is already in progress');
             if (!this.module) throw new Error('connect a board first');
+            await this._applyScenario();
             const list = stages || this.plan();
             if (!list.length) {
                 this.log('ok', `Board ${this.serial} is already provisioned (${this.module.stage_label || this.module.stage}); use a stage's Run button to repeat it`);
@@ -465,6 +509,7 @@
             try {
                 out = await runSession(session, usb, (prev) => this._waitRpiboot(prev), {
                     log: (l, m) => this.log(l, m),
+                    settleMs: this.opt.rpibootSettleMs,
                     onDevice: (u) => this._setDevice(u, 'rpiboot'),
                 });
             } catch (e) {
@@ -590,6 +635,10 @@
                 const img = manifest.image || {};
                 this._setStage(3, 'running', `${img.name || 'image'} ${img.version || ''} → ${manifest.storage_device || 'mmcblk0'}${img.encrypted ? ' (LUKS2)' : ''}`);
                 const imageJson = await this._fetchVerified(manifest.image_json);
+                if (manifest.key_export) {
+                    details.device_key_pem = await this._exportDeviceKey(client, manifest.key_export);
+                    this._setStage(3, 'running', `${img.name || 'image'} ${img.version || ''} → ${manifest.storage_device || 'mmcblk0'}${img.encrypted ? ' (LUKS2)' : ''}`);
+                }
                 const postKey = async (pem) => {
                     details.device_key_pem = pem;
                     try {
@@ -650,6 +699,24 @@
             }
         }
     }
+
+    /**
+     * Secure scenario, first thing in stage 3 (before anything is erased): fetch the OTP device key the
+     * gadget exports and hand it to the server, which checks it against the board's public key and keeps
+     * it. Returns the board's public key PEM.
+     */
+    Flow.prototype._exportDeviceKey = async function (client, keyExport) {
+        this._setStage(3, 'running', 'exporting the OTP device key…');
+        const r = await client.exportDeviceKey(keyExport, { log: (l, m) => this.log(l, m), timeoutMs: this.opt.keyExportTimeoutMs });
+        const pem = await client.publicKey();
+        if (!pem) throw new Error('the gadget exported a device key but getvar:public-key returned none');
+        const res = await this.api.deviceKey(this.serial, { key_der_b64: toBase64(r.der), device_key_pem: pem });
+        this._setModule(res.module);
+        const dk = res.device_key || {};
+        this.log('ok', `OTP device key ${dk.already ? 'was already on the server' : 'stored on the server'} (${String(dk.fingerprint || '').slice(0, 16)})`);
+        if (dk.zero_words) this.log('warn', `${dk.zero_words} of the 8 OTP words of the device key are zero: its generation was probably interrupted (power loss?)`);
+        return pem;
+    };
 
     Flow.STAGE_TITLES = STAGE_TITLES;
     Flow.STAGE_INDEX = STAGE_INDEX;

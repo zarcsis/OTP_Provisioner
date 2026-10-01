@@ -1,11 +1,15 @@
 """FastAPI application factory and the service container shared by the API and the CLI.
 
-``create_app(cfg)`` builds every service eagerly (store, module registry, docker runner, job manager,
-artifacts) so the app can be driven directly with ``httpx.ASGITransport`` in tests. Nothing here may
-prevent the server from starting:
+``create_app(cfg)`` builds every service eagerly (Google account, store, module registry, docker runner,
+job manager, artifacts) so the app can be driven directly with ``httpx.ASGITransport`` in tests. Nothing
+here may prevent the server from starting:
 
-* a misconfigured or unreachable store (``StoreError``) is reported in ``/api/status`` and turns the
-  module endpoints into HTTP 503;
+* signing in to Google is required: until the operator has signed in (``/api/google/login``) and the
+  settings worksheet has been read, the module, stage and build endpoints answer HTTP 401 and the page
+  shows only the sign-in. The settings are re-read from the sheet while the server runs
+  (:meth:`Services.refresh_settings`), so changing them needs no restart;
+* an unreachable store (``StoreError``) is reported in ``/api/status`` and turns the module endpoints
+  into HTTP 503;
 * Docker being down is only reported (``/api/status`` -> ``docker.ok = false``); builds fail as jobs;
 * the optional auto-build (``builds.auto``) runs in a background thread after startup.
 
@@ -22,6 +26,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,13 +55,134 @@ class Services:
     artifacts_error: str = ""
     auto_build_error: str = ""
     extra: dict = field(default_factory=dict)
+    #: The Google login and the settings worksheet (None in tests that inject their own store).
+    account: Any = None
+    settings: Any = None
+    #: CLI flags / test overrides applied on top of the sheet settings (``load_config(overrides=...)``).
+    bootstrap: dict = field(default_factory=dict)
+    settings_error: str = ""
+    settings_unknown: list = field(default_factory=list)
+    settings_loaded_at: float | None = None
+    settings_checked_at: float = float("-inf")
+    auto_build: bool | None = None
+    auto_build_done: bool = False
+    _settings_lock: Any = field(default_factory=threading.RLock, repr=False)
+
+    SETTINGS_TTL = 15.0
+
+    # ------------------------------------------------------------------ Google + settings
+    def refresh_settings(self, force: bool = False) -> bool:
+        """Read the settings worksheet (at most every :attr:`SETTINGS_TTL` s unless ``force``) and apply it
+        to ``cfg`` in place. Returns whether settings from the sheet are in effect. A broken sheet keeps
+        the last good settings and reports why (``settings_error``)."""
+        if self.account is None or self.settings is None:
+            return True
+        with self._settings_lock:
+            now = time.monotonic()
+            loaded = self.settings_loaded_at is not None
+            if not force and now - self.settings_checked_at < self.SETTINGS_TTL:
+                return loaded
+            self.settings_checked_at = now
+            if not self.account.has_token():
+                self.settings_error = "not signed in to Google"
+                return loaded
+            from .config import load_config
+            from .google_account import NotSignedIn
+            from .settings import decode_rows
+            from .storage.base import StoreError
+
+            try:
+                rows = self.settings.read()
+                tree, unknown = decode_rows(rows)
+                new = load_config(overrides=self.bootstrap or None, repo_root=self.cfg.repo_root, settings=tree)
+            except NotSignedIn as exc:
+                # Google rejected the login (revoked / expired): the station is signed out again, so the
+                # page shows its sign-in gate instead of failing module calls with 503
+                self.settings_error = str(exc)
+                self.settings_loaded_at = None
+                return False
+            except StoreError as exc:
+                self.settings_error = str(exc)
+                return loaded
+            except ValueError as exc:
+                self.settings_error = f"invalid value in the settings sheet: {exc}"
+                return loaded
+            self.cfg.apply_settings(new)
+            self.settings_unknown = list(unknown)
+            self.settings_error = ""
+            self.settings_loaded_at = now
+            return True
+
+    def google_ready(self) -> bool:
+        """Signed in and the settings sheet read (always true when no Google account is wired: tests)."""
+        if self.account is None:
+            return True
+        return self.account.has_token() and self.refresh_settings()
+
+    def google_problem(self) -> str:
+        if self.account is None:
+            return ""
+        if not self.account.client_configured():
+            return (f"no Google OAuth client: save the 'Desktop app' client JSON as {self.account.client_file}, "
+                    "then sign in on the page")
+        if not self.account.has_token():
+            return "sign in to Google first (button on the page, or python -m otp_server login)"
+        return self.settings_error or self.account.last_error or "the settings sheet has not been read yet"
+
+    def finish_google_login(self, state: str, code: str, error: str) -> str:
+        """The OAuth redirect came back to ``/``: exchange the code; returns where to send the browser."""
+        from urllib.parse import quote
+
+        from .storage.base import StoreError
+
+        if error:
+            return "/?google_error=" + quote(f"Google sign-in was not completed: {error}")
+        try:
+            self.account.finish_login(state, code)
+        except StoreError as exc:
+            return "/?google_error=" + quote(str(exc))
+        self.on_google_login()
+        return "/"
+
+    def on_google_login(self) -> None:
+        """A new login: forget the old connection, read the settings, start the auto build once."""
+        if self.store is not None and hasattr(self.store, "reset"):
+            self.store.reset()
+        self.refresh_settings(force=True)
+        self.start_auto_build()
+
+    def google_logout(self) -> None:
+        if self.account is not None:
+            self.account.logout()
+        if self.store is not None and hasattr(self.store, "reset"):
+            self.store.reset()
+        with self._settings_lock:
+            self.settings_loaded_at = None
+            self.settings_checked_at = float("-inf")
+            self.settings_error = "not signed in to Google"
+
+    def start_auto_build(self) -> None:
+        """Run :meth:`run_auto_build` in a thread once (after the first successful sign-in / startup)."""
+        want = self.cfg.builds.auto if self.auto_build is None else self.auto_build
+        if not want or self.auto_build_done or not self.google_ready():
+            return
+        self.auto_build_done = True
+        threading.Thread(target=self.run_auto_build, name="auto-build", daemon=True).start()
+
+    def settings_status(self) -> dict:
+        return {
+            "ok": self.account is None or self.settings_loaded_at is not None,
+            "error": self.settings_error,
+            "unknown": list(self.settings_unknown),
+            "worksheet": "settings",
+        }
 
     # ------------------------------------------------------------------ status pieces
     def storage_status(self) -> dict:
         """``store.describe()``, or a synthetic failure record when the store is unusable."""
         if self.store is None:
             return {
-                "backend": getattr(self.cfg.storage, "backend", "?"),
+                "backend": "gsheets",
                 "ok": False,
                 "location": "",
                 "detail": self.store_error or "store not configured",
@@ -123,6 +249,9 @@ class Services:
         """The ``/api/status`` document (SPEC section 8)."""
         return {
             "version": __version__,
+            "google": self.account.status() if self.account is not None else None,
+            "google_ready": self.google_ready(),
+            "settings": self.settings_status(),
             "config": self.cfg.summary(),
             "storage": self.storage_status(),
             "docker": self.docker_status(),
@@ -153,31 +282,38 @@ def _missing_artifact(target: str, detail: str) -> dict:
 
 
 def create_services(cfg: Any, *, store: Any = None, docker: Any = None, jobs: Any = None, modules: Any = None,
-                    artifacts: Any = None) -> Services:
-    """Build the services for ``cfg``; injected objects are used as they are (tests)."""
+                    artifacts: Any = None, account: Any = None, bootstrap: dict | None = None) -> Services:
+    """Build the services for ``cfg``; injected objects are used as they are (tests).
+
+    Without an injected store the registry is the Google spreadsheet of ``account`` (a
+    :class:`~otp_server.google_account.GoogleAccount` for this repo + work dir unless given), and the
+    settings come from its ``settings`` worksheet. ``bootstrap`` holds the CLI overrides that stay on top
+    of the sheet settings.
+    """
     svc = Services(cfg=cfg)
+    svc.bootstrap = dict(bootstrap or {})
     try:
         cfg.ensure_dirs()
     except OSError as exc:
         log.warning("cannot create the work directories under %s: %s", cfg.work_dir, exc)
+    if account is None and store is None and modules is None:
+        from .google_account import GoogleAccount
+
+        account = GoogleAccount(cfg.repo_root, cfg.work_dir)
+    if account is not None:
+        from .settings import SettingsSheet
+
+        svc.account = account
+        svc.settings = SettingsSheet(account)
 
     if modules is not None:
         svc.modules = modules
         svc.store = store if store is not None else getattr(modules, "store", None)
     else:
         if store is None:
-            from .storage import StoreError, make_store
+            from .storage import GoogleSheetsStore
 
-            try:
-                store = make_store(cfg)
-            except StoreError as exc:
-                svc.store_error = str(exc)
-                log.error("storage backend %r is not usable: %s", cfg.storage.backend, exc)
-                store = None
-            except Exception as exc:  # e.g. a Google library missing
-                svc.store_error = f"{exc.__class__.__name__}: {exc}"
-                log.error("storage backend %r could not be created: %s", cfg.storage.backend, svc.store_error)
-                store = None
+            store = GoogleSheetsStore(svc.account)
         svc.store = store
         if store is not None:
             from .modules import ModuleService
@@ -352,23 +488,28 @@ class HostOriginGuard:
 
 
 def create_app(cfg: Any, *, store: Any = None, docker: Any = None, jobs: Any = None, modules: Any = None,
-               artifacts: Any = None, auto_build: bool | None = None) -> FastAPI:
+               artifacts: Any = None, auto_build: bool | None = None, account: Any = None,
+               bootstrap: dict | None = None) -> FastAPI:
     """The FastAPI application serving the page (``/``, ``/css``, ``/js``) and the API (``/api``).
 
-    :param auto_build: start missing builds at startup (default ``cfg.builds.auto``); runs in a
-        background thread so startup never blocks on Docker.
+    :param auto_build: start missing builds once signed in (default ``builds.auto`` from the settings
+        sheet); runs in a background thread so startup never blocks on Docker or Google.
     """
     from .api import api_router, install_error_handlers, static_router
 
-    svc = create_services(cfg, store=store, docker=docker, jobs=jobs, modules=modules, artifacts=artifacts)
-    do_auto = cfg.builds.auto if auto_build is None else bool(auto_build)
+    svc = create_services(cfg, store=store, docker=docker, jobs=jobs, modules=modules, artifacts=artifacts,
+                          account=account, bootstrap=bootstrap)
+    svc.auto_build = auto_build
+
+    def startup() -> None:
+        svc.refresh_settings(force=True)
+        svc.start_auto_build()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if do_auto:
-            t = threading.Thread(target=svc.run_auto_build, name="auto-build", daemon=True)
-            t.start()
-            app.state.auto_build_thread = t
+        t = threading.Thread(target=startup, name="startup", daemon=True)
+        t.start()
+        app.state.startup_thread = t
         yield
 
     app = FastAPI(title="OTP_Provisioner", version=__version__, lifespan=lifespan,
@@ -378,7 +519,7 @@ def create_app(cfg: Any, *, store: Any = None, docker: Any = None, jobs: Any = N
     install_error_handlers(app)
     app.add_middleware(HostOriginGuard, configured_host=str(getattr(cfg.server, "host", "") or ""))
     app.include_router(api_router(svc))
-    app.include_router(static_router(cfg.web_dir))
+    app.include_router(static_router(cfg.web_dir, oauth_callback=svc.finish_google_login if svc.account else None))
     return app
 
 

@@ -2,11 +2,19 @@
  * e2e.js — end-to-end operator run against the REAL server (driven by tests/web/run_e2e.py).
  *
  * Loaded by the runner's proxy BEFORE the page's own scripts (after tests/web/mocks.js), so navigator.usb is a
- * TestMocks.MockHub by the time js/app.js builds its OTP.Flow. window.__E2E = {scenario, serial, devicePem,
- * timeoutMs} comes from the runner. The script plugs a mock Raspberry Pi 5 into the hub and clicks through the
- * real UI like an operator (Connect board → Provision → typed-serial confirmation → Select device /
- * Connect fastboot gadget), records every byte the board received, and POSTs a JSON report to /__e2e_result.
- * All assertions are made by the runner (Python), which also knows the server files and the registry.
+ * TestMocks.MockHub by the time js/app.js builds its OTP.Flow. window.__E2E = {scenario, serial, mode, blocks,
+ * timeoutMs} comes from the runner: mode = the scenario radio to pick ("open" | "secure"), blocks = the
+ * "<dev>:<simage>" list the mock gadget answers to "oem idpgetblk" (the runner reads it from the image set the
+ * server serves for that scenario). The script plugs a mock Raspberry Pi 5 into the hub and clicks through the
+ * real UI like an operator (scenario radio → Connect board → Provision → typed-serial confirmation → Select
+ * device / Connect fastboot gadget), records every byte the board received, and POSTs a JSON report to
+ * /__e2e_result. All assertions are made by the runner (Python), which also knows the server files and the
+ * registry.
+ *
+ * The board: in the secure scenario the recovery reports our key hash as burnt (SECURE_BOOT_PROVISION), and the
+ * fastboot gadget runs the otp-keyexport helper of tests/web/mocks.js with an empty OTP key slot, so the page has
+ * to ask it to generate the device key (WebCrypto P-256) and hand it to the server. In the open scenario the OTP
+ * stays blank and the gadget has no device key.
  */
 (function () {
     'use strict';
@@ -15,7 +23,7 @@
     const hub = new T.MockHub();
     Object.defineProperty(navigator, 'usb', { value: hub, configurable: true });
 
-    const report = { scenario: CFG.scenario, serial: CFG.serial, errors: [], timeline: [], dialogs: [], clicks: [], stages: {} };
+    const report = { scenario: CFG.scenario, serial: CFG.serial, mode: CFG.mode, errors: [], timeline: [], dialogs: [], clicks: [], stages: {} };
     const t0 = Date.now();
     const mark = (what) => report.timeline.push(`${((Date.now() - t0) / 1000).toFixed(1)}s ${what}`);
     window.addEventListener('error', (e) => report.errors.push(`window error: ${e.message} @ ${e.filename}:${e.lineno}`));
@@ -39,7 +47,7 @@
     /** One Pi 5: ROM → recovery (stage 1) → ROM → bootloader (stage 2) → fastboot gadget (stage 3). */
     class E2EBoard {
         constructor(opts) {
-            this.o = Object.assign({ serial: 'e2e5a7c1', keyHash: '0'.repeat(64), secureBoot: false, blocks: [], fastboot: {} }, opts);
+            this.o = Object.assign({ serial: 'e2e5a7c1', keyHash: '0'.repeat(64), program: false, blocks: [], fastboot: {} }, opts);
             this.boots = 0;
             this.history = [];
             this.roms = [];          // [{boot, bytes: Uint8Array}] second stage sent to each ROM enumeration
@@ -64,14 +72,15 @@
             mark('board: ROM plugged');
             return rom;
         }
+        /** The recovery's metadata: with program_pubkey (secure) our key hash is burnt, else the OTP stays blank. */
         _metadata() {
             const md = [
                 ['USER_SERIAL_NUM', this.o.serial],
                 ['MAC_ADDR', '2c:cf:67:e2:e5:01'],
                 ['USER_BOARDREV', 'd04170'],
-                ['CUSTOMER_KEY_HASH', this.o.keyHash],
+                ['CUSTOMER_KEY_HASH', this.o.program ? this.o.keyHash : '0'.repeat(64)],
             ];
-            if (this.o.secureBoot) md.push(['SECURE_BOOT_PROVISION', 'success']);
+            if (this.o.program) md.push(['SECURE_BOOT_PROVISION', 'success']);
             md.push(['EEPROM_UPDATE', 'success']);
             return md.map(([k, v]) => ({ cmd: 0, name: `*${k}*${v}` }));
         }
@@ -123,14 +132,9 @@
         }
         _reboot(fs) { this._replace(fs, this._rom(), 10); }
         _gadget(fs) {
+            // rpi-fastbootd + the otp-keyexport helper; the OTP key slot is empty (a new board)
             const sim = new T.FastbootSim(Object.assign({ serial64: '10000000' + this.o.serial, maxDownload: 0x10000000, blocks: this.o.blocks }, this.o.fastboot));
             sim.kind = 'fastboot';
-            // a real device key (the mocks' placeholder PEM does not parse)
-            const origHandle = sim.handle.bind(sim);
-            sim.handle = (cmd) => {
-                if (cmd === 'getvar:public-key' && sim.keyProvisioned && CFG.devicePem) { sim.ok(CFG.devicePem.trim()); return; }
-                return origHandle(cmd);
-            };
             // SHA-256 of every completed download
             const origOut = sim.transferOut.bind(sim);
             sim.transferOut = async (ep, data) => {
@@ -139,8 +143,8 @@
                 if (sim.downloads.length > n) sim.downloads[n].sha256 = await sha(sim.buffer);
                 return r;
             };
-            // keep the passphrase out of the recorded command list but remember it for the runner
             this.fb = sim;
+            mark(`board: gadget key slot "${sim.keyStatus()}"`);
             this._replace(fs, sim, 300);
         }
         async summary() {
@@ -172,6 +176,13 @@
                     erased: fb.erased,
                     passwords: fb.passwords.map((p) => ({ dev: p.dev, pass: p.pass })),
                     keyProvisioned: fb.keyProvisioned,
+                    keyGenerated: fb.keyGenerated,
+                    keyRequests: fb.keyRequests,
+                    keyStatus: fb.keyStatus(),
+                    uploads: fb.uploads.map((u) => ({ path: u.path, size: u.size, asked: u.asked, sent: u.sent })),
+                    fileWrites: fb.fileWrites,
+                    devicePem: fb.deviceKey ? fb.deviceKey.pem : null,
+                    deviceKeyDerB64: fb.deviceKey ? T.b64(fb.deviceKey.der) : null,
                     maxCommandSeen: fb.maxCommandSeen,
                     idp: fb.idp,
                 } : null,
@@ -204,6 +215,7 @@
         try { body = JSON.parse(text); } catch (e) { body = text; }
         return { status: r.status, body };
     }
+    const checkedScenario = () => { const r = $('#scenario input[name=scenario]:checked'); return r ? r.value : null; };
 
     function answerDialog() {
         const dlg = $('#confirm-dialog');
@@ -228,11 +240,32 @@
         mark('page ready');
         report.apiAvailable = window.OTP.api.available;
         if (!report.apiAvailable) throw new Error('the page says the server is offline');
+        report.gated = document.body.classList.contains('gated');
+        report.googleGateHidden = $('#google-gate').classList.contains('hidden');
         const verbose = $('#chk-verbose');
         if (!verbose.checked) verbose.click();   // render debug lines too, so the log check sees everything
 
-        const board = new E2EBoard({ serial: CFG.serial, secureBoot: !!CFG.secureBoot });
+        // the scenario radio, like the operator: preselected from provisioning.default_mode, then the choice
+        report.scenarioDefault = checkedScenario();
+        const radio = $(`#scenario input[name=scenario][value="${CFG.mode}"]`);
+        if (!radio) throw new Error(`no scenario radio for "${CFG.mode}"`);
+        if (radio.checked) {
+            // already preselected: switch away and back, like an operator double-checking (a click on the checked
+            // radio fires no change event, so nothing would be remembered otherwise)
+            const other = [...document.querySelectorAll('#scenario input[name=scenario]')].find((r) => r !== radio);
+            report.clicks.push(`${((Date.now() - t0) / 1000).toFixed(1)}s scenario radio ${other.value}`);
+            other.click();
+            report.scenarioDetour = checkedScenario();
+        }
+        report.clicks.push(`${((Date.now() - t0) / 1000).toFixed(1)}s scenario radio ${CFG.mode}`);
+        radio.click();
+        report.scenarioRadio = checkedScenario();
+        report.scenarioRemembered = (() => { try { return localStorage.getItem('otp.scenario'); } catch (e) { return null; } })();
+        mark(`scenario radio: ${report.scenarioDefault} → ${report.scenarioRadio}`);
+
+        const board = new E2EBoard({ serial: CFG.serial, program: CFG.mode === 'secure', blocks: CFG.blocks || [] });
         window.__E2E_BOARD = board;
+        report.blocks = board.o.blocks;
         board.powerOnRom();
         await sleep(50);
         report.connectEnabled = !$('#btn-connect').disabled;
@@ -240,25 +273,17 @@
         const flow = app.flow;
         await until(() => (flow.module && flow.module.serial === CFG.serial) || $('#board-status').textContent, 30000, 'the board record');
         if (!flow.module) throw new Error(`Connect board failed: ${$('#board-status').textContent}`);
-        mark(`board connected: record ${flow.module.serial} stage ${flow.module.stage}`);
+        mark(`board connected: record ${flow.module.serial} stage ${flow.module.stage} mode ${flow.module.mode}${flow.module.mode_chosen ? '' : ' (default)'}`);
         report.moduleAfterHello = flow.module;
         report.boardCardSerial = ($('#board-detail .serial-big') || {}).textContent || '';
 
-        // the board's OTP facts: scenario B reports our key hash as burnt (read from the registry by the runner)
-        if (CFG.secureBoot) {
+        // the board's OTP facts: in the secure scenario it reports our key hash as burnt (read from the registry by the runner)
+        if (CFG.mode === 'secure') {
             const kh = await getJson(`/__e2e__/keyhash?serial=${CFG.serial}`);
             if (kh.status !== 200 || !/^[0-9a-f]{64}$/.test(kh.body.customer_key_hash || '')) throw new Error(`keyhash: ${JSON.stringify(kh)}`);
             board.o.keyHash = kh.body.customer_key_hash;
             report.registryKeyHash = kh.body.customer_key_hash;
         }
-        // the image's real block list (INFO <dev>:<simage>) from the stage-3 manifest
-        const m3 = await getJson(`/api/modules/${CFG.serial}/stage/3`);
-        if (m3.status !== 200) throw new Error(`stage 3 manifest before the run: HTTP ${m3.status} ${JSON.stringify(m3.body).slice(0, 300)}`);
-        const simages = Object.keys(m3.body.parts || {});
-        const crypt = m3.body.crypt || [];
-        const mapper = crypt.length ? `mapper/${crypt[0].mname}` : `${m3.body.storage_device}p2`;
-        board.o.blocks = simages.map((s, i) => (i === 0 ? `${m3.body.storage_device}p1:${s}` : `${mapper}:${s}`));
-        report.blocks = board.o.blocks;
         mark(`blocks: ${board.o.blocks.join(', ')}`);
 
         await until(() => !$('#btn-provision').disabled, 10000, 'Provision to be enabled');
@@ -267,6 +292,7 @@
         click('#btn-provision', 'Provision');
         await until(() => flow.running, 10000, 'the run to start');
         mark('provisioning started');
+        report.moduleAtStart = flow.module;
 
         const deadline = Date.now() + (CFG.timeoutMs || 1800000);
         let lastSel = 0;
@@ -292,6 +318,7 @@
             report.stages[n] = { flowState: flow.stages[n].state, flowDetail: flow.stages[n].detail, uiClass: s.root.className, uiState: s.stateLabel.textContent, uiIcon: s.icon.textContent, uiDetail: s.detail.textContent, notes: [...s.notes.querySelectorAll('li')].map((li) => li.textContent) };
         }
         report.finalModuleFlow = flow.module;
+        report.scenarioAfter = checkedScenario();
         report.hubRequests = hub.requests.length;
     }
 

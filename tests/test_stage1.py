@@ -1,7 +1,9 @@
-"""Stage 1 (EEPROM & OTP): key-hash checks, boot.conf rules per mode, fingerprint inputs, stage1.sh guards.
+"""Stage 1 (EEPROM & OTP): key-hash checks, boot.conf rules per scenario, signing rules, fingerprint
+inputs, stage1.sh guards.
 
 Self-contained: a fake repo checkout (firmware-2712 + docker/scripts) and a fake docker runner that
-simulates stage1.sh by writing its outputs into the /out mount. The last tests run the real
+simulates stage1.sh by writing its outputs into the /out mount. The scenario is chosen per board
+(``ModuleService.set_mode``) or comes from ``provisioning.default_mode``. The last tests run the real
 ``docker/scripts/stage1.sh`` with bash for the argument/guard checks that fail before any tool runs.
 """
 from __future__ import annotations
@@ -16,12 +18,12 @@ from pathlib import Path
 
 import pytest
 
+from memstore import MemoryStore
 from otp_server.artifacts import Artifacts, NotReady
-from otp_server.artifacts.stage1 import signed_boot_conf, unsigned_boot_conf
+from otp_server.artifacts.stage1 import WHY_JTAG, WHY_PUBKEY, config_txt, signed_boot_conf, unsigned_boot_conf
 from otp_server.jobs import JobManager
 from otp_server.modules import ModuleService
 from otp_server.secrets_gen import customer_key_hash
-from otp_server.storage.local import LocalJsonStore
 
 SERIAL = "a7eb274c"
 TOOLS_TAG = "otp-tools:latest"
@@ -105,8 +107,11 @@ class Env:
     def __init__(self, cfg, docker, jobs, modules, store, arts):
         self.cfg, self.docker, self.jobs, self.modules, self.store, self.arts = cfg, docker, jobs, modules, store, arts
 
-    def board(self, **fields) -> dict:
+    def board(self, mode: str | None = None, **fields) -> dict:
+        """hello (creates the board and its key), the operator's scenario choice, then raw record edits."""
         self.modules.hello(SERIAL, {"chip": "BCM2712"})
+        if mode is not None:
+            self.modules.set_mode(SERIAL, mode)
         rec = self.store.get(SERIAL)
         if fields:
             rec.update(fields)
@@ -125,7 +130,7 @@ def make_env(make_cfg, tmp_path):
         cfg = make_cfg(tmp_path, repo_root=repo, **overrides)
         docker = FakeDocker()
         jobs = JobManager(cfg.work_dir)
-        store = LocalJsonStore(cfg.storage.local_dir)
+        store = MemoryStore()
         modules = ModuleService(cfg, store)
         arts = Artifacts(cfg, docker, jobs, modules)
         docker.labels[TOOLS_TAG] = {"otp.tools.hash": arts.tools.hash()}
@@ -134,27 +139,40 @@ def make_env(make_cfg, tmp_path):
 
 
 # ---------------------------------------------------------------------- #9 key hash
-def test_signed_passes_expect_ckh_from_the_key(make_env):
-    env = make_env(provisioning={"secure_boot": True})
-    rec = env.board()
+@pytest.mark.parametrize("how", ["board", "default_mode"])
+def test_signed_passes_expect_ckh_from_the_key(make_env, how):
+    """Secure scenario chosen for the board, or the board inherits provisioning.default_mode: secure."""
+    if how == "board":
+        env = make_env()
+        rec = env.board(mode="secure")
+    else:
+        env = make_env(provisioning={"default_mode": "secure"})
+        rec = env.board()
+        assert rec["mode"] == "" and env.modules.mode_of(rec) == "secure"
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
+    assert m["mode"] == "signed"
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh}
     (run,) = env.docker.runs
     assert run["env"]["EXPECT_CKH"] == ckh and customer_key_hash(run["public_pem"]) == ckh
+    assert run["env"]["MODE"] == "signed" and run["env"]["SIGN_RECOVERY"] == "0"
     assert not any("PRIVATE KEY" in ln for j in env.jobs.list() for ln in j.lines)
 
 
-def test_unsigned_passes_no_expect_ckh(make_env):
-    env = make_env()
-    env.board()
-    env.arts.stage_manifest(SERIAL, 1)
-    assert "EXPECT_CKH" not in env.docker.runs[0]["env"]
+@pytest.mark.parametrize("cfg_default", ["open", "secure"])
+def test_unsigned_passes_no_expect_ckh(make_env, cfg_default):
+    env = make_env(provisioning={"default_mode": cfg_default})
+    env.board(mode="open")                       # the board's choice wins over the default
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["mode"] == "unsigned"
+    (run,) = env.docker.runs
+    assert "EXPECT_CKH" not in run["env"] and "/keys" not in run["mounts"]
+    assert run["env"]["MODE"] == "unsigned" and run["env"]["SIGN_RECOVERY"] == "0"
 
 
 def test_record_hash_not_matching_its_key_is_refused_before_building(make_env):
-    env = make_env(provisioning={"secure_boot": True})
-    env.board(customer_key_hash="ab" * 32)
+    env = make_env()
+    env.board(mode="secure", customer_key_hash="ab" * 32)
     with pytest.raises(NotReady, match="does not match its RSA key"):
         env.arts.stage_manifest(SERIAL, 1)
     with pytest.raises(NotReady, match="does not match its RSA key"):
@@ -163,8 +181,8 @@ def test_record_hash_not_matching_its_key_is_refused_before_building(make_env):
 
 
 def test_record_hash_mismatch_refused_even_with_a_complete_dir(make_env):
-    env = make_env(provisioning={"secure_boot": True})
-    env.board()
+    env = make_env()
+    env.board(mode="secure")
     env.arts.stage_manifest(SERIAL, 1)
     assert len(env.docker.runs) == 1
     env.board(customer_key_hash="cd" * 32)          # storage edited after the build
@@ -175,8 +193,8 @@ def test_record_hash_mismatch_refused_even_with_a_complete_dir(make_env):
 
 def test_record_without_key_but_with_hash_is_refused(make_env):
     """A record that lost its PEMs keeps a stale hash; secrets_for mints a new key: never sign with it."""
-    env = make_env(provisioning={"secure_boot": True})
-    old = env.board()["customer_key_hash"]
+    env = make_env()
+    old = env.board(mode="secure")["customer_key_hash"]
     env.board(rsa_private_pem="", rsa_public_pem="", customer_key_hash=old)
     with pytest.raises(NotReady, match="does not match its RSA key"):
         env.arts.stage_manifest(SERIAL, 1)
@@ -184,8 +202,8 @@ def test_record_without_key_but_with_hash_is_refused(make_env):
 
 
 def test_build_info_must_name_the_expected_key(make_env):
-    env = make_env(provisioning={"secure_boot": True})
-    env.board()
+    env = make_env()
+    env.board(mode="secure")
 
     def wrong_key(call):
         FakeDocker.h_stage1(call)
@@ -198,8 +216,8 @@ def test_build_info_must_name_the_expected_key(make_env):
 
 
 def test_complete_dir_with_other_key_in_build_info_is_rebuilt(make_env):
-    env = make_env(provisioning={"secure_boot": True})
-    env.board()
+    env = make_env()
+    env.board(mode="secure")
     env.arts.stage_manifest(SERIAL, 1)
     final = env.out_dirs()[0]
     info = json.loads((final / "build-info.json").read_text(encoding="utf-8"))
@@ -236,9 +254,8 @@ def test_signed_boot_conf_normalises_odd_spellings():
 
 
 def test_signed_manifest_uses_section_aware_boot_conf(make_env):
-    env = make_env(provisioning={"secure_boot": True,
-                                 "boot_conf": "[all]\nBOOT_UART=1\n[cm5]\nENABLE_SELF_UPDATE=0\nSIGNED_BOOT=1\n"})
-    env.board()
+    env = make_env(provisioning={"boot_conf": "[all]\nBOOT_UART=1\n[cm5]\nENABLE_SELF_UPDATE=0\nSIGNED_BOOT=1\n"})
+    env.board(mode="secure")
     env.arts.stage_manifest(SERIAL, 1)
     conf = (env.out_dirs()[0] / "boot.conf").read_text(encoding="utf-8")
     assert conf.endswith("[all]\nENABLE_SELF_UPDATE=0\nSIGNED_BOOT=1\n")
@@ -269,6 +286,114 @@ def test_unsigned_default_boot_conf_has_no_warning(make_env):
     env.board()
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["notes"] == ["unsigned EEPROM update; OTP is not changed in this stage"]
+
+
+# ---------------------------------------------------------------------- scenario -> signing rules
+JTAG_WARNING = "provisioning.jtag_lock only applies to the secure scenario"
+
+
+def test_jtag_lock_outside_the_secure_scenario_is_a_warning(make_env):
+    env = make_env(provisioning={"jtag_lock": True})
+    env.board(mode="open")
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["mode"] == "unsigned"
+    assert m["notes"] == ["unsigned EEPROM update; OTP is not changed in this stage", JTAG_WARNING]
+    assert "program_jtag_lock" not in m["config_txt"] and m["irreversible"] == []
+    assert m["config_txt"] == config_txt(False, False)
+    assert any(ln == f"WARNING: {JTAG_WARNING}" for ln in env.jobs.last("stage1").lines)
+    conf = (env.out_dirs()[0] / "config.txt").read_text(encoding="utf-8")
+    assert "program_jtag_lock" not in conf
+
+
+def test_jtag_lock_in_the_secure_scenario_is_burnt(make_env):
+    env = make_env(provisioning={"jtag_lock": True})
+    env.board(mode="secure")
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["mode"] == "signed"
+    assert m["config_txt"] == config_txt(True, True)
+    assert m["config_txt"].endswith("program_pubkey=1\nprogram_jtag_lock=1\n")
+    assert m["irreversible"] == [{"key": "program_pubkey", "value": "1", "why": WHY_PUBKEY},
+                                 {"key": "program_jtag_lock", "value": "1", "why": WHY_JTAG}]
+    assert JTAG_WARNING not in m["notes"]
+
+
+def test_jtag_lock_off_adds_no_warning_in_either_scenario(make_env):
+    env = make_env()
+    for mode in ("open", "secure"):
+        env.board(mode=mode)
+        m = env.arts.stage_manifest(SERIAL, 1)
+        assert JTAG_WARNING not in m["notes"] and "program_jtag_lock" not in m["config_txt"]
+
+
+@pytest.mark.parametrize("locked, secure, signed, program_pubkey, sign_recovery", [
+    (False, False, False, False, False),     # open: unsigned, OTP untouched
+    (True, False, True, False, True),        # locked to our key: the ROM only runs signed code
+    (False, True, True, True, False),        # secure, not locked yet: burn the key hash
+    (True, True, True, False, True),         # secure, already locked: nothing more to burn
+])
+def test_plan_signing_rules(make_env, locked, secure, signed, program_pubkey, sign_recovery):
+    env = make_env(provisioning={"jtag_lock": True})
+    rec = env.board()
+    plan = env.arts.stage1.plan(rec, locked_to_ours=locked, secure=secure)
+    assert (plan.signed, plan.program_pubkey, plan.sign_recovery) == (signed, program_pubkey, sign_recovery)
+    assert plan.mode == ("signed" if signed else "unsigned")
+    assert plan.jtag_lock is secure
+    assert (JTAG_WARNING in plan.warnings) is (not secure)
+    work = Path(env.cfg.work_dir)
+    if signed:
+        assert plan.customer_key_hash == customer_key_hash(rec["rsa_public_pem"])
+        assert plan.dir.parent == work / "modules" / SERIAL / "stage1"
+        assert plan.boot_conf.endswith("SIGNED_BOOT=1\n")
+    else:
+        assert plan.customer_key_hash == ""
+        assert plan.dir.parent == work / "artifacts" / "stage1"   # shared by every open board
+        assert "SIGNED_BOOT" not in plan.boot_conf
+    assert plan.config_txt == config_txt(program_pubkey, secure)
+
+
+def test_open_plan_is_unsigned_and_ignores_the_board_key(make_env):
+    """An open, unlocked board is never signed: its key (even a broken record) plays no part."""
+    env = make_env(provisioning={"default_mode": "secure"})
+    rec = env.board(mode="open", customer_key_hash="ab" * 32)
+    plan = env.arts.stage1.plan(rec, locked_to_ours=False, secure=False)
+    assert plan.signed is False and plan.customer_key_hash == ""
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["mode"] == "unsigned"
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    (run,) = env.docker.runs
+    assert "/keys" not in run["mounts"] and "EXPECT_CKH" not in run["env"]
+
+
+def test_board_locked_to_our_key_gets_a_signed_stage1(make_env):
+    """The OTP holds our key hash (here: operator override after an open choice): signed EEPROM,
+    counter-signed recovery, nothing burnt again."""
+    env = make_env()
+    rec = env.board(mode="open")
+    env.modules.mark_locked(SERIAL)
+    assert env.modules.mode_of(env.store.get(SERIAL)) == "secure"
+    m = env.arts.stage_manifest(SERIAL, 1)
+    ckh = customer_key_hash(rec["rsa_public_pem"])
+    assert m["mode"] == "signed" and m["irreversible"] == []
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    assert m["notes"][0] == "board OTP is already locked to our key: signed EEPROM and counter-signed recovery"
+    assert "program_pubkey" not in m["config_txt"]
+    (run,) = env.docker.runs
+    assert run["env"]["MODE"] == "signed" and run["env"]["SIGN_RECOVERY"] == "1"
+    assert run["env"]["EXPECT_CKH"] == ckh and customer_key_hash(run["public_pem"]) == ckh
+
+
+def test_open_and_secure_plans_do_not_share_a_directory(make_env):
+    env = make_env()
+    rec = env.board()
+    open_plan = env.arts.stage1.plan(rec, locked_to_ours=False, secure=False)
+    secure_plan = env.arts.stage1.plan(rec, locked_to_ours=False, secure=True)
+    assert open_plan.fp != secure_plan.fp and open_plan.dir != secure_plan.dir
+    # switching the board's scenario switches the manifest it gets
+    env.board(mode="open")
+    assert env.arts.stage_manifest(SERIAL, 1)["mode"] == "unsigned"
+    env.board(mode="secure")
+    assert env.arts.stage_manifest(SERIAL, 1)["mode"] == "signed"
+    assert len(env.docker.runs) == 2 and env.out_dirs()[0] != env.out_dirs()[1]
 
 
 # ---------------------------------------------------------------------- #7 fingerprint inputs

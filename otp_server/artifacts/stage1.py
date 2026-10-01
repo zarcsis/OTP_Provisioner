@@ -179,8 +179,8 @@ class Stage1Builder:
             raise NotReady(_mismatch(stored, computed))
         return computed, bool(stored)
 
-    def plan(self, record: dict, *, locked_to_ours: bool) -> Stage1Plan:
-        """Decide mode and inputs for a board (see SPEC §10 signing rules)."""
+    def plan(self, record: dict, *, locked_to_ours: bool, secure: bool) -> Stage1Plan:
+        """Decide mode and inputs for a board (see SPEC §10 signing rules); ``secure`` = the board's scenario."""
         prov = self.cfg.provisioning
         channel = prov.firmware_channel
         cdir = self.channel_dir(channel)
@@ -189,7 +189,7 @@ class Stage1Builder:
         if pie is None or not rec.is_file():
             raise NotReady(f"rpi-eeprom firmware-2712/{channel} has no pieeprom-*.bin / recovery.bin "
                            f"(is the external/usbboot submodule checked out with rpi-eeprom?)")
-        secure = bool(prov.secure_boot)
+        secure = bool(secure)
         signed = secure or locked_to_ours
         program_pubkey = secure and not locked_to_ours
         jtag = bool(prov.jtag_lock) and secure
@@ -202,7 +202,9 @@ class Stage1Builder:
             boot_conf, removed = unsigned_boot_conf(prov.boot_conf)
             if removed:
                 warnings.append(f"provisioning.boot_conf sets {', '.join(removed)}, but this EEPROM is unsigned "
-                                "(no customer key): the line was removed; SIGNED_BOOT belongs to secure_boot")
+                                "(no customer key): the line was removed; SIGNED_BOOT belongs to the secure scenario")
+        if prov.jtag_lock and not secure:
+            warnings.append("provisioning.jtag_lock only applies to the secure scenario")
         cfgtxt = config_txt(program_pubkey, jtag)
         plan = Stage1Plan(signed=signed, program_pubkey=program_pubkey, jtag_lock=jtag,
                           sign_recovery=sign_recovery, channel=channel, pieeprom=pie, recovery=rec,
@@ -358,8 +360,6 @@ class Stage1Builder:
         else:
             notes.append("board OTP is already locked to our key: signed EEPROM and counter-signed recovery")
         notes.extend(plan.warnings)
-        if self.cfg.provisioning.jtag_lock and not self.cfg.provisioning.secure_boot:
-            notes.append("provisioning.jtag_lock is ignored because provisioning.secure_boot is false")
         return {
             "stage": 1,
             "kind": "rpiboot",

@@ -12,6 +12,13 @@
         if (!ok) failed++;
     }
     function assert(cond, name, detail) { report(name, !!cond, cond ? '' : detail); }
+    /**
+     * A known product bug (reported, not fixed here): XFAIL while it holds, XPASS once it is fixed (then turn it
+     * into an assert). Neither counts as a failure.
+     */
+    function xfail(cond, name, bug) {
+        results.push(`${cond ? 'XPASS' : 'XFAIL'} ${section ? '[' + section + '] ' : ''}${name} — ${cond ? 'fixed? make this a normal assertion' : 'known bug: ' + bug}`);
+    }
     function eq(a, b, name) { const ok = a === b; report(name, ok, ok ? '' : `got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`); }
     function deq(a, b, name) { const sa = JSON.stringify(a); const sb = JSON.stringify(b); report(name, sa === sb, sa === sb ? '' : `got ${sa}, want ${sb}`); }
     async function throwsLike(fn, re, name) {
@@ -239,6 +246,91 @@
             eq(waits.length === 1 && waits[0] === romA, true, 'runSession: waited once for the re-enumeration of the ROM device');
             eq(res.result.kind + ':' + !!res.result.interrupted, 'file-server-done:true', 'runSession: board leaving USB → interrupted result');
             eq(res.usb, fsB, 'runSession: returns the last device');
+        }
+
+        // ep_write: one 16 KiB piece at a time (usbboot's ep_write), a stall watchdog, timing stats for the log
+        {
+            const bulkUsb = (opts) => ({
+                vendorId: 0x0a5c, productId: 0x2712, serialNumber: 'a7eb274c', opened: true, closed: false,
+                ctrl: [], pieces: [], inflight: 0, maxInflight: 0,
+                async controlTransferOut(setup) { this.ctrl.push(setup.value | (setup.index << 16)); return { status: 'ok' }; },
+                transferOut(ep, data) {
+                    const i = this.pieces.length;
+                    this.pieces.push(new Uint8Array(data));
+                    this.inflight++;
+                    this.maxInflight = Math.max(this.maxInflight, this.inflight);
+                    return opts.piece(i, data).then((r) => { this.inflight--; return r; });
+                },
+                async releaseInterface() {},
+                async close() { this.closed = true; this.opened = false; },
+            });
+            const later = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
+            const payload = new Uint8Array(16384 * 20 + 1000);
+            for (let i = 0; i < payload.length; i++) payload[i] = (i * 7 + (i >> 9)) & 0xff;
+
+            const okUsb = bulkUsb({ piece: (i, data) => later(i % 3, { status: 'ok', bytesWritten: data.byteLength }) });
+            const okDev = new OTP.rpiboot.RpiDevice(okUsb);
+            okDev.outEp = 1;
+            const prog = [];
+            const n = await okDev.epWrite(payload, (s, t) => prog.push([s, t]));
+            eq(n, payload.byteLength, 'ep_write: every byte reported sent');
+            eq(okUsb.ctrl.join(','), String(payload.byteLength), 'ep_write: one length announcement first');
+            eq(okUsb.pieces.length, 21, 'ep_write: 16 KiB pieces');
+            assert(okUsb.pieces.every((p) => p.byteLength <= 16384), 'ep_write: no piece above 16 KiB');
+            const joined = new Uint8Array(payload.byteLength);
+            let off = 0;
+            for (const p of okUsb.pieces) { joined.set(p, off); off += p.byteLength; }
+            assert(joined.every((b, i) => b === payload[i]), 'ep_write: pieces in order, bytes intact');
+            eq(okUsb.maxInflight, 1, 'ep_write: one piece in flight at a time, as usbboot does');
+            deq(prog[prog.length - 1], [payload.byteLength, payload.byteLength], 'ep_write: progress reaches the total');
+            eq(okDev.lastWrite.chunks + ':' + okDev.lastWrite.bytes, '21:' + payload.byteLength, 'ep_write: stats count the pieces and bytes');
+
+            const partUsb = bulkUsb({ piece: (i, data) => later(0, { status: 'ok', bytesWritten: i === 2 ? 100 : data.byteLength }) });
+            const part = new OTP.rpiboot.RpiDevice(partUsb);
+            part.outEp = 1;
+            eq(await part.epWrite(payload), payload.byteLength, 'ep_write: a partial write continues from where it stopped (usbboot: buf += sent)');
+            eq(partUsb.pieces[3][0], payload[32768 + 100], 'ep_write: the piece after a partial write starts at the first unsent byte');
+
+            const stuckUsb = bulkUsb({ piece: (i, data) => (i === 3 ? new Promise(() => {}) : later(0, { status: 'ok', bytesWritten: data.byteLength })) });
+            const stuck = new OTP.rpiboot.RpiDevice(stuckUsb);
+            stuck.outEp = 1;
+            stuck.bulkStallMs = 60;
+            const se = await throwsLike(() => stuck.epWrite(payload), /stopped reading after 49152 of 328680 bytes .*3 pieces of 16 KiB/, 'ep_write: a piece that never completes → stall error at the last completed byte');
+            assert(se && se.stalled === true, 'ep_write: stall error is marked', String(se));
+            assert(stuckUsb.closed, 'ep_write: a stall closes the device (Chrome then fails the pending transfer)');
+
+            const goneErr = await (async () => {
+                const d = new OTP.rpiboot.RpiDevice(bulkUsb({ piece: (i, data) => (i === 4 ? later(1).then(() => { throw new DOMException('device gone', 'NetworkError'); }) : later(0, { status: 'ok', bytesWritten: data.byteLength })) }));
+                d.outEp = 1;
+                try { await d.epWrite(payload); } catch (e) { return e; }
+                return null;
+            })();
+            eq(goneErr && goneErr.name, 'NetworkError', 'ep_write: a failing transfer\'s own error is thrown');
+            await later(20);
+        }
+
+        // runSession leaves every enumeration alone for a second before opening it (rpiboot: sleep(1) before libusb_open)
+        {
+            const romA = T.romDevice({ serial: 'a7eb274c' });
+            const fsB = T.fsDevice({ serial: 'a7eb274c', script: [{ cmd: 0, name: 'boot.img' }, { cmd: 1, name: 'boot.img' }] });
+            const opened = [];
+            const tS = Date.now();
+            let tWait = 0;
+            for (const d of [romA, fsB]) { const o = d.open.bind(d); d.open = async () => { opened.push(Date.now() - tS); return o(); }; }
+            const sess = new OTP.rpiboot.RpiBootSession(stage2, { log: () => {} });
+            await OTP.rpiboot.runSession(sess, romA, async () => { tWait = Date.now() - tS; return fsB; });
+            assert(opened.length >= 2 && opened[0] >= 950, 'settle: the first device is opened after ~1 s', JSON.stringify(opened));
+            assert(opened.length >= 2 && opened[opened.length - 1] - tWait >= 950, 'settle: the re-enumerated device is opened ~1 s after it appeared', JSON.stringify({ opened, tWait }));
+
+            const romC = T.romDevice({ serial: 'a7eb274c' });
+            const sessC = new OTP.rpiboot.RpiBootSession(stage2, { log: () => {} });
+            let openedC = false;
+            const oc = romC.open.bind(romC);
+            romC.open = async () => { openedC = true; return oc(); };
+            setTimeout(() => sessC.abort(), 50);
+            const tA = Date.now();
+            await throwsLike(() => OTP.rpiboot.runSession(sessC, romC, async () => fsB), /aborted/, 'settle: abort during the pause → aborted');
+            assert(!openedC && Date.now() - tA < 600, 'settle: abort cuts the pause short and nothing is opened', `${Date.now() - tA} ms, opened=${openedC}`);
         }
 
         // ================================================================ T5 app manual panels
@@ -469,6 +561,127 @@
             eq(sim.commands[sim.commands.length - 1], 'oem idpdone', '… and the IDP is closed');
         }
 
+        // ================================================================ T7b upload / upload-file / download-file
+        section = 'upload';
+        {
+            const sim = new T.FastbootSim({ keyExport: false });
+            const c = new OTP.fastboot.FastbootClient(sim);
+            await c.open();
+            eq(await c.uploadFile('/run/x/missing'), null, 'uploadFile: a missing file ("Error opening file, ERRNO: 2") → null');
+            deq(sim.commands, ['oem upload-file /run/x/missing'], '… after "oem upload-file" alone (no upload)');
+            sim.files.set('/run/x/empty', new Uint8Array(0));
+            eq(await c.uploadFile('/run/x/empty'), null, 'uploadFile: an empty file ("Filesize zero") → null');
+            const small = T.bytesOf(200, 51);
+            sim.files.set('/run/x/small', small);
+            const gotSmall = await c.uploadFile('/run/x/small');
+            eq(gotSmall && `${gotSmall.byteLength}:${T.checksum(gotSmall)}`, `200:${T.checksum(small)}`, 'uploadFile: 200 bytes back byte-exact');
+            deq(sim.commands.slice(-2), ['oem upload-file /run/x/small', 'upload'], 'uploadFile: oem upload-file <path>, then upload');
+            deq(sim.uploads[0] && [sim.uploads[0].asked, sim.uploads[0].sent], [[200], [200]], 'upload: one transfer asking for exactly the 200 announced bytes');
+            const big = T.bytesOf(1300, 52);
+            sim.files.set('/run/x/big', big);
+            const gotBig = await c.uploadFile('/run/x/big');
+            eq(gotBig && `${gotBig.byteLength}:${T.checksum(gotBig)}`, `1300:${T.checksum(big)}`, 'uploadFile: 1300 bytes (more than one 512-byte transfer) reassembled byte-exact');
+            deq(sim.uploads[1] && sim.uploads[1].sent, [512, 512, 276], 'upload: the device sends the data phase as 512 + 512 + 276');
+            deq(sim.uploads[1] && sim.uploads[1].asked, [1300, 788, 276], 'upload: every transferIn asks for exactly the bytes still due');
+            eq(sim.responses.length, 0, 'upload: the final OKAY was read (nothing pending)');
+            const r = await c.downloadFile('/run/x/request', enc.encode('export\n'));
+            eq(r && r.status, 'OKAY', 'downloadFile: OKAY');
+            deq(sim.commands.slice(-2), ['download:00000007', 'oem download-file /run/x/request'], 'downloadFile: download:%08x + data, then oem download-file <path>');
+            eq(sim.files.get('/run/x/request') && dec.decode(sim.files.get('/run/x/request')), 'export\n', 'downloadFile: the gadget file holds the bytes');
+            deq(sim.downloads[sim.downloads.length - 1].chunks, [7], 'downloadFile: one 7-byte data phase');
+            const n = sim.commands.length;
+            await throwsLike(() => c.uploadFile('/run/x/a b'), /invalid path/, 'uploadFile: a path with whitespace is refused');
+            await throwsLike(() => c.downloadFile('', enc.encode('x')), /invalid path/, 'downloadFile: an empty path is refused');
+            eq(sim.commands.length, n, '… and nothing is sent for them');
+        }
+        {
+            // more than 1 MiB: the reads are capped at 1 MiB (DATA_CHUNK), the rest is asked for exactly
+            const sim = new T.FastbootSim({ keyExport: false, uploadChunk: 4 << 20 });
+            const c = new OTP.fastboot.FastbootClient(sim);
+            await c.open();
+            const huge = T.bytesOf((1 << 20) + 4103, 53);
+            sim.files.set('/run/x/huge', huge);
+            const got = await c.uploadFile('/run/x/huge');
+            eq(got && `${got.byteLength}:${T.checksum(got)}`, `${huge.byteLength}:${T.checksum(huge)}`, 'upload of 1 MiB + 4103 bytes byte-exact');
+            deq(sim.uploads[0] && sim.uploads[0].asked, [1 << 20, 4103], 'upload: transferIn lengths capped at 1 MiB, then the remainder');
+            const fresh = new T.FastbootSim({ keyExport: false });
+            const c2 = new OTP.fastboot.FastbootClient(fresh);
+            await c2.open();
+            await throwsLike(() => c2.upload(), /FAIL No data/, 'upload with nothing staged → FAIL');
+            const old = new T.FastbootSim({ keyExport: false, fileCommands: false });
+            const c3 = new OTP.fastboot.FastbootClient(old);
+            await c3.open();
+            await throwsLike(() => c3.uploadFile('/run/x/key.der'), /Unknown OEM command/, 'uploadFile: a gadget without "oem upload-file" is an error, not a missing file');
+        }
+
+        // ================================================================ T7c exportDeviceKey (gadget otp-keyexport helper)
+        section = 'keyexport';
+        const KX = { dir: '/run/otp-keyexport', key: '/run/otp-keyexport/key.der', status: '/run/otp-keyexport/status', request: '/run/otp-keyexport/request' };
+        const KEY_A = await T.makeDeviceKey();
+        const KEY_B = await T.makeDeviceKey();
+        const openFb = async (opts) => { const sim = new T.FastbootSim(opts); const c = new OTP.fastboot.FastbootClient(sim); await c.open(); return { sim, c }; };
+        {
+            // the OTP already holds a key: the helper exported it at gadget boot, before rpi-fastbootd READ-locked it
+            const { sim, c } = await openFb({ deviceKey: KEY_A });
+            eq(sim.keyStatus(), 'exported key.der', 'existing key: the boot run of the helper exported it');
+            const logs = [];
+            const r = await c.exportDeviceKey(KX, { log: (l, m) => logs.push(`${l}: ${m}`), pollMs: 10 });
+            eq(r.generated, false, 'existing key: generated=false');
+            eq(T.hex(r.der), T.hex(KEY_A.der), 'existing key: key.der = the OTP key (PKCS#8 DER)');
+            deq(sim.commands, [`oem upload-file ${KX.key}`, 'upload'], 'existing key: only key.der is fetched, nothing is requested');
+            eq(sim.keyRequests + sim.fileWrites.length, 0, 'existing key: nothing written to the gadget');
+            assert(!logs.some((l) => l.includes(T.b64(KEY_A.der).slice(10, 40))), 'existing key: the key bytes are never logged', logs.join(' | '));
+            eq(await c.publicKey(), KEY_A.pem, 'existing key: getvar:public-key is the same key');
+        }
+        {
+            // blank slot: request → the helper generates the key (OTP write) → poll until key.der appears
+            const { sim, c } = await openFb({ keyGenDelayMs: 80 });
+            eq(sim.keyStatus().split(' ')[0], 'blank', 'blank slot: the helper reports "blank" at boot');
+            const logs = [];
+            const r = await c.exportDeviceKey(KX, { log: (l, m) => logs.push(`${l}: ${m}`), pollMs: 20, timeoutMs: 5000 });
+            eq(r.generated, true, 'blank slot: generated=true');
+            eq(sim.keyGenerated && T.hex(r.der) === T.hex(sim.deviceKey.der), true, 'blank slot: the key generated on request is the one exported');
+            deq(sim.commands.filter((x) => !x.startsWith('getvar:')).slice(0, 5), [`oem upload-file ${KX.key}`, `oem upload-file ${KX.status}`, 'upload', 'download:00000007', `oem download-file ${KX.request}`],
+                'blank slot: key.der missing → status read → "export\\n" written to the request file');
+            deq(sim.fileWrites, [{ path: KX.request, size: 7 }], 'blank slot: exactly one request ("export\\n", 7 bytes)');
+            eq(sim.keyRequests, 1, 'blank slot: the helper ran its request mode once');
+            const polls = sim.commands.slice(sim.commands.indexOf(`oem download-file ${KX.request}`) + 1).filter((x) => x === `oem upload-file ${KX.key}`).length;
+            assert(polls >= 2, 'blank slot: key.der polled until it appeared', `${polls} polls: ${sim.commands.slice(sim.commands.indexOf(`oem download-file ${KX.request}`) + 1).join(' | ')}`);
+            deq(sim.commands.slice(-2), [`oem upload-file ${KX.key}`, 'upload'], 'blank slot: ends with the upload of key.der');
+            assert(logs.some((l) => /OTP key slot is empty: the gadget generates the device key/.test(l)), 'blank slot: the OTP write is announced in the log', logs.join(' | '));
+            const pem = await c.publicKey();
+            eq(T.hex(await T.spkiOfPkcs8(r.der)), T.hex(T.pemDer(pem, 'PUBLIC KEY')), 'blank slot: the exported private key belongs to getvar:public-key');
+            const fc = await c.fwcryptoInit();
+            eq(`${fc.message}:${fc.created}`, 'Key already provisioned:false', 'blank slot: afterwards "oem fwcrypto init" answers "Key already provisioned"');
+        }
+        {
+            const { sim, c } = await openFb({ deviceKey: KEY_A, readLocked: true });
+            eq(sim.keyStatus().split(' ')[0], 'locked', 'READ-locked key: the helper says "locked"');
+            await throwsLike(() => c.exportDeviceKey(KX, { pollMs: 10 }), /cannot be exported in this boot .*run stage 2 again/, 'READ-locked key: error (reboot the gadget: run stage 2 again)');
+            eq(sim.fileWrites.length, 0, 'READ-locked key: no request written');
+        }
+        {
+            const { sim, c } = await openFb({ keyExport: false, deviceKey: KEY_A });
+            await throwsLike(() => c.exportDeviceKey(KX, { pollMs: 10 }), /no OTP key export helper/, 'no helper in the gadget: error (rebuild the gadget)');
+            eq(sim.fileWrites.length, 0, 'no helper: no request written');
+        }
+        {
+            const { sim, c } = await openFb({ keyGenDelayMs: 60000 });
+            const tt = Date.now();
+            await throwsLike(() => c.exportDeviceKey(KX, { pollMs: 20, timeoutMs: 200 }), /did not export the device key within 0 s \(busy generating/, 'timeout: error with the last status');
+            assert(Date.now() - tt < 3000, 'timeout: honoured', `${Date.now() - tt} ms`);
+            eq(sim.keyRequests, 1, 'timeout: the request was sent once');
+        }
+        {
+            const { c } = await openFb({ keyGenError: 'mailbox: -5' });
+            await throwsLike(() => c.exportDeviceKey(KX, { pollMs: 10, timeoutMs: 5000 }), /export failed: error genkey: mailbox: -5/, 'genkey fails while polling → error');
+        }
+        {
+            const { sim, c } = await openFb({ bootStatus: 'error no firmware mailbox device (/dev/vcio_crypto, /dev/vcio)' });
+            await throwsLike(() => c.exportDeviceKey(KX, { pollMs: 10 }), /could not read the OTP device key: error no firmware mailbox/, 'helper error at boot → error');
+            eq(sim.fileWrites.length, 0, 'helper error at boot: no request written');
+        }
+
         // ================================================================ T8 server.js + BootDir.fromManifest
         section = 'api';
         {
@@ -559,10 +772,18 @@
         const KEYHASH = 'ab'.repeat(32);
         async function buildServerFiles() {
             const files = new Map();
-            const add = async (stageNo, name, bytes) => {
-                const url = `/api/modules/a7eb274c/stage/${stageNo}/files/${name}`;
+            const add = async (stageNo, name, bytes, dir) => {
+                const url = `/api/modules/a7eb274c/stage/${stageNo}/files/${dir ? dir + '/' : ''}${name}`;
                 files.set(url, bytes);
                 return { name, size: bytes.byteLength, sha256: await sha(bytes), url, origin: 'test' };
+            };
+            // open scenario: unsigned EEPROM, nothing for OTP
+            const m1open = {
+                stage: 1, kind: 'rpiboot', title: 'EEPROM & OTP', ready: true, mode: 'unsigned',
+                files: [await add(1, 'bootcode5.bin', T.bytesOf(1000, 44), 'open'), await add(1, 'pieeprom.bin', T.bytesOf(4096, 45), 'open'),
+                    await add(1, 'pieeprom.sig', enc.encode('11\nts: 1\n'), 'open'),
+                    await add(1, 'config.txt', enc.encode('uart_2ndstage=1\nset_reboot_order=0x3\nrecovery_reboot=1\n'), 'open')],
+                irreversible: [], expect: { secure_boot_provision: false, customer_key_hash: null }, notes: ['unsigned EEPROM update; OTP is not changed in this stage'],
             };
             const m1 = {
                 stage: 1, kind: 'rpiboot', title: 'EEPROM & OTP', ready: true, mode: 'signed',
@@ -581,20 +802,28 @@
             const pb = await add(3, 'boot.sparse', bootPiece);
             const r0 = await add(3, 'root.sparse.0', root0);
             const r1 = await add(3, 'root.sparse.1', root1);
+            // secure scenario (with provisioning.recovery_passphrase on: one LUKS container gets keyslot 1)
             const m3 = {
-                stage: 3, kind: 'fastboot-idp', title: 'Image', ready: true, mode: 'unsigned',
-                image: { name: 'deb13-arm64-min', version: 'v1-test', set: 'set1', encrypted: true },
+                stage: 3, kind: 'fastboot-idp', title: 'Image', ready: true, mode: 'unsigned', scenario: 'secure',
+                image: { name: 'deb13-arm64-min', version: 'v1-test', set: 'set1', variant: 'crypt', encrypted: true },
                 storage_device: 'mmcblk0', image_json: ij,
                 parts: { 'boot.sparse': [pb], 'root.sparse': [r0, r1] },
                 total_bytes: bootPiece.byteLength + root0.byteLength + root1.byteLength, max_piece_size: 268435456,
-                fwcrypto_init: true, erase: true,
+                fwcrypto_init: true, key_export: Object.assign({}, KX), erase: true,
                 crypt: [{ dev: 'mmcblk0p2', mname: 'osroot_crypt', label: 'OSROOT_CRYPT', passphrase: PASS }],
                 irreversible: [{ key: 'oem fwcrypto init', value: '', why: 'device key in OTP' }, { key: 'erase', value: 'mmcblk0', why: 'wipes the card' }],
-                notes: [],
+                notes: ['the OTP device key is exported to the station before the storage is erased'],
             };
-            return { files, m1, m2, m3 };
+            // open scenario: clear image, no OTP key, nothing exported
+            const m3open = Object.assign({}, m3, {
+                scenario: 'open', image: { name: 'deb13-arm64-min', version: 'v1-test', set: 'set1-clear', variant: 'clear', encrypted: false },
+                fwcrypto_init: false, key_export: null, crypt: [],
+                irreversible: [{ key: 'erase', value: 'mmcblk0', why: 'wipes the card' }],
+                notes: ['open scenario: clear image, OTP is not touched'],
+            });
+            return { files, m1, m2, m3, m1open, m3open };
         }
-        const FLOW_OPTS = { reenumTimeoutMs: 20000, fastbootTimeoutMs: 20000, pollMs: 25, needDeviceAfterMs: 150, buildPollMs: 60, eraseSettleMs: 10, fileServerRetryMs: 20 };
+        const FLOW_OPTS = { reenumTimeoutMs: 20000, fastbootTimeoutMs: 20000, pollMs: 25, needDeviceAfterMs: 150, buildPollMs: 60, eraseSettleMs: 10, fileServerRetryMs: 20, rpibootSettleMs: 20 };
         function makeFlow(api, hub, ev, extraOpts) {
             let flow = null;
             flow = new OTP.Flow({
@@ -625,13 +854,15 @@
             const job = { id: 'job3', target: 'image', title: 'Build droneos image', status: 'running' };
             const api = new T.FakeApi({ files, manifests: { 1: m1, 2: m2, 3: (k) => (k <= 2 ? { ready: false, reason: 'the droneos image is being built', job } : m3) } });
             const hub = new T.MockHub();
-            const board = new T.MockBoard(hub, { serial: 'a7eb274c', keyHash: KEYHASH, stage1Timeouts: { 6: 3 } });
+            const board = new T.MockBoard(hub, { serial: 'a7eb274c', keyHash: KEYHASH, stage1Timeouts: { 6: 3 }, fastboot: { keyGenDelayMs: 30 } });
             board.powerOnRom();
             const ev = newEv();
-            const flow = makeFlow(api, hub, ev);
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
             const m = await flow.connectBoard();
             eq(m && m.serial, 'a7eb274c', 'connectBoard → hello → module');
             deq(api.calls[0][1], { serial: 'a7eb274c', chip: 'BCM2712', board: 'Pi 5 / CM5 / Pi 500', usb: { vendor_id: 0x0a5c, product_id: 0x2712, product_name: 'BCM2712 Boot', manufacturer: 'Broadcom', serial_number: 'a7eb274c' }, rom_stage: 'rom' }, 'hello body');
+            eq(`${m && m.mode}:${m && m.mode_chosen}`, 'open:', 'a new record: the server default scenario, none chosen yet');
+            eq(flow.scenarioChanges(), false, 'a new board: picking "secure" is not a scenario change (no progress yet)');
             deq(flow.plan(), [1, 2, 3], 'plan for a new board: 1, 2, 3');
             const tRun = Date.now();
             const ok = await flow.provision();
@@ -666,7 +897,35 @@
             eq(idc && idc[1].vars.product, 'Raspberry Pi 5 Model B Rev 1.0', 'identify: vars (product)');
             assert(idc && OTP.Flow.FASTBOOT_VARS.every((k) => k in idc[1].vars), 'identify: every whitelisted getvar', JSON.stringify(idc && idc[1].vars));
             const names = api.names();
-            assert(names.indexOf('identify') < names.indexOf('facts') && names.indexOf('facts') < names.indexOf('result3'), 'order: identify → facts → result3', names.join(' '));
+            assert(names.indexOf('identify') < names.indexOf('deviceKey') && names.indexOf('deviceKey') < names.indexOf('facts') && names.indexOf('facts') < names.indexOf('result3'),
+                'order: identify → deviceKey → facts → result3', names.join(' '));
+            // scenario: chosen on the server before anything else
+            deq(api.calls[1], ['setMode', 'a7eb274c', 'secure'], 'secure: api.setMode(serial, "secure") right after hello');
+            assert(names.indexOf('setMode') < names.findIndex((x) => /^stage\d$/.test(x)), 'secure: the scenario is sent before the first stage manifest is fetched', names.join(' '));
+            eq(names.filter((x) => x === 'setMode').length, 1, 'secure: setMode called once');
+            eq(flow.module && `${flow.module.mode}:${flow.module.mode_chosen}:${flow.module.mode_locked}`, 'secure:secure:true', 'secure: the record ends secure, chosen and locked');
+            // stage 3: the OTP device key is exported BEFORE anything is erased, then posted to the server
+            const fbs = board.fb;
+            const cmds = fbs ? fbs.commands : [];
+            const iReq = cmds.indexOf(`oem download-file ${KX.request}`);
+            const iKey = cmds.lastIndexOf(`oem upload-file ${KX.key}`);
+            const iFw = cmds.indexOf('oem fwcrypto init');
+            const iErase = cmds.indexOf('erase:mmcblk0');
+            assert(iReq > 0 && iKey > iReq && cmds[iKey + 1] === 'upload', 'secure: blank OTP slot → request → key.der uploaded', cmds.slice(0, Math.max(iFw, 0) + 1).join(' | '));
+            assert(iKey >= 0 && iKey < iFw && iFw < iErase, 'secure: key export → oem fwcrypto init → erase (the key is out before anything is erased)', `export ${iKey}, fwcrypto ${iFw}, erase ${iErase}`);
+            eq(fbs && fbs.keyGenerated, true, 'secure: the gadget generated the device key on request');
+            const dk = api.calls.find((c) => c[0] === 'deviceKey');
+            eq(dk && dk[1], 'a7eb274c', 'secure: deviceKey posted for the board');
+            eq(dk && fbs && T.hex(T.unb64(dk[2].key_der_b64)) === T.hex(fbs.deviceKey.der), true, 'secure: key_der_b64 = the gadget\'s key.der');
+            eq(dk && fbs && dk[2].device_key_pem.trim() === fbs.deviceKey.pem.trim(), true, 'secure: device_key_pem = getvar:public-key');
+            eq(flow.module && flow.module.otp.device_key_exported, true, 'secure: the server record says the key was exported');
+            assert(ev.logs.includes('info: Board a7eb274c: secure scenario'), 'secure: the first scenario choice of a new board is logged plainly', ev.logs.filter((l) => /scenario/.test(l)).join(' | '));
+            eq(ev.logs.some((l) => /every stage is redone/.test(l)), false, 'secure: … and does not claim "every stage is redone" (nothing was reset)');
+            eq(api.gated, 2, 'secure: the early manifests of stages 2 and 3 are refused (409) until stage 1 has burnt our key hash');
+            assert(ev.logs.some((l) => /OTP device key stored on the server/.test(l)), 'secure: "stored on the server" logged');
+            assert(ev.logs.some((l) => /fwcrypto: Key already provisioned/.test(l)), 'secure: oem fwcrypto init found the exported key ("Key already provisioned")', ev.logs.filter((l) => /fwcrypto/.test(l)).join(' | '));
+            assert(fbs && !ev.logs.some((l) => l.includes(T.b64(fbs.deviceKey.der).slice(8, 40))), 'secure: the private key never appears in the log');
+            assert(names.indexOf('deviceKey') < names.indexOf('result3'), 'secure: deviceKey before result3');
             eq(ev.confirms.length, 2, 'two confirmations: stage 1 up front, stage 3 once its manifest is ready');
             eq(ev.confirms[0] && ev.confirms[0].token, 'a7eb274c', 'confirmation token = serial');
             eq(ev.confirms[0] && ev.confirms[0].flags.map((f) => f.key).join('|'), 'stage 1: program_pubkey', 'first confirmation: program_pubkey');
@@ -686,6 +945,37 @@
             eq(p3 && p3.sent === p3.total && p3.total === m3.total_bytes, true, 'stage 3 progress reached total_bytes');
             deq(flow.plan(), [], 'plan after provisioning: nothing left');
             eq(await flow.provision(), true, 'provision() on a flashed board is a no-op');
+            eq(api.calls.filter((c) => c[0] === 'setMode').length, 1, 'the no-op run sends no setMode (mode_chosen already "secure")');
+        }
+
+        // the open scenario: unsigned EEPROM, clear image, nothing written to OTP, no key export, no fwcrypto init
+        section = 'flow-open';
+        {
+            const { files, m1open, m2, m3open } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: m1open, 2: m2, 3: m3open } });
+            const hub = new T.MockHub();
+            const board = new T.MockBoard(hub, { serial: 'a7eb274c', program: false, fastboot: { blocks: ['mmcblk0p1:boot.sparse', 'mmcblk0p2:root.sparse'] } });
+            board.powerOnRom();
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'open' });
+            await flow.connectBoard();
+            const ok = await flow.provision();
+            eq(ok, true, 'open: provision() succeeded');
+            if (!ok) results.push('  open flow log:\n    ' + ev.logs.slice(-20).join('\n    '));
+            deq(api.calls[1], ['setMode', 'a7eb274c', 'open'], 'open: the scenario is sent first (none was chosen for the board yet)');
+            eq(flow.module && `${flow.module.stage}:${flow.module.mode}:${flow.module.mode_locked}:${flow.module.otp.locked}`, 'flashed:open:false:false', 'open: flashed, OTP not locked');
+            const cmds = board.fb ? board.fb.commands : [];
+            deq(cmds.filter((c) => /^oem (upload-file|download-file|fwcrypto)|^upload$/.test(c)), [], 'open: no key export and no oem fwcrypto init on the gadget');
+            eq(board.fb && board.fb.keyProvisioned, false, 'open: the OTP key slot stays empty');
+            eq(api.calls.some((c) => c[0] === 'deviceKey' || c[0] === 'facts'), false, 'open: no device key posted (the board has none)');
+            deq(board.fb && board.fb.flashes.map((f) => f.dev), ['mmcblk0p1', 'mmcblk0p2', 'mmcblk0p2'], 'open: clear image flashed to the plain partitions');
+            eq(board.fb && board.fb.passwords.length, 0, 'open: no cryptsetpassword');
+            eq(ev.confirms.length, 1, 'open: one confirmation');
+            eq(ev.confirms[0] && ev.confirms[0].flags.map((f) => f.key).join('|'), 'stage 3: erase', 'open: the only irreversible step is the erase');
+            const b1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
+            eq(b1 && `${b1[3].expect.secure_boot_provision}:${b1[3].metadata.SECURE_BOOT_PROVISION}`, 'false:undefined', 'open: stage 1 expects no OTP programming');
+            const r3 = api.calls.find((c) => c[0] === 'result' && c[2] === 3);
+            eq(r3 && `${r3[3].ok}:${r3[3].details.device_key_pem}`, 'true:null', 'open: stage-3 result without a device key');
         }
 
         // ================================================================ T10 Flow: failure paths
@@ -725,7 +1015,7 @@
             const { files, m3 } = await buildServerFiles();
             const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
             const hub = new T.MockHub();
-            const sim = new T.FastbootSim({ goneOnFlash: 'mapper/osroot_crypt', keyProvisioned: true });
+            const sim = new T.FastbootSim({ goneOnFlash: 'mapper/osroot_crypt', deviceKey: KEY_A });
             hub.plug(sim);
             const ev = newEv();
             const flow = makeFlow(api, hub, ev);
@@ -783,14 +1073,14 @@
             const { files, m3 } = await buildServerFiles();
             const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
             const hub = new T.MockHub();
-            const mine = new T.FastbootSim({ serial64: '10000000a7eb274c', keyProvisioned: true });
+            const mine = new T.FastbootSim({ serial64: '10000000a7eb274c', deviceKey: KEY_A });
             hub.plug(mine);
             const ev = newEv();
             const flow = makeFlow(api, hub, ev);
             await flow.connectBoard();
             eq(flow.serial, 'a7eb274c', 'foreign gadget: connected to board a7eb274c');
             hub.unplug(mine);
-            const other = new T.FastbootSim({ serial64: '10000000deadbeef', keyProvisioned: true });
+            const other = new T.FastbootSim({ serial64: '10000000deadbeef', deviceKey: KEY_B });
             other.serialNumber = 'RPI-GADGET'; // no usable USB serial: only getvar:serialno tells the boards apart
             hub.plug(other);
             const before = api.calls.filter((c) => c[0] === 'identify').length;
@@ -821,12 +1111,238 @@
             assert(a[0].id !== b[0].id && a[0].id.startsWith('a7eb274c|'), 'confirmation ids carry the board serial', a[0].id + ' / ' + b[0].id);
         }
 
+        // ================================================================ T10b Flow: scenario (Open / Secure) handling
+        section = 'flow-scenario';
+        {
+            const refused = { ready: false, reason: 'stop here (test)', job: null };
+            /** A flow on a seeded module (no USB): scenario `want`, every stage manifest refused. */
+            const scenarioFlow = (fields, want, apiOpts) => {
+                const api = new T.FakeApi(Object.assign({ files: new Map(), manifests: { 1: refused, 2: refused, 3: refused } }, apiOpts || {}));
+                const m = api.seed('a7eb274c', fields);
+                const ev = newEv();
+                const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: want }), hooks: { onLog: (l, x) => ev.logs.push(`${l}: ${x}`), onConfirm: async () => true } });
+                flow.module = JSON.parse(JSON.stringify(m));
+                flow.serial = m.serial;
+                return { api, flow, ev };
+            };
+            let pick = 'secure';
+            const fnFlow = new OTP.Flow({ api: new T.FakeApi({ files: new Map(), manifests: {} }), usb: new T.MockHub(), options: { scenario: () => pick } });
+            eq(fnFlow.scenario(), 'secure', 'scenario option as a function (the page radios)');
+            pick = 'open';
+            eq(fnFlow.scenario(), 'open', '… read on every call');
+            pick = 'weird';
+            eq(fnFlow.scenario(), '', 'unknown scenario → ""');
+            deq(fnFlow.plan(), [], 'plan without a module: nothing');
+
+            // plan() / scenarioChanges(): module.mode is the scenario the stages so far ran in
+            const planOf = (fields, want) => { const { flow } = scenarioFlow(fields, want); return `${flow.scenarioChanges()}:${flow.plan().join('')}`; };
+            eq(planOf({ stage: 'new' }, 'secure'), 'false:123', 'new board, secure picked: no change, plan 1,2,3');
+            eq(planOf({ stage: 'eeprom', mode: 'open', mode_chosen: 'open' }, 'open'), 'false:23', 'eeprom done, same scenario: plan 2,3');
+            eq(planOf({ stage: 'eeprom', mode: 'open', mode_chosen: 'open' }, 'secure'), 'true:123', 'eeprom done in open, secure picked: every stage redone (1,2,3)');
+            eq(planOf({ stage: 'flashed', mode: 'open', mode_chosen: 'open' }, 'open'), 'false:', 'flashed, same scenario: nothing to do');
+            eq(planOf({ stage: 'flashed', mode: 'open', mode_chosen: 'open' }, 'secure'), 'true:123', 'flashed in open, secure picked: plan 1,2,3');
+            eq(planOf({ stage: 'flashed', mode: 'open', mode_chosen: '' }, 'secure'), 'true:123', 'flashed with the server default (open), secure picked: plan 1,2,3');
+            eq(planOf({ stage: 'flashed', mode: 'open', mode_chosen: '' }, 'open'), 'false:', 'flashed with the server default, the same scenario picked: nothing to do');
+            eq(planOf({ stage: 'gadget', mode: 'secure', mode_chosen: 'secure', mode_locked: true }, 'secure'), 'false:23', 'locked board in secure: no change');
+            eq(planOf({ stage: 'eeprom', mode: 'open', mode_chosen: 'open' }, ''), 'false:23', 'no scenario picked: never a change');
+        }
+        {
+            // setMode is called before any stage, with the picked scenario
+            const refused = { ready: false, reason: 'stop here (test)', job: null };
+            const api = new T.FakeApi({ files: new Map(), manifests: { 1: refused } });
+            const m = api.seed('a7eb274c', { stage: 'new' });
+            const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: 'secure' }), hooks: {} });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            eq(await flow.provision([1]), false, 'setMode: the run itself stops at the refused stage 1');
+            deq(api.calls[0], ['setMode', 'a7eb274c', 'secure'], 'setMode: first call of the run, with the picked scenario');
+            eq(api.names().slice(1).every((x) => x === 'stage1'), true, 'setMode: only then the stage manifests', api.names().join(' '));
+            eq(`${flow.module.mode}:${flow.module.mode_chosen}`, 'secure:secure', 'setMode: the flow takes the module the server returned');
+        }
+        {
+            // not called again when the board already has that scenario
+            const refused = { ready: false, reason: 'stop here (test)', job: null };
+            const api = new T.FakeApi({ files: new Map(), manifests: { 1: refused } });
+            const m = api.seed('a7eb274c', { stage: 'new', mode: 'secure', mode_chosen: 'secure' });
+            const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: 'secure' }), hooks: {} });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            await flow.provision([1]);
+            eq(api.calls.some((c) => c[0] === 'setMode'), false, 'mode_chosen already "secure": no setMode');
+        }
+        {
+            // the server default is not a choice: it is sent once (and resets nothing when it is the same)
+            const api = new T.FakeApi({ files: new Map(), manifests: {} });
+            const m = api.seed('a7eb274c', { stage: 'flashed', mode: 'open', mode_chosen: '' });
+            const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: 'open' }), hooks: {} });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            eq(await flow.provision(), true, 'default scenario confirmed on a flashed board: nothing to run');
+            deq(api.calls.map((c) => c.join(' ')), ['setMode a7eb274c open'], '… setMode records the choice, no stage is fetched');
+            eq(flow.module.stage, 'flashed', '… and the board stays flashed');
+        }
+        {
+            // a board whose OTP holds a key hash can only be provisioned in the secure scenario
+            const api = new T.FakeApi({ files: new Map(), manifests: {} });
+            const m = api.seed('a7eb274c', { stage: 'gadget', mode: 'secure', mode_chosen: 'secure', mode_locked: true, otp: { locked: true, locked_to_our_key: true, secure_boot_provisioned: true } });
+            const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: 'open' }), hooks: {} });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            await throwsLike(() => flow.provision(), /only the secure scenario is possible/, 'open on a mode_locked board → refused before anything runs');
+            eq(api.calls.length, 0, 'mode_locked: no setMode, no stage call');
+            eq(flow.running, false, 'mode_locked: the flow is idle');
+            await throwsLike(() => api.setMode('a7eb274c', 'open'), /only the secure scenario/, 'FakeApi mirrors the server: setMode open on a locked board → 400');
+        }
+        {
+            // switching scenario on a board with progress: the server resets the stage, the run plans 1, 2, 3
+            const refused = { ready: false, reason: 'stop here (test)', job: null };
+            const api = new T.FakeApi({ files: new Map(), manifests: { 1: refused, 2: refused, 3: refused } });
+            const m = api.seed('a7eb274c', { stage: 'flashed', mode: 'open', mode_chosen: 'open' });
+            const ev = newEv();
+            const flow = new OTP.Flow({ api, usb: new T.MockHub(), options: Object.assign({}, FLOW_OPTS, { scenario: 'secure' }), hooks: { onLog: (l, x) => ev.logs.push(`${l}: ${x}`) } });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            deq(flow.plan(), [1, 2, 3], 'switch open → secure on a flashed board: plan 1, 2, 3');
+            eq(await flow.provision(), false, 'switch: the run starts (and stops at the refused stage 1)');
+            deq(api.names(), ['setMode', 'stage1', 'stage2', 'stage3', 'stage1'], 'switch: setMode, the three manifests for the confirmation, then stage 1');
+            eq(`${flow.module.stage}:${flow.module.mode}`, 'new:secure', 'switch: the server reset the record to "new"');
+            assert(ev.logs.includes('info: Board a7eb274c: secure scenario (every stage is redone, starting with stage 1)'), 'switch: the reset is logged', ev.logs.join(' | '));
+        }
+        {
+            // the same switch while the board is connected as a fastboot gadget: the run starts over in RPIBOOT mode
+            const { files, m1 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: m1, 2: null, 3: null } });
+            const m = api.seed('a7eb274c', { stage: 'gadget', mode: 'open', mode_chosen: 'open' });
+            const hub = new T.MockHub();
+            const gadget = new T.FastbootSim({ serial64: '10000000a7eb274c' });
+            hub.permitted.add(T.MockHub.key(gadget));
+            hub.plug(gadget);
+            const ev = newEv();
+            ev.noAutoPick = true;   // nobody plugs the board in RPIBOOT mode: abort while the run waits for it
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            flow.module = JSON.parse(JSON.stringify(m));
+            flow.serial = 'a7eb274c';
+            flow.device = gadget;
+            flow.deviceKind = 'fastboot';
+            deq(flow.plan(), [1, 2, 3], 'switch on a gadget: the page announces stages 1, 2, 3');
+            await flow._applyScenario();
+            eq(flow.module.stage, 'new', 'switch on a gadget: the server reset the record');
+            deq(flow.plan(), [1, 2, 3], 'switch on a gadget: after the reset the run still plans 1, 2, 3 (not stage 3 alone)');
+            api.seed('a7eb274c', { stage: 'gadget', mode: 'open', mode_chosen: 'open' });   // back to before the switch
+            flow.module = JSON.parse(JSON.stringify(m));   // provision() applies the switch itself
+            api.calls.length = 0;
+            const run = flow.provision();
+            await until(() => ev.need.includes('rpiboot'), 8000, 'the run to ask for the board in RPIBOOT mode');
+            eq(flow.stages[1].state, 'waiting', 'switch on a gadget: stage 1 waits for the board in RPIBOOT mode');
+            assert(/RPIBOOT/.test(flow.stages[1].detail), 'switch on a gadget: … and says so', flow.stages[1].detail);
+            flow.abort();
+            eq(await run, false, 'switch on a gadget: aborted while waiting');
+            deq(api.names(), ['setMode', 'stage1', 'stage2', 'stage3', 'stage1'], 'switch on a gadget: setMode, the manifests, then stage 1 (stages 2 and 3 refused: secure, OTP not locked yet)');
+            eq(api.gated, 2, 'switch on a gadget: the server refuses stages 2 and 3 of the not-yet-locked secure board');
+            deq(gadget.commands, [], 'switch on a gadget: nothing was sent to the gadget (no stage 3 on its own)');
+            eq(ev.confirms.length, 1, 'switch on a gadget: one confirmation (stage 1) before waiting');
+            eq(ev.confirms[0] && ev.confirms[0].flags.map((f) => f.key).join('|'), 'stage 1: program_pubkey', '… for program_pubkey');
+            assert(ev.logs.includes('info: Board a7eb274c: secure scenario (every stage is redone, starting with stage 1)'), 'switch on a gadget: the reset is logged', ev.logs.filter((l) => /scenario/.test(l)).join(' | '));
+        }
+        {
+            // a secure board whose OTP does not hold our key hash (stage 1 never confirmed): stage 3 alone is refused
+            const { files, m3 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
+            api.seed('a7eb274c', { stage: 'gadget', mode_chosen: 'secure' });
+            const hub = new T.MockHub();
+            const sim = new T.FastbootSim({ deviceKey: KEY_A });
+            hub.plug(sim);
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            await flow.connectBoard();
+            deq(flow.plan(), [3], 'secure gadget, OTP not locked: the page plans stage 3');
+            eq(await flow.provision(), false, 'secure gadget, OTP not locked: stage 3 fails');
+            assert(/OTP does not hold this board's key hash yet: run stage 1 first/.test(flow.stages[3].detail), 'secure gadget, OTP not locked: the server\'s reason is shown', flow.stages[3].detail);
+            deq(sim.commands.filter((c) => !c.startsWith('getvar:')), [], 'secure gadget, OTP not locked: nothing exported, erased or written');
+            eq(api.calls.some((c) => c[0] === 'deviceKey'), false, 'secure gadget, OTP not locked: no device key posted');
+        }
+
+        // ================================================================ T10c secure stage 3 on a gadget: existing key, failures
+        section = 'stage3-secure';
+        {
+            // the board's OTP already holds a key (exported at gadget boot); the server reports zero OTP words
+            const { files, m3 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 }, zeroWords: 2 });
+            api.seed('a7eb274c', { stage: 'gadget', mode: 'secure', mode_chosen: 'secure', mode_locked: true, otp: { locked: true, locked_to_our_key: true, secure_boot_provisioned: true } });
+            const hub = new T.MockHub();
+            const sim = new T.FastbootSim({ deviceKey: KEY_A });
+            hub.plug(sim);
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            await flow.connectBoard();
+            deq(flow.plan(), [3], 'existing key: a gadget of a secure board plans stage 3');
+            eq(await flow.provision(), true, 'existing key: stage 3 succeeded');
+            const cmds = sim.commands;
+            const first = cmds.findIndex((c) => !c.startsWith('getvar:'));
+            deq(cmds.slice(first, first + 2), [`oem upload-file ${KX.key}`, 'upload'], 'existing key: the first state-touching commands fetch key.der');
+            eq(cmds.indexOf(`oem download-file ${KX.request}`), -1, 'existing key: no request (nothing generated)');
+            assert(cmds.lastIndexOf('upload') < cmds.indexOf('erase:mmcblk0'), 'existing key: exported before the erase', cmds.join(' | '));
+            const dk = api.calls.find((c) => c[0] === 'deviceKey');
+            eq(dk && T.hex(T.unb64(dk[2].key_der_b64)), T.hex(KEY_A.der), 'existing key: posted to the server');
+            assert(ev.logs.some((l) => /^warn: 2 of the 8 OTP words of the device key are zero/.test(l)), 'existing key: zero_words > 0 → warning', ev.logs.filter((l) => /OTP/.test(l)).join(' | '));
+            eq(api.calls.some((c) => c[0] === 'setMode'), false, 'existing key: the scenario was already chosen');
+        }
+        {
+            // the key is READ-locked in this boot: stage 3 fails before anything is erased
+            const { files, m3 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
+            api.seed('a7eb274c', { stage: 'gadget', mode: 'secure', mode_chosen: 'secure', mode_locked: true, otp: { locked: true, locked_to_our_key: true, secure_boot_provisioned: true } });
+            const hub = new T.MockHub();
+            const sim = new T.FastbootSim({ deviceKey: KEY_A, readLocked: true });
+            hub.plug(sim);
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            await flow.connectBoard();
+            eq(await flow.provision(), false, 'locked key: stage 3 fails');
+            assert(/run stage 2 again/.test(flow.stages[3].detail), 'locked key: the operator is told to boot the gadget again', flow.stages[3].detail);
+            eq(sim.erased.length + sim.flashes.length, 0, 'locked key: nothing erased or flashed');
+            eq(sim.commands.includes('oem fwcrypto init'), false, 'locked key: no oem fwcrypto init');
+            eq(api.calls.some((c) => c[0] === 'deviceKey'), false, 'locked key: nothing posted as a device key');
+            const r3 = api.calls.find((c) => c[0] === 'result');
+            eq(r3 && `${r3[2]}:${r3[3].ok}`, '3:false', 'locked key: the failure is reported to the server');
+        }
+        {
+            // the server refuses the exported key (it does not match getvar:public-key): nothing is erased
+            const { files, m3 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
+            api.seed('a7eb274c', { stage: 'gadget', mode: 'secure', mode_chosen: 'secure', mode_locked: true, otp: { locked: true, locked_to_our_key: true, secure_boot_provisioned: true } });
+            const hub = new T.MockHub();
+            const sim = new T.FastbootSim({ deviceKey: KEY_A });
+            sim.files.set(KX.key, KEY_B.der.slice());   // key.der of another key than the OTP one
+            hub.plug(sim);
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            await flow.connectBoard();
+            eq(await flow.provision(), false, 'mismatching key: stage 3 fails');
+            assert(/server: the exported device key does not match/.test(flow.stages[3].detail), 'mismatching key: the server\'s reason is shown', flow.stages[3].detail);
+            eq(sim.erased.length + sim.flashes.length, 0, 'mismatching key: nothing erased or flashed');
+        }
+
         // ================================================================ T11 page wiring with the runner's fake API
         section = 'page';
         await OTP.app.ready;
+        // app = OTP.app (declared in T5)
+        const gate = document.getElementById('google-gate');
+        // ?google_error=... (what /api/google/login appends when the sign-in failed): shown, removed from the URL
+        eq(app.srv.googleError, window.__FIX.googleError, 'google_error from the URL is picked up');
+        eq(location.search, '', 'google_error is removed from the URL');
+        assert(!gate.classList.contains('hidden') && gate.textContent.includes('Google sign-in: ' + window.__FIX.googleError), 'google_error is shown in the gate', gate.textContent);
+        eq(document.body.classList.contains('gated'), false, 'google_error alone does not gate the page (still signed in)');
+        const dismiss = [...gate.querySelectorAll('button')].find((b) => b.textContent === 'Dismiss');
+        assert(dismiss, 'google_error: a Dismiss button');
+        if (dismiss) dismiss.click();
+        eq(gate.classList.contains('hidden'), true, 'Dismiss hides the gate');
         const badges = document.getElementById('server-badges').textContent;
         assert(/Server .*✓/.test(badges), 'server badge online (runner fake API)', badges);
-        assert(/Storage: local/.test(badges), 'storage badge', badges);
+        assert(/Storage: gsheets ✓/.test(badges), 'storage badge: Google Sheets', badges);
+        const sheetLink = [...document.querySelectorAll('#server-badges a.badge')].find((a) => /Sheets ↗/.test(a.textContent));
+        assert(sheetLink && /^https:\/\/docs\.google\.com\/spreadsheets\/d\//.test(sheetLink.getAttribute('href')), 'header: link to the station spreadsheet', sheetLink && sheetLink.outerHTML);
+        assert([...document.querySelectorAll('#server-badges button')].some((b) => b.textContent === 'Sign out'), 'header: Sign out button');
         eq(document.querySelectorAll('#builds .build-row').length, 3, 'three build rows');
         assert(document.querySelectorAll('#registry-table tbody tr.clickable').length >= 1, 'registry rows from /api/modules');
         eq(document.querySelectorAll('#steps .step').length, 3, 'three step rows');
@@ -834,9 +1350,162 @@
         eq(document.getElementById('btn-connect').disabled, !navigator.usb, 'Connect board enabled when WebUSB exists');
         document.querySelector('#registry-table tbody tr.clickable').click();
         assert(document.querySelector('#board-detail .serial-big'), 'clicking a registry row shows the record in the Board card');
+        const rowOf = (serial) => [...document.querySelectorAll('#registry-table tbody tr.clickable')].find((tr) => tr.firstChild.textContent === serial);
+        if (rowOf('5e21c09a')) rowOf('5e21c09a').click();
+        let card = document.getElementById('board-detail').textContent;
+        assert(card.includes('Scenariosecure · OTP locked: secure only'), 'board card: the scenario of a locked board', card);
+        assert(card.includes('private key on the server'), 'board card: the exported device key', card);
+        if (rowOf('0c4f88d1')) rowOf('0c4f88d1').click();
+        card = document.getElementById('board-detail').textContent;
+        assert(card.includes('Scenarioopen (default)'), 'board card: a board without a choice shows the default scenario', card);
+        assert(!document.documentElement.innerHTML.includes('stage-dirs'), 'no hint mentions the deleted stage-dirs/ folder');
         OTP.app.setStep(2, 'failed', 'test failure', { verdict: { ok: false, notes: ['note A'] } });
         eq(OTP.app.steps[2].root.className + '|' + OTP.app.steps[2].notes.textContent, 'step state-failed|note A', 'step rendering');
         OTP.app.setStep(2, 'idle', '');
+
+        // ================================================================ T12 Google gate (fake /api/status variants)
+        section = 'page-google';
+        const fakeStatus = async (obj) => { await fetch('/__fake/status', { method: 'POST', body: JSON.stringify(obj) }); return app.refreshStatus(); };
+        const fakeReset = async () => { await fetch('/__fake/reset', { method: 'POST' }); return app.refreshStatus(); };
+        const counts = async () => (await fetch('/__fake/counts')).json();
+        const provBtn = document.getElementById('btn-provision');
+        const connBtn = document.getElementById('btn-connect');
+        const hintEl = document.getElementById('provision-hint');
+        const gated = () => document.body.classList.contains('gated');
+        const fakeBoard = (fields) => Object.assign({ serial: 'a7eb274c', stage: 'eeprom', stage_label: 'EEPROM flashed', mode: 'open', mode_chosen: 'open', mode_locked: false, secrets: {}, otp: {}, metadata: {}, facts: {}, events: [] }, fields || {});
+        app.flow.module = fakeBoard();
+        app.flow.serial = 'a7eb274c';
+        app.renderScenario();
+        eq(provBtn.disabled, false, 'signed in + a board: Provision enabled');
+        {
+            await fakeStatus({ google: { client: false, signed_in: false, spreadsheet_id: '', spreadsheet_url: '' }, google_ready: false, settings: { ok: false, error: 'not signed in to Google' } });
+            assert(!gate.classList.contains('hidden') && gate.classList.contains('err'), 'no OAuth client: the gate is shown as an error');
+            assert(/No Google OAuth client/.test(gate.textContent) && gate.textContent.includes('C:/station/OTP_Provisioner/google-oauth-client.json'), 'no OAuth client: says where the client JSON goes', gate.textContent);
+            eq(gate.querySelector('a[href="/api/google/login"]'), null, 'no OAuth client: no sign-in link');
+            eq(gated(), true, 'no OAuth client: body.gated');
+            eq(`${connBtn.disabled}:${provBtn.disabled}`, 'true:true', 'no OAuth client: Connect board and Provision disabled');
+            eq(hintEl.textContent, 'sign in to Google first', 'gated: the provision hint');
+            eq([...document.querySelectorAll('#server-badges a.badge')].some((a) => /Sheets ↗/.test(a.textContent)), false, 'not signed in: no spreadsheet link in the header');
+        }
+        {
+            await fakeStatus({ google: { client: true } });
+            const link = gate.querySelector('a[href="/api/google/login"]');
+            eq(link && link.textContent, 'Sign in with Google', 'not signed in: "Sign in with Google" → /api/google/login');
+            eq(gate.classList.contains('err'), false, 'not signed in: not shown as an error');
+            eq(gated(), true, 'not signed in: body.gated');
+            eq(`${connBtn.disabled}:${provBtn.disabled}`, 'true:true', 'not signed in: Connect board and Provision disabled');
+            await throwsLike(() => OTP.api.modules(), /sign in to Google first.*HTTP 401/, 'not signed in: module endpoints answer 401 with the reason');
+        }
+        {
+            await fakeStatus({ google: { signed_in: true, spreadsheet_id: 'x1', spreadsheet_url: 'https://docs.google.com/spreadsheets/d/x1/edit' },
+                settings: { error: 'the settings worksheet cannot be read: HTTP 403 (insufficient permissions)' } });
+            assert(gate.textContent.includes('Google Sheets is not usable: the settings worksheet cannot be read: HTTP 403'), 'signed in, not ready: the sheet error is shown', gate.textContent);
+            const again = gate.querySelector('a[href="/api/google/login"]');
+            eq(again && again.textContent, 'Sign in again', 'signed in, not ready: "Sign in again"');
+            assert([...gate.querySelectorAll('button')].some((b) => b.textContent === 'Sign out'), 'signed in, not ready: "Sign out" in the gate');
+            eq(gate.classList.contains('err'), true, 'signed in, not ready: shown as an error');
+            eq(gated(), true, 'signed in, not ready: body.gated');
+            eq(provBtn.disabled, true, 'signed in, not ready: Provision disabled even with a board');
+        }
+        {
+            const before = (await counts())['GET modules'] || 0;
+            await fakeStatus({ google_ready: true, settings: { ok: true, error: '' } });
+            eq(gate.classList.contains('hidden'), true, 'ready: no gate');
+            eq(gated(), false, 'ready: body not gated');
+            eq(`${connBtn.disabled}:${provBtn.disabled}`, `${!navigator.usb}:false`, 'ready: Connect board and Provision enabled again');
+            let after = before;
+            for (let i = 0; i < 100 && after <= before; i++) { await T.sleep(20); after = (await counts())['GET modules'] || 0; }
+            assert(after > before, 'signing in reloads the registry (GET /api/modules)', `${before} → ${after}`);
+            const link = [...document.querySelectorAll('#server-badges a.badge')].find((a) => /Sheets ↗/.test(a.textContent));
+            eq(link && link.getAttribute('href'), 'https://docs.google.com/spreadsheets/d/x1/edit', 'ready: the header links the spreadsheet_url');
+            eq(link && link.textContent, 'Google: operator@example.com · Sheets ↗', 'ready: the header names the signed-in account');
+            const out = [...document.querySelectorAll('#server-badges button')].find((b) => b.textContent === 'Sign out');
+            assert(out, 'ready: Sign out in the header');
+            const posts = (await counts())['POST google/*'] || 0;
+            if (out) out.click();
+            await until(() => gated(), 3000, 'Sign out to gate the page');
+            eq(((await counts())['POST google/*'] || 0) - posts, 1, 'Sign out → POST /api/google/logout');
+            eq(gate.querySelector('a[href="/api/google/login"]') && gate.querySelector('a[href="/api/google/login"]').textContent, 'Sign in with Google', 'after Sign out: the sign-in link');
+        }
+        await fakeReset();
+        eq(gated(), false, 'fake API reset: signed in again');
+
+        // ================================================================ T13 scenario radios
+        section = 'page-scenario';
+        {
+            const R = Object.fromEntries([...document.querySelectorAll('#scenario input[name=scenario]')].map((r) => [r.value, r]));
+            deq(Object.keys(R).sort(), ['open', 'secure'], 'two scenario radios: open, secure');
+            const modeText = () => document.getElementById('provision-mode').textContent;
+            app.flow.module = null;
+            app.flow.serial = '';
+            app.srv.scenario = '';
+            localStorage.removeItem('otp.scenario');
+            app.renderScenario();
+            eq(`${R.open.checked}:${R.secure.checked}`, 'true:false', 'no choice yet: provisioning.default_mode from /api/status (open)');
+            assert(/^Open: /.test(modeText()), 'the open scenario is described', modeText());
+            await fakeStatus({ config: { provisioning: { default_mode: 'secure' } } });
+            eq(`${R.open.checked}:${R.secure.checked}`, 'false:true', 'default_mode secure → secure preselected');
+            assert(/^Secure: .*LUKS/.test(modeText()), 'the secure scenario is described', modeText());
+            eq(app.flow.scenario(), 'secure', 'the page\'s Flow reads the selected scenario');
+            R.open.click();
+            eq(localStorage.getItem('otp.scenario'), 'open', 'the operator\'s choice is remembered (localStorage otp.scenario)');
+            eq(`${app.currentScenario()}:${R.open.checked}:${app.flow.scenario()}`, 'open:true:open', 'the choice wins over the default');
+            await app.refreshStatus();
+            eq(R.open.checked, true, 'the choice survives a status refresh');
+            app.flow.module = fakeBoard({ mode: 'secure', mode_chosen: 'secure', mode_locked: true, otp: { locked: true, locked_to_our_key: true } });
+            app.flow.serial = 'a7eb274c';
+            app.renderScenario();
+            eq(`${R.secure.checked}:${R.open.disabled}:${R.secure.disabled}`, 'true:true:false', 'mode_locked board: secure forced, open disabled');
+            assert(/OTP is locked: secure only/.test(modeText()), 'mode_locked board: explained', modeText());
+            eq(app.flow.scenario(), 'secure', 'mode_locked board: the Flow gets secure');
+            R.open.click();
+            eq(R.secure.checked, true, 'mode_locked board: open cannot be picked');
+            eq(localStorage.getItem('otp.scenario'), 'open', 'mode_locked board: the remembered choice is kept');
+            app.flow.module = fakeBoard({ stage: 'flashed', stage_label: 'Image written' });
+            app.renderScenario();
+            eq(`${R.open.disabled}:${R.open.checked}`, 'false:true', 'an open board: open selectable again (the remembered choice)');
+            assert(/is fully provisioned \(open scenario\)/.test(hintEl.textContent), 'flashed in the picked scenario: nothing to do', hintEl.textContent);
+            eq(provBtn.disabled, true, 'flashed in the picked scenario: Provision disabled');
+            R.secure.click();
+            assert(/stages 1 → 2 → 3 · secure scenario \(switching: every stage is redone\)/.test(hintEl.textContent), 'switching the scenario of a flashed board: the hint says every stage is redone', hintEl.textContent);
+            eq(provBtn.disabled, false, 'switching: Provision enabled');
+            eq(localStorage.getItem('otp.scenario'), 'secure', 'switching: remembered');
+        }
+        app.flow.module = null;
+        app.flow.serial = '';
+        app.srv.scenario = '';
+        localStorage.removeItem('otp.scenario');
+        await fakeReset();
+        app.renderScenario();
+        app.renderBoard();
+
+        // ================================================================ T14 server.js scenario / device-key calls against the fake API
+        section = 'api-scenario';
+        {
+            const a = OTP.api;
+            const r1 = await a.setMode('0c4f88d1', 'secure');
+            eq(`${r1.module.mode}:${r1.module.mode_chosen}:${r1.module.stage}`, 'secure:secure:new', 'setMode → POST /api/modules/{serial}/mode; a board with progress is reset to "new"');
+            for (const n of [2, 3]) {
+                const g = await a.stage('0c4f88d1', n);
+                eq(`${g.ready}:${g.job}:${/OTP does not hold this board's key hash yet: run stage 1 first/.test(g.reason)}`, 'false:null:true',
+                    `stage ${n} of a secure board whose OTP is not locked yet → 409 "run stage 1 first"`);
+            }
+            const s3 = await a.stage('5e21c09a', 3);
+            eq(`${s3.ready}:${s3.scenario}:${s3.mode}:${s3.fwcrypto_init}:${s3.image.variant}`, 'true:secure:signed:true:crypt', 'stage 3 of a locked secure board: signed, fwcrypto init, crypt image');
+            deq(s3.key_export, KX, 'stage 3 of a secure board names the gadget\'s key export paths');
+            const o3 = await a.stage('a7eb274c', 3);
+            eq(`${o3.scenario}:${o3.key_export}:${o3.fwcrypto_init}:${o3.image.variant}`, 'open:null:false:clear', 'stage 3 of an open board: no key export, no fwcrypto init, clear image');
+            eq((await a.stage('0c4f88d1', 1)).irreversible.map((f) => f.key).join(','), 'program_pubkey', 'stage 1 of a secure board: program_pubkey');
+            eq((await a.stage('a7eb274c', 1)).irreversible.length, 0, 'stage 1 of an open board: nothing irreversible');
+            await throwsLike(() => a.setMode('5e21c09a', 'open'), /only the secure scenario is possible.*HTTP 400/, 'setMode open on a locked board → ApiError 400');
+            await throwsLike(() => a.setMode('a7eb274c', 'closed'), /mode must be one of open, secure/, 'setMode with an unknown scenario → 400');
+            const dk = await a.deviceKey('0c4f88d1', { key_der_b64: T.b64(KEY_A.der), device_key_pem: KEY_A.pem });
+            eq(dk.device_key.fingerprint, await T.pemFingerprint(KEY_A.pem), 'deviceKey → POST /api/modules/{serial}/device-key; fingerprint = SHA-256 of the SPKI');
+            eq(`${dk.device_key.already}:${dk.device_key.zero_words}:${dk.module.otp.device_key_exported}`, 'false:0:true', 'deviceKey: stored, the module says device_key_exported');
+            eq((await a.deviceKey('0c4f88d1', { key_der_b64: T.b64(KEY_A.der), device_key_pem: KEY_A.pem })).device_key.already, true, 'deviceKey: the same key again → already');
+            await throwsLike(() => a.deviceKey('0c4f88d1', { key_der_b64: '%%%', device_key_pem: KEY_A.pem }), /not valid base64/, 'deviceKey: bad base64 → 400');
+            await fakeReset();
+        }
     } catch (e) {
         results.push('EXCEPTION: ' + ((e && e.stack) || e));
         failed++;

@@ -16,6 +16,8 @@
     <div id="caps" class="badges"></div>
 </header>
 
+<div id="google-gate" class="gate hidden" role="region" aria-label="Google sign-in"></div>
+
 <main class="layout" id="main-layout">
     <div class="col-left">
         <section class="panel" id="board-panel">
@@ -49,7 +51,11 @@
         <section class="panel" id="provision-panel">
             <div class="panel-head">
                 <h2>Provision</h2>
-                <span id="provision-mode" class="muted"></span>
+                <div id="scenario" class="segmented" role="radiogroup" aria-label="Provisioning scenario">
+                    <label title="Unsigned bootloader, clear image; nothing is written to OTP"><input type="radio" name="scenario" value="open"> Open</label>
+                    <label title="Signed bootloader (program_pubkey), LUKS-encrypted image, OTP device key exported to the server"><input type="radio" name="scenario" value="secure"> Secure</label>
+                </div>
+                <span id="provision-mode" class="muted head-note"></span>
             </div>
             <ol class="instructions">
                 <li>Insert the target <b>SD card</b> into the board.</li>

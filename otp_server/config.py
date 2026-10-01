@@ -1,20 +1,23 @@
-"""Server configuration (SPEC section 4).
+"""Server configuration (SPEC section 4). There is no configuration file.
 
-The configuration is a YAML file in which every key is optional; missing keys take the defaults in
-:data:`DEFAULTS`. The file is searched in this order (first existing one wins):
+Two sources, merged over :data:`DEFAULTS`:
 
-1. the ``path`` argument of :func:`load_config` (the ``--config`` CLI flag),
-2. the ``OTP_CONFIG`` environment variable,
-3. ``<repo>/config.yaml``,
-4. ``<work>/config.yaml``.
+* **Settings** -- everything under ``provisioning``, ``builds``, ``docker`` and ``paths.droneos`` -- live in
+  the ``settings`` worksheet of the station spreadsheet (:mod:`otp_server.settings`); the server reads them
+  after the operator has signed in to Google and re-reads them while it runs, so a change in the sheet
+  needs no restart.
+* **Bootstrap** -- what the server needs before anyone has signed in: ``server.*`` (listen address,
+  browser) and ``paths.work`` -- come from the command line, the environment (``OTP_WORK_DIR``,
+  ``OTP_PORT``) and the defaults.
 
-An explicit path (1 or 2) that does not exist is an error; 3 and 4 are optional. After the file, the
-environment overrides ``OTP_WORK_DIR`` (``paths.work``), ``OTP_STORAGE`` (``storage.backend``) and
-``OTP_PORT`` (``server.port``) are applied, and finally the ``overrides`` dict (CLI flags, tests).
+:func:`load_config` merges defaults, ``settings`` (a nested dict, as decoded from the sheet), the
+environment and finally ``overrides`` (CLI flags, tests). Retired keys are dropped with a warning:
+``provisioning.secure_boot``/``mode`` (the scenario is chosen per board; see
+``provisioning.default_mode``), ``storage.*`` (Google Sheets is the only store, configured by signing in)
+and ``builds.gadget.source`` (the gadget is always built here).
 
-Relative paths inside the YAML tree (and in ``overrides``) are resolved against the repository root;
-``builds.image.config`` is resolved against the droneos checkout (see :attr:`ImageBuildCfg.config`).
-``~`` and environment variables (``%LOCALAPPDATA%``, ``$HOME``) are expanded in every path.
+Relative paths are resolved against the repository root; ``builds.image.config`` is resolved against the
+droneos checkout (see :attr:`ImageBuildCfg.config`). ``~`` and environment variables are expanded.
 """
 
 from __future__ import annotations
@@ -33,38 +36,24 @@ log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-STORAGE_BACKENDS = ("local", "gsheets", "gdrive")
-GOOGLE_AUTH_MODES = ("service_account", "oauth")
-GADGET_SOURCES = ("build", "prebuilt", "auto")
 FIRMWARE_CHANNELS = ("default", "latest")
+#: Provisioning scenarios, chosen per board on the page (both are always available):
+#: ``open`` = unsigned bootloader + clear image, OTP untouched;
+#: ``secure`` = signed bootloader (program_pubkey) + LUKS-encrypted image + OTP device key export.
+PROVISIONING_MODES = ("open", "secure")
+#: rpi-image-gen provisioning map of the image each scenario flashes (``IGconf_image_pmap``).
+IMAGE_PMAP = {"open": "clear", "secure": "crypt"}
 
 DEFAULT_BOOT_CONF = "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=1\nBOOT_ORDER=0xf2461\n"
 
 #: The complete default configuration tree (the YAML schema).
 DEFAULTS: dict[str, Any] = {
-    "server": {"host": "127.0.0.1", "port": 8765, "open_browser": True},
+    "server": {"host": "127.0.0.1", "port": 8765, "open_browser": True, "browser": None},
     "paths": {"work": None, "droneos": "external/droneos"},
-    "storage": {
-        "backend": "local",
-        "local": {"dir": None},
-        "gsheets": {
-            "auth": "service_account",
-            "credentials": None,
-            "token": None,
-            "spreadsheet": None,
-            "worksheet": "modules",
-        },
-        "gdrive": {
-            "auth": "service_account",
-            "credentials": None,
-            "token": None,
-            "folder_id": None,
-        },
-    },
     "provisioning": {
-        "secure_boot": False,
+        "default_mode": "open",
         "jtag_lock": False,
-        "recovery_passphrase": True,
+        "recovery_passphrase": False,
         "confirm_irreversible": True,
         "erase_storage": True,
         "firmware_channel": "default",
@@ -75,14 +64,13 @@ DEFAULTS: dict[str, Any] = {
         "auto": True,
         "tools": {"image_tag": "otp-tools:latest"},
         "gadget": {
-            "source": "auto",
             "targets": "pi5-family",
             "image_tag": "otp-gadget-builder:trixie",
             "volume": "otp-pgm-work",
         },
         "image": {
             "config": "droneos.yaml",
-            "overrides": ["IGconf_image_pmap=crypt"],
+            "overrides": [],
             "builder_tag": "droneos-builder:trixie",
             "volume": "otp-droneos-work",
             "keep_raw_image": False,
@@ -102,37 +90,16 @@ class ServerCfg:
     host: str
     port: int
     open_browser: bool
-
-
-@dataclass
-class GoogleCfg:
-    """Settings of one Google backend (``storage.gsheets`` or ``storage.gdrive``).
-
-    ``credentials`` is the service-account JSON key (``auth: service_account``) or the OAuth
-    "Desktop app" client JSON (``auth: oauth``). ``token`` is the OAuth authorized-user cache
-    (always filled with a default under ``<work>/google/``; unused for service accounts).
-    ``spreadsheet``/``worksheet`` are used by Sheets only, ``folder_id`` by Drive only.
-    """
-
-    auth: str
-    credentials: Path | None
-    token: Path | None
-    spreadsheet: str | None
-    worksheet: str
-    folder_id: str | None
-
-
-@dataclass
-class StorageCfg:
-    backend: str
-    local_dir: Path
-    gsheets: GoogleCfg
-    gdrive: GoogleCfg
+    #: Browser executable to open the page in (Chrome/Edge); None = the standard install locations.
+    browser: Path | None = None
 
 
 @dataclass
 class ProvisioningCfg:
-    secure_boot: bool
+    """``default_mode`` is the scenario the page preselects (:data:`PROVISIONING_MODES`); the operator
+    picks the scenario per board. ``jtag_lock`` and ``recovery_passphrase`` only apply to ``secure``."""
+
+    default_mode: str
     jtag_lock: bool
     recovery_passphrase: bool
     confirm_irreversible: bool
@@ -144,7 +111,6 @@ class ProvisioningCfg:
 
 @dataclass
 class GadgetBuildCfg:
-    source: str
     targets: str
     image_tag: str
     volume: str
@@ -195,18 +161,26 @@ class Config:
     repo_root: Path
     work_dir: Path
     droneos_dir: Path
-    config_path: Path | None
     server: ServerCfg
-    storage: StorageCfg
     provisioning: ProvisioningCfg
     builds: BuildsCfg
     docker: DockerCfg
-    #: Keys found in the YAML file that the schema does not know (typos); reported, not fatal.
+    #: Keys found in the settings/overrides that the schema does not know (typos); reported, not fatal.
     unknown_keys: list[str] = field(default_factory=list)
+    #: The command-line overrides this config was loaded with (they stay on top of the sheet settings).
+    bootstrap: dict = field(default_factory=dict)
+
+    def apply_settings(self, other: "Config") -> None:
+        """Take over the sheet-backed parts of ``other`` in place (the services keep this object)."""
+        self.droneos_dir = other.droneos_dir
+        self.provisioning = other.provisioning
+        self.builds = other.builds
+        self.docker = other.docker
+        self.unknown_keys = list(other.unknown_keys)
 
     @property
     def external_dir(self) -> Path:
-        """``<repo>/external`` (the usbboot / rpi-sb-provisioner / pi-gen-micro submodules)."""
+        """``<repo>/external`` (the usbboot / pi-gen-micro / droneos submodules)."""
         return self.repo_root / "external"
 
     @property
@@ -224,7 +198,6 @@ class Config:
         """Create the runtime directory tree under ``work_dir`` (idempotent)."""
         dirs = [
             self.work_dir,
-            self.storage.local_dir,
             self.work_dir / "google",
             self.work_dir / "modules",
             self.work_dir / "artifacts",
@@ -246,31 +219,14 @@ class Config:
         credential file or any per-board secret.
         """
 
-        def g(c: GoogleCfg) -> dict:
-            return {
-                "auth": c.auth,
-                "credentials": _pstr(c.credentials),
-                "credentials_exists": bool(c.credentials and c.credentials.is_file()),
-                "token": _pstr(c.token),
-                "spreadsheet": c.spreadsheet,
-                "worksheet": c.worksheet,
-                "folder_id": c.folder_id,
-            }
-
         return {
             "version": __version__,
             "repo_root": str(self.repo_root),
             "work_dir": str(self.work_dir),
             "droneos_dir": str(self.droneos_dir),
-            "config_path": _pstr(self.config_path),
-            "server": asdict(self.server),
-            "storage": {
-                "backend": self.storage.backend,
-                "local_dir": str(self.storage.local_dir),
-                "gsheets": g(self.storage.gsheets),
-                "gdrive": g(self.storage.gdrive),
-            },
-            "provisioning": asdict(self.provisioning),
+            "settings": "Google Sheets (worksheet settings)",
+            "server": {**asdict(self.server), "browser": _pstr(self.server.browser)},
+            "provisioning": {**asdict(self.provisioning), "modes": list(PROVISIONING_MODES)},
             "builds": {
                 "auto": self.builds.auto,
                 "tools": asdict(self.builds.tools),
@@ -308,30 +264,25 @@ def default_work_dir() -> Path:
 
 
 def load_config(
-    path: str | Path | None = None,
     *,
     overrides: dict | None = None,
     repo_root: Path | None = None,
+    settings: dict | None = None,
 ) -> Config:
-    """Load, merge and validate the configuration.
+    """Merge and validate the configuration.
 
-    :param path: explicit config file (``--config``); must exist when given.
-    :param overrides: nested dict merged last, e.g. ``{"server": {"port": 9000}}``.
+    :param overrides: nested dict merged last (CLI flags, tests), e.g. ``{"server": {"port": 9000}}``.
     :param repo_root: repository root (default: the directory containing ``otp_server``).
-    :raises FileNotFoundError: an explicit config file (argument or ``OTP_CONFIG``) is missing.
-    :raises ValueError: invalid YAML or an invalid value (enum, type).
+    :param settings: nested dict of the sheet-backed settings (values may be text, as read from cells).
+    :raises ValueError: an invalid value (enum, type).
     """
     root = Path(repo_root).resolve() if repo_root is not None else REPO_ROOT
 
-    # Environment overrides (applied after the file, before ``overrides``).
     env_tree: dict[str, Any] = {}
     env_work = os.environ.get("OTP_WORK_DIR")
     if env_work:
         # Relative env paths are relative to the current directory, not the repo root.
         env_tree.setdefault("paths", {})["work"] = str(Path(_expand(env_work)).resolve())
-    env_backend = os.environ.get("OTP_STORAGE")
-    if env_backend:
-        env_tree.setdefault("storage", {})["backend"] = env_backend.strip()
     env_port = os.environ.get("OTP_PORT")
     if env_port:
         try:
@@ -339,27 +290,28 @@ def load_config(
         except ValueError:
             raise ValueError(f"OTP_PORT must be an integer, got {env_port!r}") from None
 
-    # The work dir used to look for <work>/config.yaml: env / overrides beat the platform default
-    # (a paths.work inside that very file cannot be used to find it).
-    search_work = _peek(overrides, "paths", "work") or env_tree.get("paths", {}).get("work")
-    search_work_dir = _resolve_path(search_work, root) if search_work else default_work_dir()
-
-    config_path = _find_config(path, root, search_work_dir)
-    file_tree: dict[str, Any] = {}
-    if config_path is not None:
-        file_tree = _read_yaml(config_path)
-
     tree = copy.deepcopy(DEFAULTS)
     unknown: list[str] = []
-    _collect_unknown(file_tree, DEFAULTS, "", unknown)
-    for u in unknown:
-        log.warning("config %s: unknown key %r ignored", config_path, u)
-    _deep_merge(tree, file_tree)
+    layers = []
+    for name, layer in (("settings", settings), ("overrides", overrides)):
+        if not layer:
+            continue
+        layer = copy.deepcopy(layer)
+        _retired_keys(layer, name)
+        found: list[str] = []
+        _collect_unknown(layer, DEFAULTS, "", found)
+        for u in found:
+            log.warning("config %s: unknown key %r ignored", name, u)
+        unknown.extend(found)
+        layers.append((name, layer))
+    for name, layer in layers:
+        if name == "settings":
+            _deep_merge(tree, layer)
     _deep_merge(tree, env_tree)
-    if overrides:
-        _deep_merge(tree, overrides)
-
-    return _build(tree, root, config_path, unknown)
+    for name, layer in layers:
+        if name == "overrides":
+            _deep_merge(tree, layer)
+    return _build(tree, root, unknown)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -399,37 +351,44 @@ def _peek(tree: Mapping | None, *keys: str) -> Any:
     return cur
 
 
-def _find_config(path: str | Path | None, root: Path, work: Path) -> Path | None:
-    if path is not None and str(path).strip():
-        p = _resolve_path(path, Path.cwd())
-        if not p.is_file():
-            raise FileNotFoundError(f"config file not found: {p}")
-        return p
-    env = os.environ.get("OTP_CONFIG")
-    if env and env.strip():
-        p = _resolve_path(env.strip(), Path.cwd())
-        if not p.is_file():
-            raise FileNotFoundError(f"OTP_CONFIG points to a missing file: {p}")
-        return p
-    for cand in (root / "config.yaml", work / "config.yaml"):
-        if cand.is_file():
-            return cand
-    return None
+def _retired_keys(tree: Any, where: str) -> None:
+    """Drop (or translate) retired keys in place, with a warning instead of an "unknown key".
 
-
-def _read_yaml(p: Path) -> dict:
-    import yaml  # PyYAML; imported here so importing this module stays cheap
-
-    try:
-        with open(p, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"config file {p} is not valid YAML: {exc}") from None
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"config file {p}: top level must be a mapping, got {type(data).__name__}")
-    return data
+    * ``provisioning.secure_boot`` / ``provisioning.mode`` -> ``provisioning.default_mode`` (the scenario
+      is chosen per board now; the flag only says which one the page preselects);
+    * the whole ``storage`` section: the registry is the station's Google spreadsheet, set up by signing in;
+    * ``builds.gadget.source``: the fastboot gadget is always built by this server.
+    """
+    if not isinstance(tree, dict):
+        return
+    prov = tree.get("provisioning")
+    if isinstance(prov, dict):
+        for old in ("mode", "secure_boot"):
+            if old not in prov:
+                continue
+            value = prov.pop(old)
+            if "default_mode" in prov:
+                log.warning("config %s: provisioning.%s is retired and ignored (provisioning.default_mode is set)",
+                            where, old)
+                continue
+            if old == "mode":
+                prov["default_mode"] = value
+            else:
+                try:
+                    prov["default_mode"] = "secure" if _bool(value, "provisioning.secure_boot") else "open"
+                except ValueError:
+                    raise ValueError("config provisioning.secure_boot is retired: use "
+                                     "provisioning.default_mode: open | secure") from None
+            log.warning("config %s: provisioning.%s is retired; read as provisioning.default_mode: %s "
+                        "(the scenario is chosen per board on the page)", where, old, prov["default_mode"])
+    if "storage" in tree:
+        tree.pop("storage")
+        log.warning("config %s: the storage section is retired and ignored: the registry is the station's "
+                    "Google spreadsheet, set up by signing in to Google on the page", where)
+    gadget = (tree.get("builds") or {}).get("gadget") if isinstance(tree.get("builds"), dict) else None
+    if isinstance(gadget, dict) and "source" in gadget:
+        gadget.pop("source")
+        log.warning("config %s: builds.gadget.source is retired: the gadget is always built here", where)
 
 
 def _deep_merge(dst: dict, src: Mapping) -> dict:
@@ -506,18 +465,6 @@ def _enum(v: Any, key: str, allowed: tuple[str, ...]) -> str:
     return s
 
 
-def _google(tree: Mapping, key: str, root: Path, work: Path, token_name: str) -> GoogleCfg:
-    token = _opt_path(tree.get("token"), root, f"{key}.token")
-    return GoogleCfg(
-        auth=_enum(tree.get("auth"), f"{key}.auth", GOOGLE_AUTH_MODES),
-        credentials=_opt_path(tree.get("credentials"), root, f"{key}.credentials"),
-        token=token if token is not None else work / "google" / token_name,
-        spreadsheet=_str(tree.get("spreadsheet"), f"{key}.spreadsheet", allow_none=True),
-        worksheet=_str(tree.get("worksheet") or "modules", f"{key}.worksheet") or "modules",
-        folder_id=_str(tree.get("folder_id"), f"{key}.folder_id", allow_none=True),
-    )
-
-
 def _image_config(value: Any, droneos: Path) -> str:
     s = _str(value, "builds.image.config")
     if not s:
@@ -536,8 +483,8 @@ def _default_desktop_path() -> Path | None:
     return Path(base) / "Docker" / "Docker" / "Docker Desktop.exe"
 
 
-def _build(tree: dict, root: Path, config_path: Path | None, unknown: list[str]) -> Config:
-    srv, pth, sto = tree["server"], tree["paths"], tree["storage"]
+def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
+    srv, pth = tree["server"], tree["paths"]
     prov, bld, dck = tree["provisioning"], tree["builds"], tree["docker"]
 
     work = _opt_path(pth.get("work"), root, "paths.work") or default_work_dir()
@@ -549,14 +496,7 @@ def _build(tree: dict, root: Path, config_path: Path | None, unknown: list[str])
         host=_str(srv.get("host"), "server.host") or "127.0.0.1",
         port=_int(srv.get("port"), "server.port", lo=1, hi=65535),
         open_browser=_bool(srv.get("open_browser"), "server.open_browser"),
-    )
-
-    local = sto.get("local") or {}
-    storage = StorageCfg(
-        backend=_enum(sto.get("backend"), "storage.backend", STORAGE_BACKENDS),
-        local_dir=_opt_path(local.get("dir"), root, "storage.local.dir") or work / "registry",
-        gsheets=_google(sto.get("gsheets") or {}, "storage.gsheets", root, work, "gsheets-token.json"),
-        gdrive=_google(sto.get("gdrive") or {}, "storage.gdrive", root, work, "gdrive-token.json"),
+        browser=_opt_path(srv.get("browser"), root, "server.browser"),
     )
 
     boot_conf = prov.get("boot_conf")
@@ -566,7 +506,7 @@ def _build(tree: dict, root: Path, config_path: Path | None, unknown: list[str])
     if not boot_conf.endswith("\n"):
         boot_conf += "\n"
     provisioning = ProvisioningCfg(
-        secure_boot=_bool(prov.get("secure_boot"), "provisioning.secure_boot"),
+        default_mode=_enum(prov.get("default_mode"), "provisioning.default_mode", PROVISIONING_MODES),
         jtag_lock=_bool(prov.get("jtag_lock"), "provisioning.jtag_lock"),
         recovery_passphrase=_bool(prov.get("recovery_passphrase"), "provisioning.recovery_passphrase"),
         confirm_irreversible=_bool(prov.get("confirm_irreversible"), "provisioning.confirm_irreversible"),
@@ -586,11 +526,14 @@ def _build(tree: dict, root: Path, config_path: Path | None, unknown: list[str])
         ovr = [ovr]
     if not isinstance(ovr, list) or not all(isinstance(o, (str, int, float)) for o in ovr):
         raise ValueError("config builds.image.overrides: expected a list of KEY=VALUE strings")
+    for o in ovr:
+        if str(o).strip().startswith("IGconf_image_pmap="):
+            raise ValueError("config builds.image.overrides: IGconf_image_pmap is set per scenario "
+                             "(open = clear, secure = crypt; both images are built); remove it")
     builds = BuildsCfg(
         auto=_bool(bld.get("auto"), "builds.auto"),
         tools=ToolsBuildCfg(image_tag=_str(tools.get("image_tag"), "builds.tools.image_tag") or ""),
         gadget=GadgetBuildCfg(
-            source=_enum(gadget.get("source"), "builds.gadget.source", GADGET_SOURCES),
             targets=_str(gadget.get("targets"), "builds.gadget.targets") or "pi5-family",
             image_tag=_str(gadget.get("image_tag"), "builds.gadget.image_tag") or "",
             volume=_str(gadget.get("volume"), "builds.gadget.volume") or "",
@@ -615,9 +558,7 @@ def _build(tree: dict, root: Path, config_path: Path | None, unknown: list[str])
         repo_root=root,
         work_dir=work,
         droneos_dir=droneos,
-        config_path=config_path,
         server=server,
-        storage=storage,
         provisioning=provisioning,
         builds=builds,
         docker=docker,

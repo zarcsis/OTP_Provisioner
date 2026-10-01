@@ -98,6 +98,11 @@
             },
             result(serial, n, body) { return request('POST', `/api/modules/${enc(serial)}/stage/${n}/result`, body); },
             facts(serial, body) { return request('POST', `/api/modules/${enc(serial)}/facts`, body); },
+            /** Choose the provisioning scenario of a board: "open" | "secure". */
+            setMode(serial, mode) { return request('POST', `/api/modules/${enc(serial)}/mode`, { mode }); },
+            /** Hand over the OTP device key the gadget exported: {key_der_b64, device_key_pem}. */
+            deviceKey(serial, body) { return request('POST', `/api/modules/${enc(serial)}/device-key`, body); },
+            googleLogout() { return request('POST', '/api/google/logout', {}); },
             identify(body) { return request('POST', '/api/fastboot/identify', body); },
             builds() { return request('GET', '/api/builds'); },
             startBuild(target, force) { return request('POST', `/api/builds/${enc(target)}`, { force: !!force }); },

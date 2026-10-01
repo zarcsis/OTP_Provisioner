@@ -73,6 +73,10 @@
             this.serial = usb.serialNumber || '';
             this.opened = false;
             this.descriptorError = null;
+            // usbboot gives every 16 KiB bulk write 5 s (libusb_bulk_transfer timeout) and then fails the file;
+            // WebUSB has no transfer timeout, so a board that stops reading would hang the page forever.
+            this.bulkStallMs = 10000;
+            this.lastWrite = null; // {bytes, ms, chunks, slowestMs, slowestAt} of the last epWrite (shown in the log)
         }
 
         get isRaspberryPi() { return this.usb.vendorId === RPI_VID && !!this.chip; }
@@ -135,12 +139,34 @@
             const len = data ? data.byteLength : 0;
             const r = await this.usb.controlTransferOut({ requestType: 'vendor', recipient: 'device', request: 0, value: len & 0xffff, index: (len >>> 16) & 0xffff });
             if (r.status !== 'ok') throw new Error(`control transfer failed (${r.status}, len=${len})`);
+            const t0 = Date.now();
+            const stats = { bytes: 0, ms: 0, chunks: 0, slowestMs: 0, slowestAt: 0 };
+            this.lastWrite = stats;
             let sent = 0;
             while (sent < len) {
                 const chunk = data.subarray(sent, Math.min(sent + MAX_TRANSFER, len));
-                const res = await this.usb.transferOut(this.outEp, chunk);
+                const tc = Date.now();
+                let timer = null;
+                const stalled = new Promise((resolve) => {
+                    timer = setTimeout(() => resolve({ stalled: true }), this.bulkStallMs);
+                });
+                const out = await Promise.race([this.usb.transferOut(this.outEp, chunk).then((res) => ({ res })), stalled]).finally(() => clearTimeout(timer));
+                if (out.stalled) {
+                    try { await this.close(); } catch (e2) { /* the pending transfer is abandoned */ }
+                    const e = new Error(`the board stopped reading after ${sent} of ${len} bytes (no progress for ${Math.round(this.bulkStallMs / 1000)} s; `
+                        + `${stats.chunks} pieces of 16 KiB went through in ${tc - t0} ms, the slowest took ${stats.slowestMs} ms). `
+                        + 'Power-cycle the board into RPIBOOT mode and run the stage again.');
+                    e.stalled = true;
+                    throw e;
+                }
+                const res = out.res;
                 if (res.status !== 'ok') throw new Error(`bulk transfer failed (${res.status}) after ${sent} bytes`);
+                const took = Date.now() - tc;
+                if (took > stats.slowestMs) { stats.slowestMs = took; stats.slowestAt = sent; }
                 sent += res.bytesWritten;
+                stats.chunks++;
+                stats.bytes = sent;
+                stats.ms = Date.now() - t0;
                 if (onProgress) onProgress(sent, len);
             }
             return sent;
@@ -201,6 +227,14 @@
             });
         }
 
+        /** How a file went over bulk: the baseline to compare a stalled transfer against. */
+        _logWrite(name, w) {
+            if (!w || w.chunks < 2) return;
+            const mbps = w.ms > 0 ? (w.bytes / 1048576) / (w.ms / 1000) : 0;
+            this.log('debug', `Sent ${name}: ${w.bytes} bytes in ${w.ms} ms (${mbps ? mbps.toFixed(1) + ' MiB/s' : 'instant'}, ${w.chunks} pieces, `
+                + `slowest ${w.slowestMs} ms at ${w.slowestAt})`);
+        }
+
         /** Is the board behind `dev` still on the bus? (a failed transfer alone does not say so on Windows) */
         async _stillAttached(dev, unplugged) {
             if (unplugged() || !dev.usb.opened) return false;
@@ -218,6 +252,8 @@
             if (!rpiDevice.chip) throw new Error(`Unknown Raspberry Pi product 0x${rpiDevice.usb.productId.toString(16)}`);
             if (!rpiDevice.opened) await rpiDevice.open();
             this.log('info', `Found ${rpiDevice.chip.name} (${rpiDevice.chip.board}) serial ${rpiDevice.serial || '?'} iSerialNumber=${rpiDevice.iSerial === null ? '?' : rpiDevice.iSerial}`);
+            const u = rpiDevice.usb;
+            if (typeof u.usbVersionMajor === 'number') this.log('debug', `USB ${u.usbVersionMajor}.${u.usbVersionMinor}${u.usbVersionSubminor || ''}, bcdDevice ${rpiDevice.bcdDevice === null ? '?' : rpiDevice.bcdDevice.toString(16).padStart(4, '0')}`);
             try {
                 if (rpiDevice.iSerial === null) {
                     this.log('warn', 'Could not read the device descriptor; assuming boot ROM stage');
@@ -243,6 +279,7 @@
             let n = await dev.epWrite(msg);
             if (n !== BOOT_MESSAGE_SIZE) throw new Error(`Failed to write correct length, returned ${n}`);
             n = await dev.epWrite(code, (sent, total) => this.onProgress(name, sent, total));
+            this._logWrite(name, dev.lastWrite);
             if (n !== code.byteLength) throw new Error(`Failed to write second stage, sent ${n} of ${code.byteLength}`);
             this.handedOff = true; // the ROM runs the second stage now and re-enumerates
             await sleep(1000);
@@ -346,6 +383,7 @@
                             if (!current.data.byteLength) this.log('warn', `WARNING: ${fname} is empty`);
                             const total = current.data.byteLength;
                             const sent = await dev.epWrite(current.data, (s, t) => this.onProgress(fname, s, t));
+                            this._logWrite(fname, dev.lastWrite);
                             this.filesServed.push({ name: fname, size: total, origin: current.origin });
                             current = null;
                             if (sent !== total) throw new Error('Failed to write complete file to USB device');
@@ -397,7 +435,12 @@
      * and wait for the next enumeration; then run the file server until "Done" (or until the board leaves USB,
      * which is normal when a ramdisk takes over: the result is then marked `interrupted`).
      *   waitNext(previousUsb) → Promise<USBDevice>  the next enumeration of the same board
-     *   opts.maxHops (6), opts.onDevice(usb), opts.log(level, msg)
+     *   opts.maxHops (6), opts.onDevice(usb), opts.log(level, msg), opts.settleMs (1000)
+     * Every enumeration is left alone for settleMs before it is opened: rpiboot finds the device, sleep(1)s, and only
+     * then libusb_open()s it (main.c, open_device_with_vid). Opened right away (2 ms after the connect event), the
+     * Pi 5 second stage stopped reading pieeprom.bin a few dozen milliseconds into the transfer, at a different
+     * offset every run (144, 416, 480 KiB of 2 MiB; Windows, WinUSB), while rpiboot.exe went through on the same
+     * board, port and cable; with the pause the page provisions that board end to end.
      * Returns {result, usb, serial}: result = {kind:'file-server-done', metadata, filesServed, interrupted?}.
      */
     async function runSession(session, usb, waitNext, opts) {
@@ -405,7 +448,12 @@
         const log = opts.log || session.log;
         let lastISerial = -1;
         let serial = usb.serialNumber || '';
+        const settleMs = typeof opts.settleMs === 'number' ? opts.settleMs : 1000;
         for (let hop = 0; hop < (opts.maxHops || 6) && !session.aborted; hop++) {
+            if (settleMs > 0) {
+                await session._pause(settleMs);
+                if (session.aborted) break;
+            }
             const dev = new RpiDevice(usb);
             await dev.open();
             if (dev.serial) serial = dev.serial;

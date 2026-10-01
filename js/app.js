@@ -123,12 +123,18 @@
 
     // probed: false until the first /api/status answer (or failure), so the page shows "checking"
     // instead of flashing "Server offline" while the first request is in flight.
-    const srv = { status: null, probed: false, modules: [], viewSerial: null, jobLogHandle: null, jobLogId: null, need: null, deviceConnected: false, pollTimer: null };
+    const srv = { status: null, probed: false, modules: [], viewSerial: null, jobLogHandle: null, jobLogId: null, need: null, deviceConnected: false, pollTimer: null, scenario: '', googleError: '' };
+    const SCENARIOS = {
+        open: 'Open: unsigned bootloader, clear image; nothing is written to OTP',
+        secure: 'Secure: signed bootloader (program_pubkey), LUKS-encrypted image, OTP device key exported to the server',
+    };
+    /** Signed in to Google and the settings sheet read (true when the server has no Google wiring, e.g. tests). */
+    const googleReady = () => !srv.status || srv.status.google_ready !== false;
     const checking = () => !srv.probed && location.protocol !== 'file:';
     const STEP_INFO = {
         1: { title: 'EEPROM & OTP', sub: 'recovery flashes the EEPROM and reports the board metadata; the board reboots into RPIBOOT' },
         2: { title: 'Fastboot gadget', sub: 'the bootloader loads the rpi-fastbootd ramdisk from the station' },
-        3: { title: 'Image', sub: 'fastboot IDP: device key, partitions + LUKS2, sparse images, recovery passphrase, reboot' },
+        3: { title: 'Image', sub: 'fastboot IDP: (secure) OTP device key exported to the server, partitions (+ LUKS2), sparse images, reboot' },
     };
     const ICONS = { idle: '○', running: '◐', waiting: '◔', done: '✓', failed: '✗' };
     const steps = {};
@@ -184,11 +190,12 @@
 
     const flow = new OTP.Flow({
         api,
+        options: { scenario: () => currentScenario() },
         hooks: {
             onStage: (n, state, detail, extra) => setStep(n, state, detail, extra),
             onProgress: (n, p) => setStepProgress(n, p),
             onLog: (level, msg) => log(level, msg),
-            onModule: (m) => { srv.viewSerial = m.serial; upsertModule(m); renderBoard(); renderRegistry(); },
+            onModule: (m) => { srv.viewSerial = m.serial; upsertModule(m); renderBoard(); renderRegistry(); renderScenario(); },
             onBusy: () => updateButtons(),
             onNeed: (kind, info) => showNeed(kind, info),
             onConfirm: (req) => confirmIrreversible(Object.assign({ okLabel: 'Proceed' }, req)),
@@ -232,19 +239,22 @@
     function updateButtons() {
         const running = flow.running;
         const online = api.available;
-        $('#btn-connect').disabled = running || !online || !navigator.usb;
+        const ready = online && googleReady();
+        $('#btn-connect').disabled = running || !ready || !navigator.usb;
         $('#btn-abort').disabled = !running;
         const plan = flow.plan();
         const connected = !!flow.module && srv.deviceConnected;
-        $('#btn-provision').disabled = running || !online || !flow.module || !plan.length;
-        for (const n of [1, 2, 3]) if (steps[n]) steps[n].run.disabled = running || !online || !flow.module;
+        $('#btn-provision').disabled = running || !ready || !flow.module || !plan.length;
+        for (const n of [1, 2, 3]) if (steps[n]) steps[n].run.disabled = running || !ready || !flow.module;
+        for (const r of document.querySelectorAll('#scenario input')) r.disabled = running || (r.value === 'open' && !!(flow.module && flow.module.mode_locked));
         let hint = '';
         if (checking()) hint = 'checking the server…';
         else if (!online) hint = 'server offline: use Advanced (manual) below';
+        else if (!googleReady()) hint = 'sign in to Google first';
         else if (!flow.module) hint = 'connect a board first';
         else if (running) hint = `provisioning ${flow.serial}…`;
-        else if (!plan.length) hint = `board ${flow.serial} is fully provisioned`;
-        else hint = `will run stage${plan.length > 1 ? 's' : ''} ${plan.join(' → ')}${connected ? '' : ' (connect the board first)'}`;
+        else if (!plan.length) hint = `board ${flow.serial} is fully provisioned (${(flow.module && flow.module.mode) || ''} scenario)`;
+        else hint = `will run stage${plan.length > 1 ? 's' : ''} ${plan.join(' → ')} · ${currentScenario()} scenario${flow.scenarioChanges() ? ' (switching: every stage is redone)' : ''}${connected ? '' : ' (connect the board first)'}`;
         $('#provision-hint').textContent = hint;
     }
 
@@ -303,6 +313,7 @@
         const sec = m.secrets || {};
         const otp = m.otp || {};
         const otpText = otp.locked ? (otp.locked_to_our_key ? 'locked to this board\'s key' : 'LOCKED TO A DIFFERENT KEY') : 'not locked (OTP key hash empty)';
+        const modeText = m.mode ? `${m.mode}${m.mode_chosen ? '' : ' (default)'}${m.mode_locked ? ' · OTP locked: secure only' : ''}` : '';
         const events = (m.events || []).slice(-8).reverse();
         box.replaceChildren(
             el('div', { class: 'serial-big' }, m.serial),
@@ -311,12 +322,13 @@
                 el('span', { class: 'muted' }, [m.chip, m.board].filter(Boolean).join(' · ')),
                 live ? null : el('span', { class: 'badge' }, 'viewing record')),
             el('dl', { class: 'kv' },
+                kv('Scenario', modeText),
                 kv('Key hash', sec.customer_key_hash ? el('span', { title: sec.customer_key_hash }, shortHex(sec.customer_key_hash, 24)) : '—', 'mono'),
                 kv('Signing key', sec.rsa_key ? `RSA-2048 ✓ ${sec.rsa_key_fingerprint ? '· ' + shortHex(sec.rsa_key_fingerprint, 16) : ''}` : 'not generated'),
                 kv('Device secret', sec.device_secret ? '✓ stored' : '—'),
                 kv('OTP', otpText, otp.locked && !otp.locked_to_our_key ? 'bad' : ''),
                 kv('Secure boot', otp.secure_boot_provisioned ? 'provisioned' : 'not provisioned'),
-                kv('Device key', otp.device_key ? el('span', { title: otp.device_key_fingerprint || '' }, 'ECDSA ✓ ' + shortHex(otp.device_key_fingerprint, 16)) : '—', 'mono'),
+                kv('Device key', otp.device_key ? el('span', { title: otp.device_key_fingerprint || '' }, 'ECDSA ✓ ' + shortHex(otp.device_key_fingerprint, 16) + (otp.device_key_exported ? ' · private key on the server' : '')) : '—', 'mono'),
                 kv('DUID', m.duid, 'mono'),
                 kv('MAC', m.mac, 'mono'),
                 kv('Board rev', m.boardrev, 'mono'),
@@ -378,8 +390,87 @@
         );
         $('#registry-backend').textContent = st.backend ? `${st.backend}${st.location ? ' · ' + st.location : ''}` : '';
         $('#registry-backend').title = st.detail || '';
-        const sb = s.config && s.config.provisioning;
-        $('#provision-mode').textContent = sb ? `${sb.secure_boot ? 'secure boot (signed, OTP key hash)' : 'unsigned EEPROM, OTP key hash untouched'}${sb.recovery_passphrase === false ? '' : ' · LUKS recovery passphrase'}` : '';
+        const g = s.google;
+        if (g && g.signed_in) {
+            const who = g.email ? `Google: ${g.email}` : 'Google ✓';
+            const sheet = g.spreadsheet_url ? el('a', { href: g.spreadsheet_url, target: '_blank', rel: 'noopener', class: 'badge ok', title: `${g.email || 'This account'}'s spreadsheet: settings + board registry` }, `${who} · Sheets ↗`) : null;
+            box.append(sheet || badge(who, 'ok'), el('button', { class: 'small', title: 'Forget the Google login on this station (the next operator signs in with their own account and spreadsheet)', onclick: googleLogout }, 'Sign out'));
+        }
+        renderGoogle();
+        renderScenario();
+    }
+
+    // ---------- Google sign-in gate ----------
+    function renderGoogle() {
+        const box = $('#google-gate');
+        const s = srv.status;
+        const g = s && s.google;
+        let gated = false;
+        let content = null;
+        let err = false;
+        if (s && g) {
+            if (!g.client) {
+                gated = true;
+                err = true;
+                content = [el('div', { class: 'gate-text' }, el('b', {}, 'No Google OAuth client. '),
+                    'The station keeps its settings and the board registry in a Google spreadsheet. Create an OAuth client of type "Desktop app" in the Google Cloud console (enable the Google Sheets and Google Drive APIs), download its JSON, save it as ',
+                    el('code', {}, g.client_file || 'google-oauth-client.json'), ' and reload this page.')];
+            } else if (!g.signed_in) {
+                gated = true;
+                content = [el('div', { class: 'gate-text' }, el('b', {}, 'Sign in to Google. '),
+                    'Settings and the board registry live in a Google spreadsheet; the server creates it on the first sign-in.'),
+                el('a', { class: 'button primary big', href: '/api/google/login' }, 'Sign in with Google')];
+            } else if (s.google_ready === false) {
+                gated = true;
+                err = true;
+                const st = s.settings || {};
+                content = [el('div', { class: 'gate-text' }, el('b', {}, 'Google Sheets is not usable: '), st.error || (s.storage && s.storage.detail) || g.error || 'the settings sheet has not been read yet'),
+                    el('a', { class: 'button', href: '/api/google/login' }, 'Sign in again'),
+                    el('button', { class: 'small', onclick: googleLogout }, 'Sign out')];
+            }
+        }
+        if (srv.googleError) {
+            err = true;
+            content = [el('div', { class: 'gate-text bad' }, el('b', {}, 'Google sign-in: '), srv.googleError),
+                ...(content ? content.slice(1) : []),
+                el('button', { class: 'small', onclick: () => { srv.googleError = ''; renderGoogle(); } }, 'Dismiss')];
+        }
+        document.body.classList.toggle('gated', gated);
+        box.classList.toggle('hidden', !content);
+        box.classList.toggle('err', err);
+        if (content) box.replaceChildren(...content);
+        const unknown = s && s.settings && s.settings.unknown && s.settings.unknown.length ? s.settings.unknown : null;
+        if (unknown && !srv.unknownWarned) { srv.unknownWarned = true; log('warn', `settings sheet: unknown keys ignored: ${unknown.join(', ')}`); }
+    }
+
+    async function googleLogout() {
+        try { await api.googleLogout(); log('info', 'Signed out of Google on this station'); } catch (e) { log('error', `Sign out: ${e.detail || e.message}`); }
+        refreshStatus();
+    }
+
+    // ---------- scenario (Open / Secure) ----------
+    function currentScenario() {
+        if (flow.module && flow.module.mode_locked) return 'secure';
+        if (srv.scenario === 'open' || srv.scenario === 'secure') return srv.scenario;
+        const p = srv.status && srv.status.config && srv.status.config.provisioning;
+        return (p && p.default_mode) || 'open';
+    }
+
+    function renderScenario() {
+        const want = currentScenario();
+        for (const r of document.querySelectorAll('#scenario input')) r.checked = r.value === want;
+        const locked = !!(flow.module && flow.module.mode_locked);
+        $('#provision-mode').textContent = SCENARIOS[want] + (locked ? ' (this board\'s OTP is locked: secure only)' : '');
+        updateButtons();
+    }
+
+    for (const r of document.querySelectorAll('#scenario input')) {
+        r.addEventListener('change', () => {
+            if (!r.checked) return;
+            srv.scenario = r.value;
+            lsSet('otp.scenario', r.value);
+            renderScenario();
+        });
     }
 
     const BUILD_TITLES = { tools: 'Tools image', gadget: 'Fastboot gadget', image: 'droneos image' };
@@ -460,6 +551,7 @@
     async function refreshStatus() {
         const s = await api.probe();
         const was = !!srv.status;
+        const wasReady = googleReady();
         const first = !srv.probed;
         srv.probed = true;
         srv.status = s;
@@ -467,7 +559,10 @@
         $('#offline-box').classList.toggle('hidden', !!s);
         renderServerBadges();
         renderBuilds();
-        if (!!s !== was || first) { renderBoard(); renderRegistry(); updateButtons(); }
+        if (!!s !== was || first || googleReady() !== wasReady) {
+            renderBoard(); renderRegistry(); updateButtons();
+            if (s && googleReady() && !wasReady && !first) refreshModules();
+        }
         if (s && !srv.jobLogId) {
             const running = (s.jobs || []).find((j) => j.status === 'running' || j.status === 'queued');
             if (running) selectJobLog(running);
@@ -480,7 +575,7 @@
         srv.pollTimer = setTimeout(async () => {
             if (!document.hidden && location.protocol !== 'file:') {
                 await refreshStatus();
-                if (api.available && !flow.running) await refreshModules();
+                if (api.available && googleReady() && !flow.running) await refreshModules();
             }
             schedulePoll();
         }, api.available ? 5000 : 15000);
@@ -975,10 +1070,10 @@
             title: 'Stage 2 · Gadget / agent ramdisk',
             doneLabel: 'Stage 2 done: the ramdisk was delivered',
             runLabel: 'Boot the ramdisk',
-            dirHint: 'bootfiles.bin, boot.img (+ boot.sig once the board is locked), config.txt with boot_ramdisk=1 — e.g. stage-dirs/fastboot-gadget',
+            dirHint: 'bootfiles.bin, boot.img (+ boot.sig once the board is locked), config.txt with boot_ramdisk=1 — e.g. the server\'s stage-2 files',
             blurb: [
                 'The bootloader (from ', el('code', {}, 'bootfiles.bin'), ') asks the station for ', el('code', {}, 'config.txt'), ', ', el('code', {}, 'boot.img'), ' and ', el('code', {}, 'boot.sig'),
-                ' and boots the initramfs: the fastboot gadget (', el('code', {}, 'stage-dirs/fastboot-gadget'), ') or the stock mass-storage gadget (', el('code', {}, 'stage-dirs/mass-storage-gadget'), ').',
+                ' and boots the initramfs: the fastboot gadget the server builds, or the stock mass-storage gadget (', el('code', {}, 'external/usbboot/mass-storage-gadget64'), ').',
             ],
             expected: [
                 { name: 'bootcode5.bin', required: true, note: 'Second stage, normally inside bootfiles.bin as 2712/bootcode5.bin' },
@@ -1130,6 +1225,14 @@
     $('#btn-open-advanced').addEventListener('click', () => { advanced.open = true; advanced.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
 
     // ---------- boot ----------
+    srv.scenario = lsGet('otp.scenario', '');
+    {
+        const q = new URLSearchParams(location.search);
+        if (q.get('google_error')) {
+            srv.googleError = q.get('google_error');
+            history.replaceState(null, '', location.pathname);
+        }
+    }
     renderCaps();
     buildSteps();
     renderServerBadges();
@@ -1143,8 +1246,10 @@
     refreshDevices().then(() => { for (const p of panels) p.updateRunState(); });
     const ready = refreshStatus().then(async (s) => {
         if (s) {
-            log('info', `Server ${s.version || ''} online · storage ${(s.storage && s.storage.backend) || '?'}. Put the board into RPIBOOT mode and click "Connect board".`);
-            await refreshModules();
+            log('info', s.google_ready === false
+                ? `Server ${s.version || ''} online. Sign in to Google first: the settings and the board registry live in Google Sheets.`
+                : `Server ${s.version || ''} online · registry: Google Sheets. Pick the scenario (Open / Secure), put the board into RPIBOOT mode and click "Connect board".`);
+            if (googleReady()) await refreshModules();
         } else {
             log('warn', location.protocol === 'file:'
                 ? 'Opened from file://: no server. The manual mode (Advanced) works; for provisioning run "python server.py".'
@@ -1157,5 +1262,5 @@
     });
 
     // exposed for the self-test page
-    OTP.app = { state, panels, log, runBootDir, waitForDevice, BootRunPanel, flow, srv, steps, setStep, renderBoard, renderRegistry, refreshStatus, ready, confirmIrreversible };
+    OTP.app = { state, panels, log, runBootDir, waitForDevice, BootRunPanel, flow, srv, steps, setStep, renderBoard, renderRegistry, refreshStatus, ready, confirmIrreversible, renderGoogle, renderScenario, currentScenario };
 })();

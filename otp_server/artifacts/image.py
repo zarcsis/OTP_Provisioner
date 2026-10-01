@@ -3,7 +3,11 @@
 Build = ``droneos build.sh --in-container`` in the owner's builder image (work volume keeps the image
 output), then ``image-collect.sh`` in the tools image copies ``image.json`` + the sparse partition images
 (split to ``max_piece_size``) into ``<work>/artifacts/image/<set>/``; Python validates them and writes
-``manifest.json`` + ``.complete`` and points ``current.json`` at the set.
+``manifest.json`` + ``.complete`` and points ``current-<variant>.json`` at the set.
+
+Two variants, one per provisioning mode: ``clear`` (``open``: plain root filesystem) and ``crypt``
+(``secure``: LUKS2 root container), built with ``IGconf_image_pmap=<variant>``. Each has its own current
+set, so switching the mode back and forth does not rebuild what is already there.
 """
 from __future__ import annotations
 
@@ -19,13 +23,22 @@ from ..docker import Mount
 from .common import (NotReady, StageFile, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
                      git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, write_json)
 
-WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key the LUKS root is bound to); "
-                "it can never be changed or erased")
+WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key the LUKS root is bound to; "
+                "a copy is exported to the station); it can never be changed or erased")
 WHY_ERASE = "wipes the whole storage device before the image is written"
+VARIANTS = ("clear", "crypt")
+
+#: Where the gadget's otp-keyexport helper leaves its output (docker/gadget-helpers/otp-keyexport).
+KEY_EXPORT = {
+    "dir": "/run/otp-keyexport",
+    "key": "/run/otp-keyexport/key.der",
+    "status": "/run/otp-keyexport/status",
+    "request": "/run/otp-keyexport/request",
+}
 
 
 class ImageBuilder:
-    """droneos image sets and the stage-3 manifest."""
+    """droneos image sets (one current set per variant) and the stage-3 manifest."""
 
     def __init__(self, cfg: Any, docker: Any, jobs: Any, tools: Any, hashes: Any):
         self.cfg = cfg
@@ -47,9 +60,8 @@ class ImageBuilder:
     def staging(self) -> Path:
         return self.root / "staging"
 
-    @property
-    def current_json(self) -> Path:
-        return self.root / "current.json"
+    def current_json(self, variant: str) -> Path:
+        return self.root / f"current-{check_variant(variant)}.json"
 
     @property
     def droneos_dir(self) -> Path:
@@ -59,13 +71,17 @@ class ImageBuilder:
         p = Path(self.icfg.config)
         return p if p.is_absolute() else self.droneos_dir / p
 
-    def config_hash(self) -> str:
-        """sha256(config text + overrides)[:8] — part of the set name."""
+    def overrides(self, variant: str) -> list[str]:
+        """``builds.image.overrides`` plus the variant's provisioning map (``IGconf_image_pmap``, last)."""
+        return [*self.icfg.overrides, f"IGconf_image_pmap={check_variant(variant)}"]
+
+    def config_hash(self, variant: str) -> str:
+        """sha256(config text + overrides of the variant)[:8] — part of the set name."""
         try:
             text = self.config_path().read_bytes().replace(b"\r\n", b"\n").decode("utf-8", "replace")
         except OSError:
             text = ""
-        blob = text + "\n" + "\n".join(self.icfg.overrides)
+        blob = text + "\n" + "\n".join(self.overrides(variant))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
 
     VERSION_TTL = 10.0   # status is polled every few seconds; git describe --dirty is not free on Windows
@@ -90,22 +106,23 @@ class ImageBuilder:
         except ValueError:
             return "/cfg/" + cfgp.name, [Mount.bind(cfgp.parent, "/cfg", readonly=True)]
 
-    def build_args(self, cfg_arg: str) -> list[str]:
+    def build_args(self, cfg_arg: str, variant: str) -> list[str]:
         """Arguments after the builder image (exactly what droneos build.sh --docker passes)."""
-        args = ["--in-container", "-B", "/work", "-o", "/out", "-c", cfg_arg]
-        if self.icfg.overrides:
-            args += ["--", *self.icfg.overrides]
-        return args
+        return ["--in-container", "-B", "/work", "-o", "/out", "-c", cfg_arg, "--", *self.overrides(variant)]
 
-    # ------------------------------------------------------------------ current set
-    def current_set(self) -> tuple[Path, dict] | None:
-        """(set dir, manifest) of the image stage 3 serves, or None (also when it needs a rebuild)."""
-        cur = self.published_set()
-        if cur is None or self.rebuild_reason(cur[1]) is not None:
+    # ------------------------------------------------------------------ current sets
+    def current_set(self, variant: str) -> tuple[Path, dict] | None:
+        """(set dir, manifest) of the variant's image stage 3 serves, or None (also when it needs a rebuild)."""
+        cur = self.published_set(variant)
+        if cur is None or self.rebuild_reason(cur[1], variant) is not None:
             return None
         return cur
 
-    def rebuild_reason(self, man: dict) -> str | None:
+    def missing_variants(self) -> list[str]:
+        """Variants without a servable set (not built, or a rebuild is needed)."""
+        return [v for v in VARIANTS if self.current_set(v) is None]
+
+    def rebuild_reason(self, man: dict, variant: str) -> str | None:
         """Why a published set cannot be served with the current settings (None when it can).
 
         Pieces are split to ``provisioning.max_piece_size`` at build time; a set split with a larger
@@ -123,6 +140,8 @@ class ImageBuilder:
         if built > cur or largest > cur:
             return (f"rebuild needed: image set {man.get('set', '')} was split into pieces of up to "
                     f"{max(built, largest)} bytes, more than provisioning.max_piece_size {cur}")
+        if man.get("variant") and man.get("variant") != variant:
+            return f"rebuild needed: image set {man.get('set', '')} is a {man.get('variant')} image, not {variant}"
         have_v = str(man.get("version") or "")
         if have_v:
             want_v = self.version()
@@ -130,15 +149,15 @@ class ImageBuilder:
                 return (f"rebuild needed: droneos is at {want_v}, image set {man.get('set', '')} was built "
                         f"from {have_v}")
         have_c = str(man.get("config_hash") or "")
-        if have_c and have_c != self.config_hash():
+        if have_c and have_c != self.config_hash(variant):
             return (f"rebuild needed: builds.image config or overrides changed since image set "
                     f"{man.get('set', '')} was built")
         return None
 
-    def published_set(self) -> tuple[Path, dict] | None:
-        """(set dir, manifest) named by current.json when it is complete, whatever the settings."""
+    def published_set(self, variant: str) -> tuple[Path, dict] | None:
+        """(set dir, manifest) named by current-<variant>.json when it is complete, whatever the settings."""
         try:
-            name = read_json(self.current_json).get("set")
+            name = read_json(self.current_json(variant)).get("set")
         except (OSError, ValueError, AttributeError):
             return None
         if not name:
@@ -152,10 +171,17 @@ class ImageBuilder:
             return None
 
     # ------------------------------------------------------------------ build job
-    def build(self, job: Any, force: bool = False) -> None:
-        """Job body "Build droneos image" (SPEC §10.4)."""
-        if not force and self.current_set() is not None:
-            job.log(f"==> droneos image already built: {self.current_set()[0]}")
+    def build(self, job: Any, force: bool = False, variants: list[str] | None = None) -> None:
+        """Job body "Build droneos images": every variant that is missing (all of them with ``force``)."""
+        wanted = [check_variant(v) for v in (variants or VARIANTS)]
+        todo = []
+        for v in wanted:
+            cur = None if force else self.current_set(v)
+            if cur is not None:
+                job.log(f"==> droneos image ({v}) already built: {cur[0]}")
+            else:
+                todo.append(v)
+        if not todo:
             return
         if not (self.droneos_dir / "build.sh").is_file():
             raise RuntimeError(f"droneos checkout not found at {self.droneos_dir} (paths.droneos)")
@@ -163,12 +189,14 @@ class ImageBuilder:
         if not cfgp.is_file():
             raise RuntimeError(f"image config {cfgp} not found (builds.image.config)")
         with heavy_lock(self.cfg.work_dir, job.log):
-            if not force and self.current_set() is not None:      # built meanwhile (another process)
-                job.log(f"==> droneos image already built: {self.current_set()[0]}")
-                return
-            self._build_locked(job)
+            for v in todo:
+                cur = None if force else self.current_set(v)
+                if cur is not None:      # built meanwhile (another process)
+                    job.log(f"==> droneos image ({v}) already built: {cur[0]}")
+                    continue
+                self._build_locked(job, v)
 
-    def _build_locked(self, job: Any) -> None:
+    def _build_locked(self, job: Any, variant: str) -> None:
         self.docker.ensure_daemon(job.log)
         self.docker.ensure_arm64(job.log)
         self.tools.ensure(job.log)
@@ -176,21 +204,21 @@ class ImageBuilder:
                                 self.droneos_dir / "docker", log=job.log)
         version = self.version()
         commit = git_output(self.droneos_dir, "rev-parse", "HEAD") or ""
-        cfg_hash = self.config_hash()
+        cfg_hash = self.config_hash(variant)
         cfg_arg, extra = self.container_config()
         self.staging.mkdir(parents=True, exist_ok=True)
         mounts = [Mount.bind(self.droneos_dir, "/src", readonly=True),
                   Mount.volume(self.icfg.volume, "/work"),
                   Mount.bind(self.staging, "/out"), *extra]
         env = {"DRONEOS_IN_CONTAINER": "1", "DRONEOS_ROOT": "/src", "DRONEOS_VERSION": version}
-        job.log(f"==> droneos {version}: {cfg_arg} {' '.join(self.icfg.overrides)}")
-        self.docker.run(self.icfg.builder_tag, self.build_args(cfg_arg), mounts=mounts, env=env,
+        job.log(f"==> droneos {version} ({variant}): {cfg_arg} {' '.join(self.overrides(variant))}")
+        self.docker.run(self.icfg.builder_tag, self.build_args(cfg_arg, variant), mounts=mounts, env=env,
                         privileged=True, hostname="droneos-builder", interactive=True, log=job.log,
                         check=True)
-        set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash)
+        set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash, variant=variant)
         job.log(f"==> image set ready: {set_dir}")
 
-    def collect(self, job: Any, *, version: str, commit: str, cfg_hash: str) -> Path:
+    def collect(self, job: Any, *, version: str, commit: str, cfg_hash: str, variant: str) -> Path:
         """Run image-collect.sh into a .partial dir, validate, write manifest.json, publish the set."""
         max_piece = int(self.cfg.provisioning.max_piece_size)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -202,26 +230,31 @@ class ImageBuilder:
                                   env={"MAX_PIECE": str(max_piece)}, log=job.log)
             job.log("==> validating collected pieces")
             collect = validate_collect(part, max_piece, self.hashes)
-            name = safe_name(f"{collect['image_name']}-{version}-{cfg_hash}")
+            ij = imagejson.load(part / "image.json")
+            encrypted = imagejson.is_encrypted(ij)
+            if encrypted != (variant == "crypt"):
+                raise RuntimeError(f"the {variant} build produced an image that is "
+                                   f"{'encrypted' if encrypted else 'not encrypted'} (IGconf_image_pmap ignored?)")
+            name = safe_name(f"{collect['image_name']}-{variant}-{version}-{cfg_hash}")
             final = self.root / name
             n = 2
             while final.exists():
                 final = self.root / f"{name}-r{n}"
                 n += 1
-            ij = imagejson.load(part / "image.json")
             manifest = {
                 "name": collect["image_name"],
+                "variant": variant,
                 "version": version,
                 "set": final.name,
                 "built": now_iso(),
                 "droneos_commit": commit,
                 "config": str(self.config_path()),
                 "config_hash": cfg_hash,
-                "overrides": list(self.icfg.overrides),
+                "overrides": self.overrides(variant),
                 "image_version": collect.get("image_version", ""),
                 "device_class": collect.get("device_class") or imagejson.meta(ij).get("IGconf_device_class", ""),
                 "storage_type": collect.get("storage_type") or imagejson.storage_type(ij),
-                "encrypted": imagejson.is_encrypted(ij),
+                "encrypted": encrypted,
                 "max_piece_size": max_piece,
                 "image_json": {"name": "image.json", "size": (part / "image.json").stat().st_size,
                                "sha256": self.hashes.sha256(part / "image.json")},
@@ -232,7 +265,7 @@ class ImageBuilder:
         except BaseException:
             job.log(f"collect failed; partial set left for inspection: {part}")
             raise
-        write_json(self.current_json, {"set": final.name})
+        write_json(self.current_json(variant), {"set": final.name})
         if not self.icfg.keep_raw_image:
             for raw in self.staging.glob("*.img"):
                 try:
@@ -242,26 +275,42 @@ class ImageBuilder:
                     job.log(f"warning: cannot remove {raw}: {exc}")
         return final
 
-    def status(self, job: Any = None) -> dict:
-        """Artifact status dict (SPEC §8) for target ``image``."""
-        base = {"target": "image", "ready": False, "source": None, "version": "", "path": "", "size": None,
-                "built": None, "detail": "", "job": job.to_dict() if job is not None else None}
-        cur = self.published_set()
+    def variant_status(self, variant: str) -> dict:
+        """``{"ready", "set", "version", "path", "size", "built", "detail"}`` of one variant."""
+        out = {"ready": False, "set": "", "version": "", "path": "", "size": None, "built": None, "detail": ""}
+        cur = self.published_set(variant)
         if cur is None:
-            base["detail"] = "the droneos image is not built yet"
-            return base
+            out["detail"] = f"the {variant} image is not built yet"
+            return out
         d, man = cur
-        why = self.rebuild_reason(man)
+        why = self.rebuild_reason(man, variant)
         if why is not None:
-            base["detail"] = why
-            return base
+            out["detail"] = why
+            return out
         total = int((man.get("image_json") or {}).get("size") or 0)
         for pieces in (man.get("simages") or {}).values():
             total += sum(int(p.get("size") or 0) for p in pieces)
-        detail = f"{man.get('name', '')} ({man.get('device_class', '')}, {man.get('storage_type', '')}" \
-                 f"{', encrypted' if man.get('encrypted') else ''})"
-        base.update(ready=True, source="built", version=str(man.get("version", "")), path=str(d), size=total,
-                    built=man.get("built"), detail=detail)
+        out.update(ready=True, set=str(man.get("set") or d.name), version=str(man.get("version", "")),
+                   path=str(d), size=total, built=man.get("built"),
+                   detail=f"{man.get('name', '')} ({man.get('device_class', '')}, {man.get('storage_type', '')}"
+                          f"{', encrypted' if man.get('encrypted') else ''})")
+        return out
+
+    def status(self, job: Any = None) -> dict:
+        """Artifact status dict (SPEC §8) for target ``image``: ready when every variant is.
+
+        ``variants`` holds the per-variant status; the top-level fields describe the crypt set when it is
+        ready, else the clear one.
+        """
+        variants = {v: self.variant_status(v) for v in VARIANTS}
+        base = {"target": "image", "ready": all(s["ready"] for s in variants.values()), "source": None,
+                "version": "", "path": "", "size": None, "built": None, "detail": "",
+                "job": job.to_dict() if job is not None else None, "variants": variants}
+        shown = next((variants[v] for v in ("crypt", "clear") if variants[v]["ready"]), None)
+        if shown is not None:
+            base.update(source="built", version=shown["version"], path=shown["path"], size=shown["size"],
+                        built=shown["built"])
+        base["detail"] = "; ".join(f"{v}: {s['detail']}" for v, s in variants.items())
         return base
 
     # ------------------------------------------------------------------ stage 3
@@ -311,19 +360,31 @@ class ImageBuilder:
                                        f"{simage} re-signed with the board key (boot.img + boot.sig)")
                 for p in res.get("pieces") or []]
 
-    def stage3(self, record: dict, *, signed: bool, secrets_fn, base_url: str) -> tuple[dict, dict[str, Path]]:
-        """Stage-3 manifest (SPEC §8) and {name: path}."""
+    def stage3(self, record: dict, *, secure: bool, signed: bool, secrets_fn,
+               base_url: str) -> tuple[dict, dict[str, Path]]:
+        """Stage-3 manifest (SPEC §8) and {name: path}.
+
+        ``secure``: the crypt image, ``oem fwcrypto init`` and the OTP device key export; otherwise the
+        clear image and nothing that touches OTP.
+        """
         serial = str(record.get("serial") or "")
-        cur = self.published_set()
+        variant = "crypt" if secure else "clear"
+        scenario = "secure" if secure else "open"
+        cur = self.published_set(variant)
         if cur is None:
-            raise NotReady("the droneos image is not built yet", self.jobs.active("image"))
+            raise NotReady(f"the droneos image for the {scenario} scenario ({variant}) is not built yet",
+                           self.jobs.active("image"))
         set_dir, man = cur
-        why = self.rebuild_reason(man)
+        why = self.rebuild_reason(man, variant)
         if why is not None:
             raise NotReady(why, self.jobs.active("image"))
         ij = imagejson.load(set_dir / "image.json")
         disk = imagejson.storage_device(ij)
         encrypted = imagejson.is_encrypted(ij)
+        if encrypted != secure:
+            raise NotReady(f"image set {set_dir.name} is {'encrypted' if encrypted else 'not encrypted'}, the "
+                           f"{scenario} scenario needs {'an encrypted' if secure else 'a clear'} image; rebuild it",
+                           self.jobs.active("image"))
         prov = self.cfg.provisioning
         origin = f"droneos {man.get('set', set_dir.name)}"
         msim: dict = man.get("simages") or {}
@@ -346,7 +407,7 @@ class ImageBuilder:
         ij_sf = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
                           str(ijm.get("sha256") or self.hashes.sha256(ij_path)), origin)
         crypt = []
-        if encrypted and prov.recovery_passphrase:
+        if secure and prov.recovery_passphrase:
             secrets = secrets_fn()
             dsec = secrets.get("device_secret") if secrets else None
             if not dsec:
@@ -355,9 +416,12 @@ class ImageBuilder:
             for c in imagejson.crypt_containers(ij):
                 crypt.append({"dev": imagejson.partition_name(disk, c["index"]), "mname": c["mname"],
                               "label": c["label"], "passphrase": luks_passphrase(dsec, c["mname"], serial)})
-        elif encrypted:
-            notes.append("provisioning.recovery_passphrase is false: no server-held LUKS passphrase is added")
-        irreversible = [{"key": "oem fwcrypto init", "value": "", "why": WHY_FWCRYPTO}]
+        irreversible = []
+        if secure:
+            irreversible.append({"key": "oem fwcrypto init", "value": "", "why": WHY_FWCRYPTO})
+            notes.append("the OTP device key is exported to the station before the storage is erased")
+        else:
+            notes.append("open scenario: clear image, OTP is not touched")
         if prov.erase_storage:
             irreversible.append({"key": "erase", "value": disk, "why": WHY_ERASE})
         paths = {"image.json": ij_path}
@@ -372,16 +436,18 @@ class ImageBuilder:
             "title": "Image",
             "ready": True,
             "mode": "signed" if signed else "unsigned",
+            "scenario": scenario,
             "image": {"name": man.get("name", ""), "version": man.get("version", ""),
                       "set": man.get("set", set_dir.name), "built": man.get("built"),
-                      "device_class": man.get("device_class", ""), "storage_type": man.get("storage_type", ""),
-                      "encrypted": encrypted},
+                      "variant": variant, "device_class": man.get("device_class", ""),
+                      "storage_type": man.get("storage_type", ""), "encrypted": encrypted},
             "storage_device": disk,
             "image_json": _entry(ij_sf, file_url(base_url, serial, 3, "image.json")),
             "parts": {s: [_entry(f, file_url(base_url, serial, 3, f.name)) for f in pl] for s, pl in parts.items()},
             "total_bytes": total,
             "max_piece_size": int(prov.max_piece_size),
-            "fwcrypto_init": True,
+            "fwcrypto_init": bool(secure),
+            "key_export": dict(KEY_EXPORT) if secure else None,
             "erase": bool(prov.erase_storage),
             "crypt": crypt,
             "irreversible": irreversible,
@@ -393,6 +459,13 @@ class ImageBuilder:
 def _entry(f: StageFile, url: str) -> dict:
     """Stage-3 file entry: {"name", "size", "sha256", "url"} (SPEC §8)."""
     return {"name": f.name, "size": f.size, "sha256": f.sha256, "url": url}
+
+
+def check_variant(variant: str) -> str:
+    """``variant`` when it is one of :data:`VARIANTS` (ValueError otherwise)."""
+    if variant not in VARIANTS:
+        raise ValueError(f"image variant must be one of {', '.join(VARIANTS)}, got {variant!r}")
+    return variant
 
 
 def safe_name(name: str) -> str:

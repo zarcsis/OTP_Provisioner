@@ -3,6 +3,7 @@
 Error mapping (every error body is ``{"detail": "..."}``):
 
 * unusable serial / malformed body / unknown build target -> 400
+* not signed in to Google / settings sheet not read yet   -> 401
 * unknown module, job, stage or file                     -> 404
 * artifact not ready yet                                  -> 409 ``{"ready": false, "reason", "job"}``
 * store unavailable (``StoreError``)                      -> 503
@@ -19,13 +20,15 @@ else of the repository is reachable, there are no directory listings, and page a
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 log = logging.getLogger(__name__)
 
@@ -141,12 +144,19 @@ def api_router(svc: Any) -> APIRouter:
     StoreErrors = _store_error_types()
     NotReady = _not_ready_type()
 
+    def require_google() -> None:
+        """Every module / stage / build endpoint needs the Google login and the settings sheet."""
+        if not svc.google_ready():
+            raise HTTPException(401, detail=svc.google_problem())
+
     def modules() -> Any:
+        require_google()
         if svc.modules is None:
             raise HTTPException(503, detail=f"module store is not usable: {svc.store_error or 'not configured'}")
         return svc.modules
 
     def artifacts() -> Any:
+        require_google()
         if svc.artifacts is None:
             raise HTTPException(503, detail=f"artifacts are not available: {svc.artifacts_error or 'not configured'}")
         return svc.artifacts
@@ -183,6 +193,28 @@ def api_router(svc: Any) -> APIRouter:
     @r.get("/status")
     def get_status() -> JSONResponse:
         return JSONResponse(svc.status(), headers=NO_STORE)
+
+    # ---------------------------------------------------------------- Google sign-in
+    @r.get("/google/login", include_in_schema=False)
+    def google_login(request: Request) -> RedirectResponse:
+        """Send the browser to Google's consent screen; Google redirects back to ``/`` (see static_router)."""
+        if svc.account is None:
+            raise HTTPException(404, detail="no Google account is wired into this server")
+        hostname = (request.url.hostname or "").lower()
+        host = "localhost" if hostname == "localhost" else "127.0.0.1"
+        port = request.url.port or svc.cfg.server.port
+        try:
+            url = svc.account.begin_login(f"http://{host}:{port}/")
+        except Exception as exc:
+            from urllib.parse import quote
+
+            return RedirectResponse("/?google_error=" + quote(_exc_text(exc)), status_code=303)
+        return RedirectResponse(url, status_code=303)
+
+    @r.post("/google/logout")
+    def google_logout() -> dict:
+        svc.google_logout()
+        return {"ok": True}
 
     # ---------------------------------------------------------------- modules
     @r.get("/modules")
@@ -264,6 +296,33 @@ def api_router(svc: Any) -> APIRouter:
         rec = call(modules().add_facts, serial, b)
         return {"module": view(rec)}
 
+    @r.post("/modules/{serial}/mode")
+    def module_mode(serial: str, body: Any = Body(default=None)) -> dict:
+        """Choose the provisioning scenario of a board: ``{"mode": "open" | "secure"}``."""
+        b = body_dict(body)
+        rec = call(modules().set_mode, serial, b.get("mode"))
+        forget = getattr(svc.artifacts, "forget_board", None)
+        if forget is not None:
+            # files pinned by manifests of the old scenario must not stay downloadable
+            forget(str(rec.get("serial") or serial))
+        return {"module": view(rec)}
+
+    @r.post("/modules/{serial}/device-key")
+    def module_device_key(serial: str, body: Any = Body(default=None)) -> dict:
+        """The board's OTP device private key as the fastboot gadget exported it (``secure`` mode):
+        ``{"key_der_b64": base64 of the gadget's key file, "device_key_pem": getvar:public-key}``.
+        Stored only when it matches the public key the board reports; the key never comes back out."""
+        b = body_dict(body)
+        raw_b64 = b.get("key_der_b64")
+        if not isinstance(raw_b64, str) or not raw_b64.strip():
+            raise HTTPException(400, detail="key_der_b64 must be a non-empty base64 string")
+        try:
+            der = base64.b64decode(raw_b64.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, detail="key_der_b64 is not valid base64") from None
+        rec, info = call(modules().store_device_key, serial, der, b.get("device_key_pem"))
+        return {"module": view(rec), "device_key": {k: info[k] for k in ("fingerprint", "already", "zero_words")}}
+
     @r.post("/modules/{serial}/otp")
     def module_otp(serial: str, body: Any = Body(default=None)) -> dict:
         """Operator override of the recorded OTP lock state (``python -m otp_server modules
@@ -339,8 +398,12 @@ def api_router(svc: Any) -> APIRouter:
 # ----------------------------------------------------------------------------------------------------
 
 
-def static_router(web_dir: Path) -> APIRouter:
-    """``/`` -> index.html, ``/css/<file>``, ``/js/<file>``; nothing else."""
+def static_router(web_dir: Path, oauth_callback: Any = None) -> APIRouter:
+    """``/`` -> index.html, ``/css/<file>``, ``/js/<file>``; nothing else.
+
+    ``oauth_callback(state, code, error) -> url``: Google's OAuth redirect lands on ``/`` with ``state`` and
+    ``code`` (or ``error``) in the query; it is handed over and the browser is sent on to the result.
+    """
     r = APIRouter()
     web = Path(web_dir)
 
@@ -350,7 +413,11 @@ def static_router(web_dir: Path) -> APIRouter:
         return FileResponse(p, media_type=_media_type(p), headers=NO_STORE)
 
     @r.get("/", include_in_schema=False)
-    def index() -> FileResponse:
+    def index(request: Request) -> Any:
+        q = request.query_params
+        if oauth_callback is not None and q.get("state") and (q.get("code") or q.get("error")):
+            target = oauth_callback(q.get("state", ""), q.get("code", ""), q.get("error", ""))
+            return RedirectResponse(target, status_code=303)
         return send(safe_static_path(web, "index.html"))
 
     @r.get("/css/{path:path}", include_in_schema=False)

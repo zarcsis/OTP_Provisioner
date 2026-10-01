@@ -1,10 +1,13 @@
-"""Fastboot gadget (pi-gen-micro ``fastboot`` configuration) and the stage-2 rpiboot directory.
+"""Fastboot gadget (pi-gen-micro ``fastboot`` configuration + our helper packages) and the stage-2
+rpiboot directory.
 
+The gadget is always built here (no prebuilt image): it carries our ``otp-keyexport`` helper
+(docker/gadget-helpers), which hands the OTP device key to the station in the secure scenario.
 Built gadget: ``<work>/artifacts/gadget/<key>[-r<N>]/fastboot-gadget-<targets>.img`` (+ build-info.json,
 .complete), key = ``<pi-gen-micro commit>-<builder hash>-<targets>`` where the builder hash covers
-docker/gadget.Dockerfile + gadget-entrypoint.sh. A forced rebuild of the same key goes to the next
-``-r<N>`` directory instead of replacing one that may be being served; the newest complete one wins. Prebuilt fallback: rpi-sb-provisioner ``host-support/
-fastboot-gadget-pi5-family.img`` (same configuration's output, only valid for ``pi5-family``).
+docker/gadget.Dockerfile, gadget-entrypoint.sh and the helper packages. A forced rebuild of the same key
+goes to the next ``-r<N>`` directory instead of replacing one that may be being served; the newest
+complete one wins.
 Stage 2 = ``bootfiles.bin`` (usbboot firmware) + ``boot.img`` (the gadget) + ``config.txt``; for a board
 locked to our key also ``boot.sig`` and a counter-signed ``bootfiles.bin`` from ``stage2-sign.sh``.
 """
@@ -22,7 +25,6 @@ from .common import (NotReady, TempKeys, commit_partial, content_hash, file_url,
                      write_json, write_text)
 
 STAGE2_CONFIG = "boot_ramdisk=1\nuart_2ndstage=1\n"
-PREBUILT_TARGETS = "pi5-family"
 
 
 class GadgetBuilder:
@@ -46,11 +48,6 @@ class GadgetBuilder:
         return Path(self.cfg.repo_root) / "external" / "pi-gen-micro"
 
     @property
-    def prebuilt_path(self) -> Path:
-        return (Path(self.cfg.repo_root) / "external" / "rpi-sb-provisioner" / "host-support"
-                / "fastboot-gadget-pi5-family.img")
-
-    @property
     def bootfiles_path(self) -> Path:
         # A real file in the usbboot checkout (never go through the firmware/2712/* git symlinks).
         return Path(self.cfg.repo_root) / "external" / "usbboot" / "firmware" / "bootfiles.bin"
@@ -65,12 +62,18 @@ class GadgetBuilder:
         return c
 
     @property
+    def helpers_dir(self) -> Path:
+        """Our pi-gen-micro helper packages (copied into the image build, see gadget-entrypoint.sh)."""
+        return Path(self.cfg.repo_root) / "docker" / "gadget-helpers"
+
+    @property
     def builder_files(self) -> list[Path]:
         d = Path(self.cfg.repo_root) / "docker"
-        return [d / "gadget.Dockerfile", d / "gadget-entrypoint.sh"]
+        helpers = sorted(p for p in self.helpers_dir.rglob("*") if p.is_file()) if self.helpers_dir.is_dir() else []
+        return [d / "gadget.Dockerfile", d / "gadget-entrypoint.sh", *helpers]
 
     def builder_hash(self) -> str:
-        """Content hash of gadget.Dockerfile + gadget-entrypoint.sh (CRLF-normalised)."""
+        """Content hash of gadget.Dockerfile, gadget-entrypoint.sh and the helper packages (CRLF-normalised)."""
         return content_hash(self.builder_files)
 
     def key(self) -> str:
@@ -114,31 +117,13 @@ class GadgetBuilder:
         p = d / self.image_name()
         return p if is_complete(d) and p.is_file() and p.stat().st_size > 0 else None
 
-    def prebuilt_image(self) -> Path | None:
-        p = self.prebuilt_path
-        if self.gcfg.targets == PREBUILT_TARGETS and p.is_file() and p.stat().st_size > 0:
-            return p
-        return None
-
     def current(self) -> tuple[Path, str, str]:
-        """(path, source "built"|"prebuilt", version) of the gadget stage 2 serves, per builds.gadget.source."""
-        source = self.gcfg.source
-        built = self.built_image() if source in ("build", "auto") else None
+        """(path, source "built", version) of the gadget stage 2 serves; NotReady until it is built."""
+        built = self.built_image()
         if built is not None:
             return built, "built", built.parent.name
-        if source in ("prebuilt", "auto"):
-            pre = self.prebuilt_image()
-            if pre is not None:
-                sb = git_output(self.pgm_dir.parent / "rpi-sb-provisioner", "rev-parse", "--short=12", "HEAD")
-                return pre, "prebuilt", f"rpi-sb-provisioner host-support ({sb or 'unknown'})"
-        job = self.jobs.active("gadget")
-        if source == "build":
-            raise NotReady("the fastboot gadget is not built yet (builds.gadget.source = build)", job)
-        if source == "prebuilt":
-            raise NotReady(f"no prebuilt fastboot gadget for targets {self.gcfg.targets!r} "
-                           f"(only {PREBUILT_TARGETS} ships in rpi-sb-provisioner host-support)", job)
-        raise NotReady("no fastboot gadget: not built yet and no prebuilt image for "
-                       f"targets {self.gcfg.targets!r}", job)
+        raise NotReady(f"the fastboot gadget (pi-gen-micro {self.commit()}, {self.gcfg.targets}) is not built yet",
+                       self.jobs.active("gadget"))
 
     # ------------------------------------------------------------------ build job
     def build(self, job: Any, force: bool = False) -> None:
@@ -197,17 +182,11 @@ class GadgetBuilder:
             base["detail"] = exc.reason
             return base
         base.update(ready=True, source=source, version=version, path=str(path), size=path.stat().st_size)
-        if source == "built":
-            try:
-                base["built"] = read_json(path.parent / "build-info.json").get("built")
-            except (OSError, ValueError, AttributeError):
-                pass
-            base["detail"] = f"pi-gen-micro fastboot {self.gcfg.targets}"
-        else:
-            detail = "prebuilt image from rpi-sb-provisioner host-support"
-            if self.gcfg.source == "auto":
-                detail += f"; no build for pi-gen-micro {self.commit()} yet"
-            base["detail"] = detail
+        try:
+            base["built"] = read_json(path.parent / "build-info.json").get("built")
+        except (OSError, ValueError, AttributeError):
+            pass
+        base["detail"] = f"pi-gen-micro fastboot {self.gcfg.targets} + otp-keyexport"
         return base
 
     # ------------------------------------------------------------------ stage 2
@@ -257,8 +236,9 @@ class GadgetBuilder:
         commit_partial(part, out_dir, {"stage": 2, "mode": "signed"})
         job.log(f"==> signed stage-2 files ready: {out_dir}")
 
-    def stage2(self, record: dict, *, signed: bool, secrets_fn, base_url: str) -> tuple[dict, dict[str, Path]]:
-        """Stage-2 manifest and {name: path}."""
+    def stage2(self, record: dict, *, signed: bool, secure: bool, secrets_fn,
+               base_url: str) -> tuple[dict, dict[str, Path]]:
+        """Stage-2 manifest and {name: path}. The gadget is the same in both scenarios."""
         serial = str(record.get("serial") or "")
         boot_img, source, version = self.current()
         if not self.bootfiles_path.is_file():
@@ -290,8 +270,8 @@ class GadgetBuilder:
                 boot_sf,
                 self.hashes.stage_file("config.txt", cfg_path, "generated"),
             ]
-        if source == "prebuilt":
-            notes.append("using the prebuilt fastboot gadget from rpi-sb-provisioner host-support")
+        if secure:
+            notes.append("secure scenario: the gadget exports the OTP device key to the station in stage 3")
         manifest = {
             "stage": 2,
             "kind": "rpiboot",

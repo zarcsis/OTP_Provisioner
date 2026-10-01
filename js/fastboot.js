@@ -21,6 +21,10 @@
  *
  * The device identifies as USB 18d1:4e40 (manufacturer "Raspberry Pi",
  * serial = 16-hex board serial) with a vendor interface ff/42/03.
+ *
+ * Secure scenario: before any of the above, exportDeviceKey() fetches the board's OTP device key from
+ * our gadget helper (otp-keyexport) with "oem upload-file" + "upload" ("upload" answers DATA%08x, then
+ * the device sends the bytes, then OKAY), so the server can keep it.
  */
 (function () {
     'use strict';
@@ -211,6 +215,87 @@
             return this.command(`flash:${partition}`);
         }
 
+        /**
+         * "upload": the device sends what the last "oem upload-file" staged — DATA%08x, the bytes, OKAY.
+         * Every read asks for exactly the bytes still due, so the OKAY packet is never swallowed.
+         */
+        async upload() {
+            const r = await this.command('upload');
+            if (r.status !== 'DATA') throw new FastbootError(`expected DATA, got ${r.status}`);
+            const size = r.dataSize;
+            const out = new Uint8Array(size);
+            let got = 0;
+            while (got < size) {
+                const t = await this.usb.transferIn(this.inEp, Math.min(DATA_CHUNK, size - got));
+                if (t.status !== 'ok') throw new FastbootError(`bulk IN failed (${t.status}) after ${got} bytes`);
+                const chunk = new Uint8Array(t.data.buffer, t.data.byteOffset, t.data.byteLength);
+                if (got + chunk.byteLength > size) throw new FastbootError(`the device sent more than the ${size} bytes it announced`);
+                out.set(chunk, got);
+                got += chunk.byteLength;
+            }
+            await this.readResponse();
+            return out;
+        }
+
+        /** The bytes of a file on the gadget ("oem upload-file <path>" + "upload"); null when it does not exist or is empty. */
+        async uploadFile(path) {
+            if (!path || /\s/.test(path)) throw new FastbootError(`invalid path "${path}"`);
+            try {
+                await this.oem(`upload-file ${path}`);
+            } catch (e) {
+                if (e instanceof FastbootError && /ERRNO|opening file|size ?zero/i.test(e.message)) return null;
+                throw e;
+            }
+            return this.upload();
+        }
+
+        /** Write bytes to a file on the gadget ("download" + "oem download-file <path>"). */
+        async downloadFile(path, bytes) {
+            if (!path || /\s/.test(path)) throw new FastbootError(`invalid path "${path}"`);
+            await this.download(bytes);
+            return this.oem(`download-file ${path}`);
+        }
+
+        /**
+         * Hand the board's OTP device private key to the station (secure scenario), through the gadget's
+         * otp-keyexport helper (paths from the stage-3 manifest's key_export: {key, status, request}).
+         * The helper exports an existing key at gadget boot, before rpi-fastbootd READ-locks it; a blank
+         * slot is generated on request (IRREVERSIBLE, the same OTP write as "oem fwcrypto init").
+         * Returns {der, generated}. The key bytes are never logged.
+         */
+        async exportDeviceKey(keyExport, opts) {
+            const ke = keyExport || {};
+            const o = Object.assign({ timeoutMs: 30000, pollMs: 500, log: null }, opts || {});
+            const say = o.log || this.log;
+            const statusText = async () => {
+                const b = await this.uploadFile(ke.status);
+                return b ? clean(dec.decode(b)) : '';
+            };
+            let der = await this.uploadFile(ke.key);
+            let generated = false;
+            if (!der) {
+                const st = await statusText();
+                if (!st) throw new FastbootError('this fastboot gadget has no OTP key export helper (otp-keyexport): rebuild the gadget on the server');
+                if (/^locked/.test(st)) throw new FastbootError(`the OTP device key cannot be exported in this boot (${st}); run stage 2 again to reboot the gadget`);
+                if (/^error/.test(st)) throw new FastbootError(`the gadget could not read the OTP device key: ${st}`);
+                generated = /^blank/.test(st);
+                say('info', generated ? 'OTP key slot is empty: the gadget generates the device key (OTP write) and exports it…'
+                    : `asking the gadget to export the device key (${st})…`);
+                await this.downloadFile(ke.request, enc.encode('export\n'));
+                const deadline = Date.now() + o.timeoutMs;
+                for (;;) {
+                    await sleep(o.pollMs);
+                    der = await this.uploadFile(ke.key);
+                    if (der) break;
+                    const s2 = await statusText();
+                    if (/^(locked|error)/.test(s2)) throw new FastbootError(`the OTP device key export failed: ${s2}`);
+                    if (Date.now() > deadline) throw new FastbootError(`the gadget did not export the device key within ${Math.round(o.timeoutMs / 1000)} s (${s2 || 'no status'})`);
+                }
+            }
+            say('ok', `OTP device key exported by the gadget (${der.byteLength} bytes${generated ? ', generated now' : ''})`);
+            return { der, generated };
+        }
+
         async oem(cmd) { return this.command(`oem ${cmd}`); }
         async reboot() { return this.command('reboot'); }
 
@@ -325,7 +410,7 @@
             }
 
             try {
-                say('info', 'oem idpwrite (partition table + LUKS containers)…');
+                say('info', 'oem idpwrite (partition table; LUKS containers for an encrypted image)…');
                 progress({ phase: 'idpwrite' });
                 const w = await this.oem('idpwrite');
                 say('ok', `idpwrite: ${clean(w.message)}`);

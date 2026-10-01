@@ -1,0 +1,12 @@
+[Unit]
+Description=Export the OTP device key before rpi-fastbootd READ-locks it
+Before=fastbootd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/otp-keyexport boot
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,156 @@
+#!/bin/sh
+# otp-keyexport - hand the board's OTP device private key (rpi-fw-crypto key-id 1) to the
+# provisioning station (OTP_Provisioner, secure scenario).
+#
+#   otp-keyexport boot      runs before rpi-fastbootd (otp-keyexport-boot.service): when the OTP key
+#                           slot holds a key, export it. rpi-fastbootd READ-locks a provisioned key at
+#                           startup, so this is the only moment of a boot an existing key can be read.
+#                           Never generates a key.
+#   otp-keyexport request   the station asked for it (fastboot "download" + "oem download-file
+#                           /run/otp-keyexport/request", picked up by otp-keyexport-request.path):
+#                           generate the key when the slot is blank (IRREVERSIBLE OTP write, the same
+#                           thing "oem fwcrypto init" does), then export it.
+#
+# Output, in /run/otp-keyexport (tmpfs, root only), fetched by the station with
+# "oem upload-file <path>" + "upload":
+#   key.der   the private key exactly as "rpi-fw-crypto privkey --key-id 1" returns it (DER)
+#   status    one line "<state> <detail>"; state = busy | blank | exported | locked | error
+# After an export the key is READ-locked for the rest of the boot (the lock rpi-fastbootd sets too).
+# The key is handed over in the clear: this is a demo station, the USB link goes to it only.
+# Busybox sh: only shell builtins, sed, mv, rm, mkdir, chmod, sleep and rpi-fw-crypto are used.
+set -u
+umask 077
+DIR="${OTP_KEYEXPORT_DIR:-/run/otp-keyexport}"        # overridable for tests only
+KEY_ID=1
+MODE="${1:-boot}"
+LOCKED_MSG="the key is READ-locked in this boot; boot the gadget again (stage 2) to export it"
+
+log() {
+    echo "otp-keyexport: $*"
+    echo "otp-keyexport: $*" > /dev/kmsg 2>/dev/null || true
+}
+
+set_status() {
+    printf '%s\n' "$*" > "$DIR/status.tmp" && mv -f "$DIR/status.tmp" "$DIR/status"
+    log "$*"
+}
+
+wait_mailbox() {
+    n=0
+    while [ ! -e "${OTP_KEYEXPORT_MBOX:-/dev/vcio_crypto}" ] && [ ! -e /dev/vcio ]; do
+        n=$((n + 1))
+        [ "$n" -gt 10 ] && return 1
+        sleep 1
+    done
+    return 0
+}
+
+# Prints present | locked | blank | "error <detail>". A slot whose public key cannot be derived
+# counts as blank: "genkey" refuses a slot that is not, so nothing is ever overwritten.
+key_state() {
+    if ! st=$(rpi-fw-crypto get-key-status "$KEY_ID" 2>&1); then
+        echo "error get-key-status: $st"
+        return
+    fi
+    if rpi-fw-crypto pubkey --key-id "$KEY_ID" --out /dev/null >/dev/null 2>&1; then
+        case "$st" in
+            *READ_LOCKED*) echo locked ;;
+            *) echo present ;;
+        esac
+    else
+        echo blank
+    fi
+}
+
+export_key() {
+    rm -f "$DIR/key.der" "$DIR/key.der.tmp"
+    if ! err=$(rpi-fw-crypto privkey --key-id "$KEY_ID" --out "$DIR/key.der.tmp" 2>&1); then
+        rm -f "$DIR/key.der.tmp"
+        case "$err" in
+            *ocked*) set_status "locked $LOCKED_MSG" ;;
+            *) set_status "error privkey: $err" ;;
+        esac
+        return 1
+    fi
+    if [ ! -s "$DIR/key.der.tmp" ]; then
+        rm -f "$DIR/key.der.tmp"
+        set_status "error privkey wrote nothing"
+        return 1
+    fi
+    mv -f "$DIR/key.der.tmp" "$DIR/key.der"
+    if ! err=$(rpi-fw-crypto set-key-status "$KEY_ID" READ_LOCKED 2>&1); then
+        log "warning: could not READ-lock the key: $err"
+    fi
+    set_status "exported key.der"
+    return 0
+}
+
+mkdir -p "$DIR" && chmod 0700 "$DIR"
+# Consume a station request before anything can fail: otp-keyexport-request.path fires while the file
+# exists, so leaving it behind would restart this service in a loop.
+[ "$MODE" = request ] && rm -f "$DIR/request"
+if ! command -v rpi-fw-crypto >/dev/null 2>&1; then
+    set_status "error rpi-fw-crypto is not installed in this gadget"
+    exit 1
+fi
+
+case "$MODE" in
+boot)
+    set_status "busy reading the OTP key slot"
+    if ! wait_mailbox; then
+        set_status "error no firmware mailbox device (/dev/vcio_crypto, /dev/vcio)"
+        exit 1
+    fi
+    state=$(key_state)
+    case "$state" in
+        present) export_key ;;
+        locked) set_status "locked $LOCKED_MSG" ;;
+        blank) set_status "blank the OTP key slot is empty; the station generates the key on request" ;;
+        *) set_status "$state" ;;
+    esac
+    exit 0
+    ;;
+request)
+    rm -f "$DIR/request"
+    if [ -s "$DIR/key.der" ]; then
+        set_status "exported key.der"
+        exit 0
+    fi
+    set_status "busy generating / exporting the OTP key"
+    if ! wait_mailbox; then
+        set_status "error no firmware mailbox device (/dev/vcio_crypto, /dev/vcio)"
+        exit 1
+    fi
+    state=$(key_state)
+    case "$state" in
+        locked)
+            set_status "locked $LOCKED_MSG"
+            exit 1
+            ;;
+        present) ;;
+        error*)
+            set_status "$state"
+            exit 1
+            ;;
+        *)
+            if out=$(rpi-fw-crypto genkey --key-id "$KEY_ID" --alg ec 2>&1); then
+                log "$out"
+            else
+                case "$out" in
+                    *"not blank"*) log "the slot is not blank, exporting what it holds: $out" ;;
+                    *)
+                        set_status "error genkey: $out"
+                        exit 1
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+    export_key
+    exit $?
+    ;;
+*)
+    echo "usage: otp-keyexport boot|request" >&2
+    exit 2
+    ;;
+esac

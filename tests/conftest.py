@@ -4,24 +4,21 @@
 * ``make_cfg`` -- factory fixture building an isolated :class:`otp_server.config.Config`::
 
       def test_x(make_cfg, tmp_path):
-          cfg = make_cfg(tmp_path)                                    # defaults, local store
-          cfg = make_cfg(tmp_path, provisioning={"secure_boot": True})  # nested overrides
+          cfg = make_cfg(tmp_path)                                         # defaults
+          cfg = make_cfg(tmp_path, provisioning={"default_mode": "secure"})  # nested overrides
           cfg = make_cfg(tmp_path, repo_root=fake_repo, paths={"droneos": str(tmp_path / "droneos")})
 
   Signature: ``make_cfg(tmp_path, *, repo_root=None, ensure_dirs=True, **overrides) -> Config``.
 
+  - there is no config file (the product reads its settings from Google Sheets): the overrides play
+    the part of the settings sheet; the ``OTP_*`` environment variables are removed for the test;
   - ``work_dir`` is ``tmp_path / "work"`` (override with ``paths={"work": ...}``);
-  - the config file is an empty ``tmp_path / "otp-test-config.yaml"``, so no user config
-    (``<repo>/config.yaml``, ``<work>/config.yaml``, ``OTP_CONFIG``) can leak in; the ``OTP_*``
-    environment variables are removed for the test;
   - ``server.open_browser`` and ``builds.auto`` default to ``False``;
-  - ``overrides`` are nested dicts per top-level YAML section (``server``, ``paths``, ``storage``,
-    ``provisioning``, ``builds``, ``docker``) merged over those test defaults;
   - ``repo_root`` defaults to the real repository (``external/`` submodules available);
   - the work directory tree is created (``cfg.ensure_dirs()``) unless ``ensure_dirs=False``.
 
 * ``cfg``            -- ``make_cfg(tmp_path)``.
-* ``store``          -- a :class:`~otp_server.storage.local.LocalJsonStore` on ``cfg``.
+* ``store``          -- a :class:`tests.memstore.MemoryStore`.
 * ``module_service`` -- a :class:`~otp_server.modules.ModuleService` on ``cfg`` + ``store``.
 """
 
@@ -40,8 +37,10 @@ import pytest
 sys.dont_write_bytecode = True
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+TESTS_DIR = Path(__file__).resolve().parent
+for p in (REPO_ROOT, TESTS_DIR):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001 - pytest hook signature
@@ -70,16 +69,13 @@ def make_cfg(monkeypatch):
     def _make(tmp_path: Path, *, repo_root: Path | None = None, ensure_dirs: bool = True, **overrides) -> Config:
         tmp_path = Path(tmp_path)
         tmp_path.mkdir(parents=True, exist_ok=True)
-        cfg_file = tmp_path / "otp-test-config.yaml"
-        if not cfg_file.exists():
-            cfg_file.write_text("{}\n", encoding="utf-8")
         tree: dict = {
             "paths": {"work": str(tmp_path / "work")},
             "server": {"open_browser": False},
             "builds": {"auto": False},
         }
         _merge(tree, overrides)
-        cfg = load_config(cfg_file, overrides=tree, repo_root=repo_root)
+        cfg = load_config(overrides=tree, repo_root=repo_root)
         if ensure_dirs:
             cfg.ensure_dirs()
         return cfg
@@ -93,10 +89,10 @@ def cfg(make_cfg, tmp_path) -> Config:
 
 
 @pytest.fixture
-def store(cfg):
-    from otp_server.storage.local import LocalJsonStore
+def store():
+    from memstore import MemoryStore
 
-    return LocalJsonStore(cfg.storage.local_dir)
+    return MemoryStore()
 
 
 @pytest.fixture

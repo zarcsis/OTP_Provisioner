@@ -7,9 +7,9 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from otp_server.modules import STAGE_LABELS, STAGES, ZERO_HASH, ModuleService, normalize_serial
+from memstore import MemoryStore
+from otp_server.modules import MODES, STAGE_LABELS, STAGES, ZERO_HASH, ModuleService, normalize_serial
 from otp_server.secrets_gen import customer_key_hash, luks_passphrase, public_key_fingerprint
-from otp_server.storage import LocalJsonStore
 
 EC_PEM = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
     serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
@@ -58,6 +58,7 @@ def test_normalize_serial_bad(raw):
 
 def test_constants():
     assert STAGES == ("new", "eeprom", "gadget", "flashed")
+    assert MODES == ("open", "secure")
     assert STAGE_LABELS["gadget"] == "Fastboot gadget booted"
     assert ZERO_HASH == "0" * 64
 
@@ -291,24 +292,30 @@ def test_public_view(module_service):
     assert rec["device_secret"] not in text
     assert "rsa_private_pem" not in text and "PRIVATE KEY" not in text
     assert "device_secret" not in view and view["secrets"]["device_secret"] is True  # only a flag
-    assert set(view) == {"serial", "stage", "stage_label", "created", "updated", "chip", "board", "duid", "mac",
-                         "factory_uuid", "boardrev", "secrets", "otp", "metadata", "facts", "events"}
+    assert set(view) == {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_locked", "created", "updated",
+                         "chip", "board", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata",
+                         "facts", "events"}
     assert view["stage"] == "eeprom" and view["stage_label"] == "EEPROM flashed"
+    assert (view["mode"], view["mode_chosen"], view["mode_locked"]) == ("open", "", False)  # cfg default_mode
     assert view["secrets"] == {"rsa_key": True, "customer_key_hash": rec["customer_key_hash"], "device_secret": True,
                                "rsa_key_fingerprint": public_key_fingerprint(rec["rsa_public_pem"])}
     assert view["otp"] == {"customer_key_hash": ZERO_HASH, "locked": False, "locked_to_our_key": False,
                            "secure_boot_provisioned": False, "device_key": True,
-                           "device_key_fingerprint": public_key_fingerprint(EC_PEM)}
+                           "device_key_fingerprint": public_key_fingerprint(EC_PEM),
+                           "device_key_exported": False}
     assert view["events"][-1]["kind"] == "device_key"
     empty = module_service.public_view({"serial": "cccccccc"})
     assert empty["secrets"]["rsa_key"] is False and empty["secrets"]["rsa_key_fingerprint"] == ""
     assert empty["otp"]["customer_key_hash"] == "" and empty["otp"]["locked"] is False
+    assert empty["otp"]["device_key_exported"] is False and empty["mode"] == "open" and empty["mode_chosen"] == ""
 
 
 def test_secrets_for(module_service, store):
     rec, _ = module_service.hello("a7eb274c")
     s = module_service.secrets_for("10000000a7eb274c")
-    assert s == {k: rec[k] for k in ("rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret")}
+    assert s == {k: rec[k] for k in ("rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret",
+                                     "device_private_pem")}
+    assert s["device_private_pem"] == ""  # nothing exported yet
     assert len(luks_passphrase(s["device_secret"], "osroot_crypt", "a7eb274c")) == 64
     with pytest.raises(KeyError):
         module_service.secrets_for("bbbbbbbb")
@@ -323,8 +330,8 @@ def test_events_capped(module_service):
     assert len(module_service.require("a7eb274c")["events"]) == 100
 
 
-def test_concurrent_updates_do_not_lose_events(cfg, tmp_path):
-    svc = ModuleService(cfg, LocalJsonStore(tmp_path / "reg"))
+def test_concurrent_updates_do_not_lose_events(cfg):
+    svc = ModuleService(cfg, MemoryStore())
     svc.hello("a7eb274c")
     errors = []
 
@@ -424,3 +431,403 @@ def test_mark_locked_never_generates_a_key(module_service, store):
                                 "rsa_private_pem": priv, "rsa_public_pem": pub, "customer_key_hash": "ab" * 32}))
     with pytest.raises(ValueError, match="does not match"):
         module_service.mark_locked("c0ffee03")
+
+
+# --------------------------------------------------------------------------------------------------
+# scenarios: mode_of / set_mode
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def svc_open(make_cfg, tmp_path, store):
+    return ModuleService(make_cfg(tmp_path / "open"), store)
+
+
+@pytest.fixture
+def svc_secure(make_cfg, tmp_path, store):
+    return ModuleService(make_cfg(tmp_path / "secure", provisioning={"default_mode": "secure"}), store)
+
+
+def test_mode_of_default_comes_from_cfg(svc_open, svc_secure):
+    assert svc_open.cfg.provisioning.default_mode == "open"
+    assert svc_secure.cfg.provisioning.default_mode == "secure"
+    for rec in ({"serial": "a7eb274c"}, {"serial": "a7eb274c", "mode": ""},
+                {"serial": "a7eb274c", "mode": "bogus"}, {}):
+        assert svc_open.mode_of(rec) == "open", rec
+        assert svc_secure.mode_of(rec) == "secure", rec
+    assert svc_secure.mode_of(None) == "secure"
+
+
+def test_mode_of_chosen_mode_wins_over_the_default(svc_open, svc_secure):
+    assert svc_open.mode_of({"serial": "a7eb274c", "mode": "secure"}) == "secure"
+    assert svc_secure.mode_of({"serial": "a7eb274c", "mode": "open"}) == "open"
+    assert svc_open.mode_of({"serial": "a7eb274c", "mode": " SECURE "}) == "secure"
+
+
+def test_mode_of_locked_board_is_always_secure(svc_open, svc_secure):
+    for svc in (svc_open, svc_secure):
+        assert svc.mode_of({"serial": "a7eb274c", "mode": "open", "otp_key_hash": "ab" * 32}) == "secure"
+        assert svc.mode_of({"serial": "a7eb274c", "otp_key_hash": "AB" * 32}) == "secure"
+        assert svc.mode_of({"serial": "a7eb274c", "mode": "open", "secure_boot_provisioned": True}) == "secure"
+        # an all-zero CUSTOMER_KEY_HASH is an unprogrammed OTP, not a lock
+        assert svc.mode_of({"serial": "a7eb274c", "mode": "open", "otp_key_hash": ZERO_HASH}) == "open"
+
+
+def test_mode_of_after_mark_locked(module_service):
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "open")
+    rec = module_service.mark_locked("a7eb274c")
+    assert rec["mode"] == "open" and module_service.mode_of(rec) == "secure"
+    view = module_service.public_view(rec)
+    assert (view["mode"], view["mode_chosen"], view["mode_locked"]) == ("secure", "open", True)
+
+
+def test_set_mode_rejects_unknown_modes(module_service, store):
+    module_service.hello("a7eb274c")
+    before, puts = store.get("a7eb274c"), store.puts
+    for bad in ("bogus", "", None, "signed", "unsigned", "open secure"):
+        with pytest.raises(ValueError, match="mode must be one of open, secure"):
+            module_service.set_mode("a7eb274c", bad)
+    with pytest.raises(ValueError):
+        module_service.set_mode("bbbbbbbb", "bogus")  # the mode is checked before the board
+    with pytest.raises(KeyError):
+        module_service.set_mode("bbbbbbbb", "open")
+    assert store.puts == puts and store.get("a7eb274c") == before
+
+
+def test_set_mode_open_is_refused_on_a_locked_board(module_service, store):
+    module_service.hello("a7eb274c")
+    module_service.mark_locked("a7eb274c")
+    puts = store.puts
+    with pytest.raises(ValueError, match="only the secure scenario is possible"):
+        module_service.set_mode("a7eb274c", "open")
+    assert store.puts == puts and store.get("a7eb274c")["mode"] == ""
+    rec = module_service.set_mode("a7eb274c", "secure")
+    assert rec["mode"] == "secure" and rec["events"][-1]["kind"] == "mode"
+
+    # secure_boot_provisioned alone (no hash recorded) counts as locked, as does a foreign key hash
+    module_service.hello("bbbbbbbb")
+    module_service.hello("cccccccc")
+    store.put({**store.get("bbbbbbbb"), "secure_boot_provisioned": True})
+    store.put({**store.get("cccccccc"), "otp_key_hash": "cd" * 32})
+    for serial in ("bbbbbbbb", "cccccccc"):
+        with pytest.raises(ValueError, match="OTP holds a key hash"):
+            module_service.set_mode(serial, "open")
+        assert store.get(serial)["mode"] == ""
+
+
+def test_set_mode_same_mode_is_a_no_op(module_service, store):
+    module_service.hello("a7eb274c")
+    rec = module_service.set_mode("a7eb274c", "secure")
+    assert rec["mode"] == "secure"
+    puts, n_events = store.puts, len(rec["events"])
+    again = module_service.set_mode("a7eb274c", " Secure ")
+    assert store.puts == puts  # nothing written
+    assert len(again["events"]) == n_events  # no event
+    assert again == rec == store.get("a7eb274c")
+
+
+def test_set_mode_switch_resets_the_stage(module_service, store):
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "open")
+    rec, v = module_service.record_result("a7eb274c", 1, s1(md_ok()))
+    assert v["ok"] is True and rec["stage"] == "eeprom"
+    rec = module_service.set_mode("a7eb274c", "secure")
+    assert rec["mode"] == "secure" and rec["stage"] == "new"
+    ev = rec["events"][-1]
+    assert ev["kind"] == "mode"
+    assert ev["note"].startswith("scenario secure (was open)")
+    assert "stage eeprom reset to new" in ev["note"] and "redone" in ev["note"]
+    assert store.get("a7eb274c") == rec
+    assert module_service.public_view(rec)["mode"] == "secure"
+    # switching back while the board is still "new": nothing to reset, no reset clause
+    rec = module_service.set_mode("a7eb274c", "open")
+    assert rec["stage"] == "new" and rec["events"][-1]["note"] == "scenario open (was secure)"
+
+
+def test_set_mode_first_choice_keeps_the_progress(module_service, store):
+    module_service.hello("a7eb274c")
+    module_service.record_result("a7eb274c", 1, s1(md_ok()))
+    module_service.identify_fastboot("10000000a7eb274c")
+    assert store.get("a7eb274c")["stage"] == "gadget" and store.get("a7eb274c")["mode"] == ""
+    # first explicit choice (the cfg default is open, so the stages already ran in this scenario)
+    rec = module_service.set_mode("a7eb274c", "open")
+    assert rec["stage"] == "gadget" and rec["mode"] == "open"
+    assert {k: rec["events"][-1][k] for k in ("kind", "note")} == {"kind": "mode", "note": "scenario open"}
+    assert store.get("a7eb274c") == rec
+
+
+def test_set_mode_first_choice_other_than_the_default_redoes_the_stages(module_service, store):
+    # the stages ran in the cfg default scenario (open) without an explicit choice: picking secure must
+    # not leave the board "flashed" with an unsigned EEPROM and no device key
+    module_service.hello("a7eb274c")
+    module_service.record_result("a7eb274c", 1, s1(md_ok()))
+    module_service.identify_fastboot("10000000a7eb274c")
+    assert store.get("a7eb274c")["stage"] == "gadget" and store.get("a7eb274c")["mode"] == ""
+    rec = module_service.set_mode("a7eb274c", "secure")
+    assert rec["mode"] == "secure" and rec["stage"] == "new"
+    note = rec["events"][-1]["note"]
+    assert note.startswith("scenario secure (the stages so far ran as open)")
+    assert "stage gadget reset to new" in note
+    assert store.get("a7eb274c") == rec
+
+
+# --------------------------------------------------------------------------------------------------
+# OTP device key exported by the fastboot gadget (secure scenario)
+# --------------------------------------------------------------------------------------------------
+
+
+def _p256():
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+def _pub(key) -> str:
+    return key.public_key().public_bytes(serialization.Encoding.PEM,
+                                         serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+
+def _priv_pem(key) -> str:
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode()
+
+
+def _der(key, fmt=serialization.PrivateFormat.TraditionalOpenSSL) -> bytes:
+    return key.private_bytes(serialization.Encoding.DER, fmt, serialization.NoEncryption())
+
+
+def _scalar(pem: str) -> int:
+    return serialization.load_pem_private_key(pem.encode(), password=None).private_numbers().private_value
+
+
+@pytest.mark.parametrize("fmt", [serialization.PrivateFormat.TraditionalOpenSSL, serialization.PrivateFormat.PKCS8],
+                         ids=["sec1", "pkcs8"])
+def test_store_device_key_from_der(module_service, store, fmt):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    pub = _pub(key)
+    rec, info = module_service.store_device_key("A7EB274C", _der(key, fmt), pub.replace("\n", "\r\n"))
+    assert info == {"fingerprint": public_key_fingerprint(pub), "already": False, "zero_words": 0}
+    assert rec["device_private_pem"].startswith("-----BEGIN PRIVATE KEY-----\n")  # PKCS#8
+    assert "\r" not in rec["device_private_pem"]
+    assert _scalar(rec["device_private_pem"]) == key.private_numbers().private_value
+    assert rec["device_key_pem"] == pub
+    ev = rec["events"][-1]
+    assert ev["kind"] == "device_key_export" and info["fingerprint"][:16] in ev["note"]
+    assert "WARNING" not in ev["note"] and "PRIVATE" not in json.dumps(rec["events"])
+    assert store.get("a7eb274c") == rec
+
+
+def test_store_device_key_raw_scalar(module_service):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    raw = key.private_numbers().private_value.to_bytes(32, "big")
+    rec, info = module_service.store_device_key("a7eb274c", raw, _pub(key))
+    assert info["already"] is False and info["zero_words"] == 0
+    assert _scalar(rec["device_private_pem"]) == key.private_numbers().private_value
+    assert rec["device_key_pem"] == _pub(key)
+
+
+def test_store_device_key_keeps_a_matching_reported_key(module_service):
+    """The board reported its public key (add_facts / getvar:public-key) before the export: same key is fine."""
+    module_service.hello("a7eb274c")
+    key = _p256()
+    module_service.add_facts("a7eb274c", {"device_key_pem": _pub(key)})
+    rec, info = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    assert info["already"] is False and rec["device_private_pem"] and rec["device_key_pem"] == _pub(key)
+
+
+def test_store_device_key_must_match_the_reported_key(module_service, store):
+    module_service.hello("a7eb274c")
+    puts = store.puts
+    with pytest.raises(ValueError, match="does not match the public key the board reports"):
+        module_service.store_device_key("a7eb274c", _der(_p256()), _pub(_p256()))
+    rec = store.get("a7eb274c")
+    assert store.puts == puts and rec["device_private_pem"] == "" and rec["device_key_pem"] == ""
+
+
+def test_store_device_key_must_match_the_recorded_device_key(module_service, store):
+    module_service.hello("a7eb274c")
+    recorded = _p256()
+    module_service.add_facts("a7eb274c", {"device_key_pem": _pub(recorded)})
+    puts = store.puts
+    other = _p256()
+    with pytest.raises(ValueError, match="differs from the one recorded"):
+        module_service.store_device_key("a7eb274c", _der(other), _pub(other))
+    rec = store.get("a7eb274c")
+    assert store.puts == puts and rec["device_private_pem"] == "" and rec["device_key_pem"] == _pub(recorded)
+
+
+def test_store_device_key_second_export(module_service, store):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    first, info1 = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    puts = store.puts
+    # the same key again (also as the other DER flavour / raw scalar): already=True, nothing written
+    for data in (_der(key), _der(key, serialization.PrivateFormat.PKCS8),
+                 key.private_numbers().private_value.to_bytes(32, "big")):
+        again, info2 = module_service.store_device_key("a7eb274c", data, _pub(key))
+        assert info2 == {**info1, "already": True}
+        assert again == first
+    assert store.puts == puts and store.get("a7eb274c") == first
+
+    # a different key afterwards is refused (an OTP key cannot change)
+    other = _p256()
+    with pytest.raises(ValueError, match="an OTP key cannot change"):
+        module_service.store_device_key("a7eb274c", _der(other), _pub(other))
+    # ... also when the public PEM went missing from the record: the stored private key still decides
+    store.put({**store.get("a7eb274c"), "device_key_pem": ""})
+    puts = store.puts
+    with pytest.raises(ValueError, match="different device private key is already stored"):
+        module_service.store_device_key("a7eb274c", _der(other), _pub(other))
+    assert store.puts == puts and store.get("a7eb274c")["device_private_pem"] == first["device_private_pem"]
+
+
+@pytest.mark.parametrize("reported", ["", None, "garbage",
+                                      "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", "private"],
+                         ids=["empty", "none", "garbage", "private-header", "private-pem"])
+def test_store_device_key_needs_a_public_pem(module_service, store, reported):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    if reported == "private":
+        reported = _priv_pem(key)
+    puts = store.puts
+    with pytest.raises(ValueError, match="PEM public key"):
+        module_service.store_device_key("a7eb274c", _der(key), reported)
+    assert store.puts == puts and store.get("a7eb274c")["device_private_pem"] == ""
+
+
+@pytest.mark.parametrize("data", [b"", None, b"\x30" * 1025, b"\x01" * 4096], ids=["empty", "none", "1025", "4096"])
+def test_store_device_key_size_limits(module_service, store, data):
+    module_service.hello("a7eb274c")
+    puts = store.puts
+    with pytest.raises(ValueError, match="must be 1..1024 bytes"):
+        module_service.store_device_key("a7eb274c", data, _pub(_p256()))
+    assert store.puts == puts
+
+
+@pytest.mark.parametrize("data", [b"not a key", b"\x00" * 32, b"\xff" * 32, b"\x01" * 31],
+                         ids=["text", "zero-scalar", "scalar>=n", "31-bytes"])
+def test_store_device_key_rejects_unusable_keys(module_service, store, data):
+    module_service.hello("a7eb274c")
+    puts = store.puts
+    with pytest.raises(ValueError):
+        module_service.store_device_key("a7eb274c", data, _pub(_p256()))
+    assert store.puts == puts
+
+
+def test_store_device_key_rejects_a_p384_key(module_service, store):
+    module_service.hello("a7eb274c")
+    key = ec.generate_private_key(ec.SECP384R1())
+    with pytest.raises(ValueError, match="not an ECDSA P-256 key"):
+        module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    assert store.get("a7eb274c")["device_private_pem"] == ""
+
+
+def test_store_device_key_unknown_module(module_service):
+    key = _p256()
+    with pytest.raises(KeyError):
+        module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+
+
+def test_store_device_key_reports_zero_otp_words(module_service):
+    module_service.hello("a7eb274c")
+    raw = bytearray(range(1, 33))
+    raw[8:12] = b"\0\0\0\0"  # one 32-bit OTP row left blank
+    d = int.from_bytes(raw, "big")
+    key = ec.derive_private_key(d, ec.SECP256R1())
+    rec, info = module_service.store_device_key("a7eb274c", bytes(raw), _pub(key))
+    assert info["zero_words"] == 1 and info["already"] is False
+    ev = rec["events"][-1]
+    assert ev["kind"] == "device_key_export"
+    assert "WARNING: 1 of its 8 OTP words are zero" in ev["note"]
+    assert raw.hex() not in json.dumps(rec["events"])
+    # the key is stored anyway (it is the board's key, weak or not)
+    assert _scalar(rec["device_private_pem"]) == d
+    _again, info2 = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    assert info2 == {**info, "already": True}
+
+
+def test_device_private_key_never_in_public_view(module_service):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    rec, _ = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    view = module_service.public_view(rec)
+    text = json.dumps(view)
+    assert "PRIVATE KEY" not in text and "device_private_pem" not in text
+    for line in rec["device_private_pem"].splitlines()[1:-1]:
+        assert line not in text
+    assert format(key.private_numbers().private_value, "064x") not in text
+    assert view["otp"]["device_key_exported"] is True and view["otp"]["device_key"] is True
+    assert view["otp"]["device_key_fingerprint"] == public_key_fingerprint(_pub(key))
+
+
+def test_add_facts_refuses_a_device_key_other_than_the_exported_one(module_service, store):
+    module_service.hello("a7eb274c")
+    key = _p256()
+    stored, _ = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    puts = store.puts
+    with pytest.raises(ValueError, match="differs from the exported one"):
+        module_service.add_facts("a7eb274c", {"device_key_pem": _pub(_p256()), "duid": "10000000a7eb274c"})
+    assert store.puts == puts and store.get("a7eb274c") == stored  # nothing of the request applied
+    # the same key (other line endings) is accepted and does not add a device_key event
+    rec = module_service.add_facts("a7eb274c", {"device_key_pem": _pub(key).replace("\n", "\r\n")})
+    assert rec["device_key_pem"] == _pub(key)
+    assert [e["kind"] for e in rec["events"]].count("device_key") == 0
+
+
+def test_stage3_secure_needs_the_exported_device_key(module_service):
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "secure")
+    module_service.record_result("a7eb274c", 2, {"ok": True, "files_served": [{"name": "boot.img"}]})
+    key = _p256()
+    ok_run = {"ok": True, "error": None, "details": {"flashed": ["boot.vfat.sparse"], "device_key_pem": _pub(key)}}
+    rec, v = module_service.record_result("a7eb274c", 3, ok_run)
+    assert v["ok"] is False
+    assert "the OTP device key was not exported to the server (secure mode needs it)" in v["notes"]
+    assert rec["stage"] == "gadget" and rec["facts"]["stage3"]["ok"] is False
+    assert rec["events"][-1]["note"].startswith("failed: the OTP device key was not exported")
+    assert rec["device_key_pem"] == _pub(key)  # the reported key is still kept
+
+    module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    rec, v = module_service.record_result("a7eb274c", 3, ok_run)
+    assert v == {"ok": True, "notes": []} and rec["stage"] == "flashed"
+    assert rec["events"][-1] == {**rec["events"][-1], "kind": "stage3", "note": "ok"}
+
+
+def test_stage3_secure_by_default_mode_needs_the_key(svc_secure):
+    svc_secure.hello("a7eb274c")
+    _, v = svc_secure.record_result("a7eb274c", 3, {"ok": True, "details": {}})
+    assert v["ok"] is False and any("not exported" in n for n in v["notes"])
+
+
+def test_stage3_open_needs_no_device_key(module_service):
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "open")
+    rec, v = module_service.record_result("a7eb274c", 3, {"ok": True, "details": {}})
+    assert v == {"ok": True, "notes": []} and rec["stage"] == "flashed"
+
+
+def test_stage3_fails_when_the_reported_key_differs_from_the_exported_one(module_service):
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "secure")
+    key = _p256()
+    module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    rec, v = module_service.record_result("a7eb274c", 3, {
+        "ok": True, "details": {"flashed": ["boot.vfat.sparse"], "device_key_pem": _pub(_p256())}})
+    assert v["ok"] is False and "the board reports a device key that differs from the exported one" in v["notes"]
+    assert rec["stage"] == "new" and rec["device_key_pem"] == _pub(key)  # the recorded key is not replaced
+    # with the matching key (CRLF from the page) the run counts
+    rec, v = module_service.record_result("a7eb274c", 3, {
+        "ok": True, "details": {"device_key_pem": _pub(key).replace("\n", "\r\n")}})
+    assert v["ok"] is True and rec["stage"] == "flashed" and rec["device_key_pem"] == _pub(key)
+
+
+def test_secrets_for_returns_the_exported_device_key(module_service):
+    module_service.hello("a7eb274c")
+    assert module_service.secrets_for("a7eb274c")["device_private_pem"] == ""
+    key = _p256()
+    rec, _ = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    s = module_service.secrets_for("10000000a7eb274c")
+    assert s["device_private_pem"] == rec["device_private_pem"]
+    assert _scalar(s["device_private_pem"]) == key.private_numbers().private_value
+    assert set(s) == {"rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret", "device_private_pem"}

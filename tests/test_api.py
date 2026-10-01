@@ -1,50 +1,88 @@
 """HTTP API tests (SPEC section 8) with fastapi's TestClient and httpx.ASGITransport.
 
-The module registry is real (ModuleService + LocalJsonStore in tmp_path); Docker and the artifacts
-facade are fakes, except in the integration tests at the end, which use the real ``Artifacts`` with a
-fake Docker runner.
+The module registry is real (ModuleService on the in-memory store of ``tests/memstore.py``); Docker,
+the artifacts facade and the Google account are fakes, except in the integration tests, which use the
+real ``Artifacts`` with a fake Docker runner, or the real ``GoogleAccount`` without network access.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from memstore import MemoryStore
 
 from otp_server import __version__
 from otp_server.app import create_app
 from otp_server.artifacts.common import NotReady
+from otp_server.artifacts.image import KEY_EXPORT
 from otp_server.jobs import JobManager
 from otp_server.modules import ModuleService
+from otp_server.secrets_gen import public_key_fingerprint
 from otp_server.storage.base import StoreError
-from otp_server.storage.local import LocalJsonStore
 
 SERIAL = "a7eb274c"
 #: The page is served on loopback; any other Host is refused (DNS rebinding guard).
 BASE = "http://127.0.0.1:8765"
-MODULE_KEYS = {"serial", "stage", "stage_label", "created", "updated", "chip", "board", "duid", "mac", "factory_uuid",
-               "boardrev", "secrets", "otp", "metadata", "facts", "events"}
+MODULE_KEYS = {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_locked", "created", "updated", "chip",
+               "board", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata", "facts", "events"}
+OTP_KEYS = {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_provisioned", "device_key",
+            "device_key_fingerprint", "device_key_exported"}
 JOB_KEYS = {"id", "target", "title", "status", "started", "finished", "rc", "error", "lines"}
+STATUS_KEYS = {"version", "google", "google_ready", "settings", "config", "storage", "docker", "usb_driver",
+               "artifacts", "jobs"}
+SIGN_IN_FIRST = "sign in to Google first"
 
 
-def _device_key_pem() -> str:
-    """A throw-away P-256 public key standing in for the board's OTP device key."""
+def _p256(fmt: str = "sec1"):
+    """A throw-away P-256 key standing in for the board's OTP device key: ``(exported bytes, public PEM,
+    private PEM)``. ``fmt``: ``sec1`` / ``pkcs8`` DER (what rpi-fw-crypto writes) or ``raw`` (32-byte d)."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
     key = ec.generate_private_key(ec.SECP256R1())
-    return key.public_key().public_bytes(serialization.Encoding.PEM,
-                                         serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    if fmt == "raw":
+        exported = key.private_numbers().private_value.to_bytes(32, "big")
+    else:
+        pf = serialization.PrivateFormat.TraditionalOpenSSL if fmt == "sec1" else serialization.PrivateFormat.PKCS8
+        exported = key.private_bytes(serialization.Encoding.DER, pf, serialization.NoEncryption())
+    pub = key.public_key().public_bytes(serialization.Encoding.PEM,
+                                        serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode()
+    return exported, pub, priv
 
 
-PUBLIC_PEM = _device_key_pem()
+PUBLIC_PEM = _p256()[1]
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _wait_for(cond, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return bool(cond())
+
+
+def _google_error(location: str) -> str:
+    """The ``google_error`` text of a ``/?google_error=...`` redirect."""
+    parts = urlsplit(location)
+    assert parts.path == "/", location
+    return parse_qs(parts.query)["google_error"][0]
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -96,9 +134,11 @@ class FakeDocker:
 
 
 class FakeArtifacts:
-    """Minimal Artifacts facade: two stages with real files on disk, configurable NotReady."""
+    """Minimal Artifacts facade: stages 1 and 3 with real files on disk, configurable NotReady. Like the
+    real facade it plans stage 3 in the board's scenario (``ModuleService.mode_of``)."""
 
-    TITLES = {"tools": "Build otp-tools image", "gadget": "Build fastboot gadget", "image": "Build droneos image"}
+    TITLES = {"tools": "Build otp-tools image", "gadget": "Build fastboot gadget",
+              "image": "Build droneos images (clear + crypt)"}
 
     def __init__(self, root: Path, jobs: JobManager, modules: ModuleService):
         self.jobs = jobs
@@ -120,11 +160,17 @@ class FakeArtifacts:
         # A file that exists next to the stage files but is NOT in any manifest.
         (root / "stage1" / "secret.pem").write_text("not for download")
 
+    def _status(self, t: str) -> dict:
+        job = self.jobs.current(t)
+        st = {"target": t, "ready": t == "tools", "source": "built" if t == "tools" else None, "version": "v",
+              "path": "", "size": None, "built": None, "detail": "", "job": job.to_dict() if job else None}
+        if t == "image":
+            st["variants"] = {v: {"ready": False, "set": "", "version": "", "path": "", "size": None, "built": None,
+                                  "detail": f"the {v} image is not built yet"} for v in ("clear", "crypt")}
+        return st
+
     def status(self) -> dict:
-        return {t: {"target": t, "ready": t == "tools", "source": "built" if t == "tools" else None, "version": "v",
-                    "path": "", "size": None, "built": None, "detail": "",
-                    "job": (self.jobs.current(t).to_dict() if self.jobs.current(t) else None)}
-                for t in ("tools", "gadget", "image")}
+        return {t: self._status(t) for t in ("tools", "gadget", "image")}
 
     def start_build(self, target: str, force: bool = False):
         if target not in self.TITLES:
@@ -153,8 +199,14 @@ class FakeArtifacts:
             data = self.files[(stage, n)].read_bytes()
             files.append({"name": n, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                           "url": f"{base_url}/api/modules/{s}/stage/{stage}/files/{n}"})
-        return {"stage": stage, "kind": "rpiboot" if stage < 3 else "fastboot-idp", "ready": True, "mode": "unsigned",
-                "files": files}
+        man = {"stage": stage, "kind": "rpiboot" if stage < 3 else "fastboot-idp", "ready": True, "mode": "unsigned",
+               "files": files}
+        if stage == 3:
+            secure = self.modules.mode_of(rec) == "secure"
+            man.update(scenario="secure" if secure else "open", fwcrypto_init=secure,
+                       image={"variant": "crypt" if secure else "clear"},
+                       key_export=dict(KEY_EXPORT) if secure else None)
+        return man
 
     def stage_file(self, serial: str, stage: int, name: str) -> Path:
         self.stage_manifest(serial, stage)
@@ -180,26 +232,119 @@ class BrokenStore:
         return {"backend": "gsheets", "ok": False, "location": "sheet", "detail": "not shared"}
 
 
+class FakeAccount:
+    """Stands in for :class:`otp_server.google_account.GoogleAccount` (no OAuth, no network)."""
+
+    LOGIN_URL = "https://accounts.google.com/o/oauth2/auth?client_id=station&state=s1"
+
+    def __init__(self, *, signed_in: bool = False, client: bool = True,
+                 sheet_error: str = "not signed in to Google: open the page and sign in"):
+        self.signed_in = signed_in
+        self.client = client
+        self.sheet_error = sheet_error
+        self.client_file = Path("repo") / "google-oauth-client.json"
+        self.last_error = ""
+        self.begin_calls: list[str] = []
+        self.begin_error: Exception | None = None
+        self.finish_calls: list[tuple[str, str]] = []
+        self.finish_error: str | None = None
+        self.logout_calls = 0
+
+    def client_configured(self) -> bool:
+        return self.client
+
+    def has_token(self) -> bool:
+        return self.signed_in
+
+    def status(self) -> dict:
+        return {"client": self.client, "client_file": str(self.client_file), "signed_in": self.signed_in,
+                "spreadsheet_id": "", "spreadsheet_url": "", "error": self.last_error}
+
+    def spreadsheet(self):
+        raise StoreError(self.sheet_error)
+
+    def spreadsheet_url(self) -> str:
+        return ""
+
+    def explain(self, exc: BaseException) -> str:
+        self.last_error = str(exc)
+        return self.last_error
+
+    def begin_login(self, redirect_uri: str) -> str:
+        self.begin_calls.append(redirect_uri)
+        if self.begin_error is not None:
+            raise self.begin_error
+        return self.LOGIN_URL
+
+    def finish_login(self, state: str, code: str) -> None:
+        self.finish_calls.append((state, code))
+        if self.finish_error:
+            raise StoreError(self.finish_error)
+        self.signed_in = True
+
+    def logout(self) -> None:
+        self.logout_calls += 1
+        self.signed_in = False
+
+
+class FakeSettings:
+    """The ``settings`` worksheet: ``read()`` returns ``{key: cell text}`` or raises ``StoreError``."""
+
+    def __init__(self, rows: dict | None = None, error: str | None = None):
+        self.rows = dict(rows or {})
+        self.error = error
+        self.error_type = StoreError
+        self.reads = 0
+
+    def read(self) -> dict:
+        self.reads += 1
+        if self.error:
+            raise self.error_type(self.error)
+        return dict(self.rows)
+
+
 # ----------------------------------------------------------------------------------------------------
 # fixtures
 # ----------------------------------------------------------------------------------------------------
 
 
+class Env:
+    pass
+
+
 @pytest.fixture
 def env(make_cfg, tmp_path):
+    """No Google account wired (an injected store): nothing is gated."""
     cfg = make_cfg(tmp_path)
-    store = LocalJsonStore(cfg.storage.local_dir)
+    store = MemoryStore()
     modules = ModuleService(cfg, store)
     jobs = JobManager(cfg.work_dir)
     arts = FakeArtifacts(tmp_path / "fake-artifacts", jobs, modules)
     docker = FakeDocker()
     app = create_app(cfg, store=store, docker=docker, jobs=jobs, modules=modules, artifacts=arts, auto_build=False)
-
-    class Env:
-        pass
-
     e = Env()
     e.cfg, e.store, e.modules, e.jobs, e.artifacts, e.docker, e.app = cfg, store, modules, jobs, arts, docker, app
+    e.svc = app.state.services
+    e.client = TestClient(app, base_url=BASE)
+    return e
+
+
+@pytest.fixture
+def genv(make_cfg, tmp_path):
+    """A Google account (fake, not signed in) and a fake settings sheet that is re-read on every request."""
+    cfg = make_cfg(tmp_path)
+    store = MemoryStore()
+    modules = ModuleService(cfg, store)
+    jobs = JobManager(cfg.work_dir)
+    arts = FakeArtifacts(tmp_path / "fake-artifacts", jobs, modules)
+    account = FakeAccount()
+    app = create_app(cfg, store=store, docker=FakeDocker(), jobs=jobs, modules=modules, artifacts=arts,
+                     account=account, auto_build=False)
+    e = Env()
+    e.cfg, e.store, e.modules, e.jobs, e.artifacts, e.account, e.app = cfg, store, modules, jobs, arts, account, app
+    e.svc = app.state.services
+    e.sheet = e.svc.settings = FakeSettings()
+    e.svc.SETTINGS_TTL = 0
     e.client = TestClient(app, base_url=BASE)
     return e
 
@@ -230,17 +375,37 @@ def test_status_shape(env, monkeypatch):
     assert r.status_code == 200
     assert r.headers["cache-control"] == "no-store"
     s = r.json()
-    assert set(s) == {"version", "config", "storage", "docker", "usb_driver", "artifacts", "jobs"}
+    assert set(s) == STATUS_KEYS
     assert s["version"] == __version__
-    assert s["config"]["provisioning"]["confirm_irreversible"] is True
-    assert s["storage"]["backend"] == "local" and s["storage"]["ok"] is True
-    assert set(s["storage"]) >= {"backend", "ok", "location", "detail"}
+    # no Google account wired (injected store): nothing to sign in to, nothing gated
+    assert s["google"] is None and s["google_ready"] is True
+    assert s["settings"] == {"ok": True, "error": "", "unknown": [], "worksheet": "settings"}
+    conf = s["config"]
+    assert "storage" not in conf and "config_path" not in conf
+    assert isinstance(conf["settings"], str) and "settings" in conf["settings"]
+    assert conf["server"]["browser"] is None
+    prov = conf["provisioning"]
+    assert prov["confirm_irreversible"] is True and prov["recovery_passphrase"] is False
+    assert prov["default_mode"] == "open" and prov["modes"] == ["open", "secure"]
+    assert "secure_boot" not in prov and "mode" not in prov
+    assert "source" not in conf["builds"]["gadget"] and conf["builds"]["image"]["overrides"] == []
+    assert s["storage"] == {"backend": "memory", "ok": True, "location": "memory", "detail": "0 module record(s)"}
     assert s["docker"] == {"ok": True, "version": "29.6.0", "detail": "", "arm64": True}
     assert s["usb_driver"] == {"platform": "windows", "rpiboot": True, "fastboot": False, "detail": "x"}
     assert set(s["artifacts"]) == {"tools", "gadget", "image"}
+    assert set(s["artifacts"]["image"]["variants"]) == {"clear", "crypt"}
     assert s["jobs"] == []
-    text = r.text
-    assert "PRIVATE KEY" not in text
+    assert "PRIVATE KEY" not in r.text
+
+
+def test_status_never_contains_secrets(env):
+    hello(env.client)
+    der, pub, priv = _p256()
+    assert env.client.post(f"/api/modules/{SERIAL}/device-key",
+                           json={"key_der_b64": _b64(der), "device_key_pem": pub}).status_code == 200
+    text = env.client.get("/api/status").text
+    assert "PRIVATE KEY" not in text and _b64(der) not in text
+    assert env.store.get(SERIAL)["rsa_private_pem"].split("\n")[1] not in text
 
 
 def test_status_usb_driver_null_off_windows(env, monkeypatch):
@@ -271,22 +436,40 @@ def test_status_jobs_running_or_last_per_target(env):
     wait_job(env.jobs.get(second["id"]))
 
 
-def test_status_docker_down_and_store_error(make_cfg, tmp_path):
-    cfg = make_cfg(tmp_path, storage={"backend": "gsheets"})  # no spreadsheet configured
-    jobs = JobManager(cfg.work_dir)
-    app = create_app(cfg, docker=FakeDocker(ok=False), jobs=jobs, auto_build=False)
+def test_status_docker_down_and_google_unreachable(make_cfg, tmp_path):
+    """The real Google wiring (GoogleSheetsStore + settings sheet) over an account whose spreadsheet cannot
+    be opened: /api/status still answers; the gate stays closed while the settings cannot be read, and
+    once they can, an unreachable registry worksheet is a 503."""
+    cfg = make_cfg(tmp_path)
+    account = FakeAccount(signed_in=True,
+                          sheet_error="Google unreachable (ConnectionError: refused); check the network -- retrying")
+    app = create_app(cfg, docker=FakeDocker(ok=False), jobs=JobManager(cfg.work_dir), account=account,
+                     auto_build=False)
+    svc = app.state.services
+    assert svc.account is account and svc.store.backend == "gsheets" and svc.settings is not None
     c = TestClient(app, base_url=BASE)
-    s = c.get("/api/status").json()
+    r = c.get("/api/status")
+    assert r.status_code == 200
+    s = r.json()
     assert s["docker"]["ok"] is False and "Docker daemon" in s["docker"]["detail"]
     assert s["storage"]["ok"] is False and s["storage"]["backend"] == "gsheets"
-    assert s["storage"]["detail"]
-    # module endpoints report the store problem as 503
-    for method, url, body in (("GET", "/api/modules", None), ("POST", "/api/modules/hello", {"serial": SERIAL}),
-                              ("GET", f"/api/modules/{SERIAL}", None),
-                              ("POST", "/api/fastboot/identify", {"serialno": "100000005e21c09a"})):
+    assert "Google unreachable" in s["storage"]["detail"]
+    assert s["google_ready"] is False and s["google"]["signed_in"] is True
+    assert s["settings"]["ok"] is False and "Google unreachable" in s["settings"]["error"]
+    endpoints = (("GET", "/api/modules", None), ("POST", "/api/modules/hello", {"serial": SERIAL}),
+                 ("GET", f"/api/modules/{SERIAL}", None),
+                 ("POST", "/api/fastboot/identify", {"serialno": "100000005e21c09a"}))
+    for method, url, body in endpoints:
+        r = c.request(method, url, json=body)
+        assert r.status_code == 401, (url, r.text)
+        assert "Google unreachable" in r.json()["detail"]
+    # the settings sheet becomes readable, the registry worksheet still is not: the store problem is a 503
+    svc.settings = FakeSettings({})
+    assert svc.refresh_settings(force=True) is True
+    for method, url, body in endpoints:
         r = c.request(method, url, json=body)
         assert r.status_code == 503, (url, r.text)
-        assert "store" in r.json()["detail"]
+        assert "store" in r.json()["detail"] and "Google unreachable" in r.json()["detail"]
 
 
 def test_store_error_at_runtime_is_503(make_cfg, tmp_path):
@@ -314,11 +497,12 @@ def test_hello_new_then_existing(env):
     m = body["module"]
     assert set(m) == MODULE_KEYS
     assert m["serial"] == SERIAL and m["stage"] == "new" and m["stage_label"] == "New"
+    assert m["mode"] == "open" and m["mode_chosen"] == "" and m["mode_locked"] is False
     assert m["chip"] == "BCM2712" and m["board"] == "Pi 5 / CM5 / Pi 500"
     assert m["secrets"]["rsa_key"] is True and m["secrets"]["device_secret"] is True
     assert len(m["secrets"]["customer_key_hash"]) == 64
-    assert set(m["otp"]) == {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_provisioned",
-                             "device_key", "device_key_fingerprint"}
+    assert set(m["otp"]) == OTP_KEYS
+    assert m["otp"]["device_key_exported"] is False
     assert "PRIVATE" not in r.text and "device_secret\":\"" not in r.text
     hash1 = m["secrets"]["customer_key_hash"]
 
@@ -327,6 +511,15 @@ def test_hello_new_then_existing(env):
     assert r2.json()["module"]["secrets"]["customer_key_hash"] == hash1
     # the secrets are really stored (server side only)
     assert "BEGIN PRIVATE KEY" in env.store.get(SERIAL)["rsa_private_pem"]
+
+
+def test_hello_default_mode_comes_from_config(make_cfg, tmp_path):
+    cfg = make_cfg(tmp_path, provisioning={"default_mode": "secure"})
+    store = MemoryStore()
+    c = TestClient(create_app(cfg, store=store, docker=FakeDocker(), jobs=JobManager(cfg.work_dir),
+                              artifacts=None, auto_build=False), base_url=BASE)
+    m = hello(c).json()["module"]
+    assert m["mode"] == "secure" and m["mode_chosen"] == "" and m["mode_locked"] is False
 
 
 @pytest.mark.parametrize("serial", ["Broadcom", "", "xyz12345", "a7eb27", 12345678, None])
@@ -368,7 +561,7 @@ def test_facts(env):
     m = r.json()["module"]
     assert set(r.json()) == {"module"}
     assert m["duid"] == "10000000a7eb274c"
-    assert m["otp"]["device_key"] is True
+    assert m["otp"]["device_key"] is True and m["otp"]["device_key_exported"] is False
     assert m["facts"]["fastboot"] == {"product": "rpi5"}
     assert any(e["kind"] == "note" and e["note"] == "hi" for e in m["events"])
     assert env.client.post(f"/api/modules/{SERIAL}/facts", json={"device_key_pem": "nope"}).status_code == 400
@@ -418,13 +611,183 @@ def test_stage_results(env):
                                           "device_key_pem": PUBLIC_PEM}})
     assert r.status_code == 200
     m = r.json()["module"]
-    assert m["stage"] == "flashed" and m["otp"]["device_key"] is True
+    # open scenario (the default): no exported device key needed
+    assert m["mode"] == "open" and m["stage"] == "flashed" and m["otp"]["device_key"] is True
     assert "x" * 64 not in r.text  # passphrases are never echoed back or stored
     assert [e["kind"] for e in m["events"]][-3:] == ["stage2", "stage2", "stage3"]
 
     assert env.client.post(f"/api/modules/{SERIAL}/stage/4/result", json={"ok": True}).status_code == 404
     assert env.client.post("/api/modules/deadbeef/stage/1/result", json={"ok": True}).status_code == 404
     assert env.client.post(f"/api/modules/{SERIAL}/stage/1/result", json="x").status_code == 400
+
+
+# ----------------------------------------------------------------------------------------------------
+# per-board scenario (POST /api/modules/{serial}/mode)
+# ----------------------------------------------------------------------------------------------------
+
+
+def test_mode_choose_and_switch(env):
+    hello(env.client)
+    r = env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "secure"})
+    assert r.status_code == 200, r.text
+    assert set(r.json()) == {"module"}
+    m = r.json()["module"]
+    assert set(m) == MODULE_KEYS
+    assert m["mode"] == "secure" and m["mode_chosen"] == "secure" and m["mode_locked"] is False
+    assert m["events"][-1]["kind"] == "mode" and "secure" in m["events"][-1]["note"]
+    assert env.store.get(SERIAL)["mode"] == "secure"
+    n_events = len(m["events"])
+    # choosing the same scenario again changes nothing
+    m = env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "SECURE"}).json()["module"]
+    assert m["mode"] == "secure" and len(m["events"]) == n_events
+    # a board that went through a stage in one scenario starts over when switched to the other
+    env.client.post(f"/api/modules/{SERIAL}/stage/2/result", json={"ok": True, "files_served": [{"name": "boot.img"}]})
+    assert env.client.get(f"/api/modules/{SERIAL}").json()["stage"] == "gadget"
+    r = env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "open"})
+    assert r.status_code == 200, r.text
+    m = r.json()["module"]
+    assert m["mode"] == "open" and m["mode_chosen"] == "open" and m["stage"] == "new"
+    assert m["events"][-1]["kind"] == "mode" and "reset to new" in m["events"][-1]["note"]
+
+
+def test_mode_errors(env):
+    hello(env.client)
+    for body in ({"mode": "bogus"}, {"mode": ""}, {}, {"mode": 1}):
+        r = env.client.post(f"/api/modules/{SERIAL}/mode", json=body)
+        assert r.status_code == 400, (body, r.text)
+        assert "mode must be one of open, secure" in r.json()["detail"]
+    assert env.client.post(f"/api/modules/{SERIAL}/mode", json=["secure"]).status_code == 400
+    r = env.client.post("/api/modules/deadbeef/mode", json={"mode": "secure"})
+    assert r.status_code == 404 and "unknown module" in r.json()["detail"]
+    assert env.client.post("/api/modules/Broadcom/mode", json={"mode": "secure"}).status_code == 404
+    assert env.client.get(f"/api/modules/{SERIAL}").json()["mode_chosen"] == ""
+
+
+def test_mode_open_refused_on_a_locked_board(env):
+    hello(env.client)
+    r = env.client.post(f"/api/modules/{SERIAL}/otp", json={"action": "mark-locked"})
+    assert r.status_code == 200
+    m = r.json()["module"]
+    # the OTP holds a key hash: secure is the only scenario, whatever was chosen
+    assert m["mode"] == "secure" and m["mode_locked"] is True and m["mode_chosen"] == ""
+    r = env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "open"})
+    assert r.status_code == 400 and "only the secure scenario is possible" in r.json()["detail"]
+    assert env.store.get(SERIAL)["mode"] == ""
+    r = env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "secure"})
+    assert r.status_code == 200 and r.json()["module"]["mode_chosen"] == "secure"
+
+
+def test_stage3_manifest_follows_the_board_scenario(env):
+    hello(env.client)
+    m = env.client.get(f"/api/modules/{SERIAL}/stage/3").json()
+    assert m["scenario"] == "open" and m["key_export"] is None and m["fwcrypto_init"] is False
+    assert m["image"]["variant"] == "clear"
+    env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "secure"})
+    m = env.client.get(f"/api/modules/{SERIAL}/stage/3").json()
+    assert m["scenario"] == "secure" and m["fwcrypto_init"] is True and m["image"]["variant"] == "crypt"
+    assert m["key_export"] == KEY_EXPORT and set(m["key_export"]) == {"dir", "key", "status", "request"}
+
+
+# ----------------------------------------------------------------------------------------------------
+# OTP device key export (POST /api/modules/{serial}/device-key)
+# ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["sec1", "pkcs8", "raw"])
+def test_device_key_export_ok(env, fmt):
+    hello(env.client)
+    der, pub, priv = _p256(fmt)
+    r = env.client.post(f"/api/modules/{SERIAL}/device-key", json={"key_der_b64": _b64(der), "device_key_pem": pub})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"module", "device_key"}
+    fp = public_key_fingerprint(pub)
+    assert body["device_key"] == {"fingerprint": fp, "already": False, "zero_words": 0}
+    m = body["module"]
+    assert set(m) == MODULE_KEYS
+    assert m["otp"]["device_key_exported"] is True and m["otp"]["device_key"] is True
+    assert m["otp"]["device_key_fingerprint"] == fp
+    assert m["events"][-1]["kind"] == "device_key_export" and fp[:16] in m["events"][-1]["note"]
+    # the private key never comes back out, in any representation
+    for text in (r.text, env.client.get(f"/api/modules/{SERIAL}").text, env.client.get("/api/modules").text):
+        assert "PRIVATE" not in text and "device_private_pem" not in text
+        assert _b64(der) not in text and priv.split("\n")[1] not in text
+    # ... but it is kept server side (PKCS#8), next to the public key
+    rec = env.store.get(SERIAL)
+    assert rec["device_private_pem"] == priv and rec["device_key_pem"] == pub
+    # a second export of the same key changes nothing
+    puts = env.store.puts
+    r = env.client.post(f"/api/modules/{SERIAL}/device-key", json={"key_der_b64": _b64(der), "device_key_pem": pub})
+    assert r.status_code == 200 and r.json()["device_key"]["already"] is True
+    assert env.store.puts == puts
+
+
+def test_device_key_export_errors(env):
+    hello(env.client)
+    der, pub, _ = _p256()
+    _der2, pub2, _ = _p256()
+    url = f"/api/modules/{SERIAL}/device-key"
+    cases = [
+        ({"key_der_b64": "not base64!", "device_key_pem": pub}, "not valid base64"),
+        ({"key_der_b64": "QQ", "device_key_pem": pub}, "not valid base64"),                    # padding missing
+        ({"key_der_b64": "", "device_key_pem": pub}, "non-empty base64"),
+        ({"device_key_pem": pub}, "non-empty base64"),
+        ({"key_der_b64": 1234, "device_key_pem": pub}, "non-empty base64"),
+        ({"key_der_b64": _b64(der)}, "device_key_pem"),                                      # pem missing
+        ({"key_der_b64": _b64(der), "device_key_pem": "nope"}, "device_key_pem"),
+        ({"key_der_b64": _b64(der), "device_key_pem": pub2}, "does not match"),               # someone else's key
+        ({"key_der_b64": _b64(b"\x30\x03\x02\x01\x01"), "device_key_pem": pub}, "not a DER private key"),
+        ({"key_der_b64": _b64(b"\x00" * 32), "device_key_pem": pub}, "not a valid P-256"),
+        ({"key_der_b64": _b64(b"\x01" * 2048), "device_key_pem": pub}, "1..1024 bytes"),
+    ]
+    for body, why in cases:
+        r = env.client.post(url, json=body)
+        assert r.status_code == 400, (body, r.text)
+        assert why in r.json()["detail"], (body, r.json())
+        assert "PRIVATE" not in r.text
+    assert env.client.post(url, json=[1]).status_code == 400
+    rec = env.store.get(SERIAL)
+    assert rec["device_private_pem"] == "" and rec["device_key_pem"] == ""
+    r = env.client.post("/api/modules/deadbeef/device-key", json={"key_der_b64": _b64(der), "device_key_pem": pub})
+    assert r.status_code == 404 and "unknown module" in r.json()["detail"]
+
+
+def test_device_key_export_must_match_the_recorded_key(env):
+    """An OTP key cannot change: a key that differs from the one the board reported or exported is refused."""
+    hello(env.client)
+    der, pub, _ = _p256()
+    der2, pub2, _ = _p256()
+    # the board reported its public key earlier (facts): another key does not match it
+    assert env.client.post(f"/api/modules/{SERIAL}/facts", json={"device_key_pem": pub}).status_code == 200
+    r = env.client.post(f"/api/modules/{SERIAL}/device-key", json={"key_der_b64": _b64(der2), "device_key_pem": pub2})
+    assert r.status_code == 400 and "differs from the one recorded" in r.json()["detail"]
+    assert env.client.post(f"/api/modules/{SERIAL}/device-key",
+                           json={"key_der_b64": _b64(der), "device_key_pem": pub}).status_code == 200
+    # once exported, the board cannot report another public key
+    r = env.client.post(f"/api/modules/{SERIAL}/facts", json={"device_key_pem": pub2})
+    assert r.status_code == 400 and "differs from the exported one" in r.json()["detail"]
+    assert env.store.get(SERIAL)["device_key_pem"] == pub
+
+
+def test_secure_stage3_needs_the_exported_device_key(env):
+    hello(env.client)
+    env.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "secure"})
+    der, pub, _ = _p256()
+    _der2, pub2, _ = _p256()
+    url = f"/api/modules/{SERIAL}/stage/3/result"
+    r = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub}})
+    out = r.json()
+    assert out["verdict"]["ok"] is False and out["module"]["stage"] == "new"
+    assert any("device key was not exported" in n for n in out["verdict"]["notes"])
+    assert env.client.post(f"/api/modules/{SERIAL}/device-key",
+                           json={"key_der_b64": _b64(der), "device_key_pem": pub}).status_code == 200
+    # a board reporting another device key than the exported one is not flashed
+    out = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub2}}).json()
+    assert out["verdict"]["ok"] is False and out["module"]["stage"] == "new"
+    assert any("differs from the exported one" in n for n in out["verdict"]["notes"])
+    out = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub}}).json()
+    assert out["verdict"]["ok"] is True and out["module"]["stage"] == "flashed"
+    assert out["module"]["otp"]["device_key_exported"] is True
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -446,13 +809,13 @@ def test_stage_manifest_ok(env):
 
 def test_stage_manifest_not_ready_409(env):
     hello(env.client)
-    job = env.jobs.submit("image", "Build droneos image", lambda j: j.log("x"))
+    job = env.jobs.submit("image", "Build droneos images (clear + crypt)", lambda j: j.log("x"))
     wait_job(job)
-    env.artifacts.not_ready[3] = NotReady("the droneos image is being built", job)
+    env.artifacts.not_ready[3] = NotReady("the droneos image for the open scenario (clear) is not built yet", job)
     r = env.client.get(f"/api/modules/{SERIAL}/stage/3")
     assert r.status_code == 409
     body = r.json()
-    assert body["ready"] is False and body["reason"] == "the droneos image is being built"
+    assert body["ready"] is False and body["reason"] == "the droneos image for the open scenario (clear) is not built yet"
     assert set(body["job"]) == JOB_KEYS and body["job"]["id"] == job.id
     r2 = env.client.get(f"/api/modules/{SERIAL}/stage/2")  # NotReady without a job
     assert r2.status_code == 409 and r2.json() == {"ready": False, "reason": "no fastboot gadget yet", "job": None}
@@ -654,6 +1017,9 @@ def test_static_routes(env):
     assert r.content == (root / "js" / "app.js").read_bytes()
     r = env.client.get("/css/app.css")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/css")
+    # without a Google account there is no OAuth callback: the query is ignored
+    r = env.client.get("/?state=s1&code=c1", follow_redirects=False)
+    assert r.status_code == 200 and r.content == (root / "index.html").read_bytes()
 
 
 @pytest.mark.parametrize("url", [
@@ -666,9 +1032,14 @@ def test_static_nothing_else(env, url):
     assert r.status_code == 404, (url, r.status_code)
 
 
+# ----------------------------------------------------------------------------------------------------
+# auto build
+# ----------------------------------------------------------------------------------------------------
+
+
 def test_auto_build_runs_in_background(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path)
-    store = LocalJsonStore(cfg.storage.local_dir)
+    store = MemoryStore()
     modules = ModuleService(cfg, store)
     jobs = JobManager(cfg.work_dir)
     arts = FakeArtifacts(tmp_path / "fa", jobs, modules)
@@ -676,18 +1047,22 @@ def test_auto_build_runs_in_background(make_cfg, tmp_path):
                      auto_build=True)
     with TestClient(app, base_url=BASE) as c:
         assert c.get("/api/status").status_code == 200
-        app.state.auto_build_thread.join(5)
+        app.state.startup_thread.join(5)
+        assert _wait_for(lambda: arts.auto_calls == 1)
+        app.state.services.start_auto_build()  # once per process
+    time.sleep(0.1)
     assert arts.auto_calls == 1
-    # auto_build=False and cfg.builds.auto False (test default): nothing happens
+    # auto_build=None and cfg.builds.auto False (test default): nothing happens
     arts2 = FakeArtifacts(tmp_path / "fb", jobs, modules)
-    with TestClient(create_app(cfg, store=store, modules=modules, docker=FakeDocker(), jobs=jobs, artifacts=arts2), base_url=BASE):
-        pass
-    assert arts2.auto_calls == 0
+    app2 = create_app(cfg, store=store, modules=modules, docker=FakeDocker(), jobs=jobs, artifacts=arts2)
+    with TestClient(app2, base_url=BASE):
+        app2.state.startup_thread.join(5)
+    assert arts2.auto_calls == 0 and app2.state.services.auto_build_done is False
 
 
 def test_auto_build_failure_does_not_crash(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path)
-    store = LocalJsonStore(cfg.storage.local_dir)
+    store = MemoryStore()
     modules = ModuleService(cfg, store)
 
     class Exploding(FakeArtifacts):
@@ -698,9 +1073,273 @@ def test_auto_build_failure_does_not_crash(make_cfg, tmp_path):
     app = create_app(cfg, store=store, modules=modules, docker=FakeDocker(ok=False), jobs=arts.jobs,
                      artifacts=arts, auto_build=True)
     with TestClient(app, base_url=BASE) as c:
-        app.state.auto_build_thread.join(5)
+        app.state.startup_thread.join(5)
+        assert _wait_for(lambda: app.state.services.auto_build_error == "docker not found")
         assert c.get("/api/status").status_code == 200
     assert app.state.services.auto_build_error == "docker not found"
+
+
+def test_auto_build_waits_for_the_google_login(make_cfg, tmp_path):
+    cfg = make_cfg(tmp_path)
+    store = MemoryStore()
+    modules = ModuleService(cfg, store)
+    jobs = JobManager(cfg.work_dir)
+    arts = FakeArtifacts(tmp_path / "fa", jobs, modules)
+    account = FakeAccount()
+    app = create_app(cfg, store=store, modules=modules, docker=FakeDocker(), jobs=jobs, artifacts=arts,
+                     account=account, auto_build=True)
+    app.state.services.settings = FakeSettings({"builds.auto": "false"})  # auto_build=True wins over the sheet
+    with TestClient(app, base_url=BASE) as c:
+        app.state.startup_thread.join(5)
+        assert arts.auto_calls == 0  # not signed in: nothing is built
+        r = c.get("/?state=s1&code=c1", follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/"
+        assert _wait_for(lambda: arts.auto_calls == 1)
+        assert c.get("/?state=s2&code=c2", follow_redirects=False).status_code == 303  # a second login
+    time.sleep(0.1)
+    assert arts.auto_calls == 1
+
+
+# ----------------------------------------------------------------------------------------------------
+# Google sign-in and the settings sheet
+# ----------------------------------------------------------------------------------------------------
+
+
+def _gated_requests():
+    der, pub, _ = _p256()
+    return [
+        ("GET", "/api/modules", None),
+        ("POST", "/api/modules/hello", {"serial": SERIAL}),
+        ("GET", f"/api/modules/{SERIAL}", None),
+        ("GET", f"/api/modules/{SERIAL}/stage/1", None),
+        ("GET", f"/api/modules/{SERIAL}/stage/3", None),
+        ("GET", f"/api/modules/{SERIAL}/stage/1/files/pieeprom.bin", None),
+        ("POST", f"/api/modules/{SERIAL}/stage/1/result", {"ok": True}),
+        ("POST", f"/api/modules/{SERIAL}/facts", {"duid": "10000000a7eb274c"}),
+        ("POST", f"/api/modules/{SERIAL}/mode", {"mode": "secure"}),
+        ("POST", f"/api/modules/{SERIAL}/device-key", {"key_der_b64": _b64(der), "device_key_pem": pub}),
+        ("POST", f"/api/modules/{SERIAL}/otp", {"action": "mark-locked"}),
+        ("POST", "/api/fastboot/identify", {"serialno": "10000000a7eb274c"}),
+        ("POST", "/api/builds/tools", {}),
+        ("POST", "/api/builds/image", {"force": True}),
+    ]
+
+
+def test_google_gate_closed_until_signed_in(genv):
+    problem = genv.svc.google_problem()
+    assert problem.startswith(SIGN_IN_FIRST)
+    for method, url, body in _gated_requests():
+        r = genv.client.request(method, url, json=body)
+        assert r.status_code == 401, (url, r.status_code, r.text)
+        assert r.json()["detail"] == problem
+    assert genv.store.puts == 0 and genv.jobs.list() == []  # nothing was written or started
+    # the status document still answers (the page needs it to offer the sign-in)
+    r = genv.client.get("/api/status")
+    assert r.status_code == 200
+    s = r.json()
+    assert set(s) == STATUS_KEYS
+    assert s["google_ready"] is False and s["google"] == genv.account.status()
+    assert s["google"]["signed_in"] is False and s["google"]["client"] is True
+    assert s["settings"]["ok"] is False
+    assert genv.sheet.reads == 0  # not signed in: the sheet is not even tried
+
+
+def test_google_gate_without_oauth_client(genv):
+    genv.account.client = False
+    r = genv.client.get("/api/modules")
+    assert r.status_code == 401
+    assert r.json()["detail"].startswith("no Google OAuth client") and "google-oauth-client.json" in r.json()["detail"]
+    assert genv.client.get("/api/status").json()["google"]["client"] is False
+
+
+def test_google_gate_opens_and_applies_the_sheet_settings(genv):
+    genv.account.signed_in = True
+    genv.sheet.rows = {"provisioning.erase_storage": "false", "provisioning.default_mode": "secure",
+                       "provisioning.bogus_switch": "1", "builds.image.overrides": "A=1\nB=2"}
+    s = genv.client.get("/api/status").json()
+    assert s["google_ready"] is True and s["google"]["signed_in"] is True
+    assert s["settings"] == {"ok": True, "error": "", "unknown": ["provisioning.bogus_switch"], "worksheet": "settings"}
+    assert s["config"]["provisioning"]["erase_storage"] is False
+    assert s["config"]["provisioning"]["default_mode"] == "secure"
+    assert s["config"]["builds"]["image"]["overrides"] == ["A=1", "B=2"]
+    assert genv.cfg.provisioning.erase_storage is False  # applied in place: every service sees it
+    assert genv.client.get("/api/modules").status_code == 200
+    m = hello(genv.client).json()["module"]
+    assert m["mode"] == "secure" and m["mode_chosen"] == ""  # the sheet's default scenario
+    assert genv.client.post(f"/api/modules/{SERIAL}/mode", json={"mode": "open"}).status_code == 200
+    r = genv.client.post("/api/builds/tools", json={})
+    assert r.status_code == 200
+    wait_job(genv.jobs.get(r.json()["job"]["id"]))
+    assert genv.client.get(f"/api/modules/{SERIAL}/stage/1").status_code == 200
+
+
+def test_settings_sheet_broken_value_keeps_the_previous_settings(genv):
+    genv.account.signed_in = True
+    genv.sheet.rows = {"provisioning.erase_storage": "false"}
+    assert genv.client.get("/api/status").json()["config"]["provisioning"]["erase_storage"] is False
+    genv.sheet.rows = {"provisioning.erase_storage": "true", "provisioning.default_mode": "maybe"}
+    s = genv.client.get("/api/status").json()
+    assert "invalid value in the settings sheet" in s["settings"]["error"]
+    assert "provisioning.default_mode" in s["settings"]["error"]
+    assert s["settings"]["ok"] is True and s["google_ready"] is True  # the last good settings stay in force
+    assert s["config"]["provisioning"]["erase_storage"] is False
+    assert s["config"]["provisioning"]["default_mode"] == "open"
+    assert genv.client.get("/api/modules").status_code == 200
+    # Google unreachable: the same
+    genv.sheet.error = "Google unreachable (ConnectionError: x); check the network -- retrying"
+    s = genv.client.get("/api/status").json()
+    assert s["settings"]["error"].startswith("Google unreachable") and s["google_ready"] is True
+    assert s["config"]["provisioning"]["erase_storage"] is False
+    # fixed in the sheet: taken over, the error is gone
+    genv.sheet.error = None
+    genv.sheet.rows = {"provisioning.erase_storage": "true"}
+    s = genv.client.get("/api/status").json()
+    assert s["settings"]["error"] == "" and s["config"]["provisioning"]["erase_storage"] is True
+
+
+def test_revoked_login_closes_the_gate(genv):
+    from otp_server.google_account import NotSignedIn
+
+    genv.account.signed_in = True   # the token file is still there ...
+    assert genv.client.get("/api/modules").status_code == 200
+    genv.sheet.error_type = NotSignedIn  # ... but Google rejects it (revoked / 7-day testing token expired)
+    genv.sheet.error = "Google rejected the saved login (invalid_grant); sign in again"
+    s = genv.client.get("/api/status").json()
+    assert s["google_ready"] is False
+    r = genv.client.get("/api/modules")
+    assert r.status_code == 401 and "sign in again" in r.json()["detail"]
+
+
+def test_settings_sheet_unreadable_at_first_keeps_the_gate_closed(genv):
+    genv.account.signed_in = True
+    genv.sheet.rows = {"provisioning.max_piece_size": "lots"}
+    r = genv.client.get("/api/modules")
+    assert r.status_code == 401
+    assert "invalid value in the settings sheet" in r.json()["detail"]
+    assert "provisioning.max_piece_size" in r.json()["detail"]
+    s = genv.client.get("/api/status").json()
+    assert s["google_ready"] is False and s["settings"]["ok"] is False
+    genv.sheet.rows = {}
+    genv.sheet.error = "worksheet 'settings': row 1 must be: key | value | description"
+    r = genv.client.post("/api/builds/tools", json={})
+    assert r.status_code == 401 and "row 1 must be" in r.json()["detail"]
+    genv.sheet.error = None
+    assert genv.client.post("/api/builds/tools", json={}).status_code == 200
+
+
+@pytest.mark.parametrize("base, host, want", [
+    (BASE, None, "http://127.0.0.1:8765/"),
+    ("http://localhost:8765", None, "http://localhost:8765/"),
+    ("http://LOCALHOST:8765", None, "http://localhost:8765/"),
+    (BASE, "[::1]:8765", "http://127.0.0.1:8765/"),
+    (BASE, "127.0.0.1:43117", "http://127.0.0.1:43117/"),   # the port the page was opened on
+    (BASE, "127.0.0.1", "http://127.0.0.1:8799/"),          # no port in Host: the configured one
+])
+def test_google_login_redirects_to_google(genv, base, host, want):
+    genv.cfg.server.port = 8799
+    c = TestClient(genv.app, base_url=base)
+    r = c.get("/api/google/login", headers={"host": host} if host else None, follow_redirects=False)
+    assert r.status_code == 303, r.text
+    assert r.headers["location"] == FakeAccount.LOGIN_URL
+    assert genv.account.begin_calls == [want]
+
+
+def test_google_login_error_redirects_to_the_page(genv):
+    genv.account.begin_error = StoreError("no OAuth client: save the client JSON as x.json")
+    r = genv.client.get("/api/google/login", follow_redirects=False)
+    assert r.status_code == 303
+    assert _google_error(r.headers["location"]) == "no OAuth client: save the client JSON as x.json"
+    genv.account.begin_error = RuntimeError("flow & broken?")
+    r = genv.client.get("/api/google/login", follow_redirects=False)
+    assert r.status_code == 303 and _google_error(r.headers["location"]) == "flow & broken?"
+
+
+def test_google_login_without_account_is_404(env):
+    assert env.client.get("/api/google/login", follow_redirects=False).status_code == 404
+
+
+def test_oauth_callback(genv):
+    genv.sheet.rows = {"provisioning.erase_storage": "false"}
+    assert genv.client.get("/api/modules").status_code == 401
+    r = genv.client.get("/?state=s1&code=4/abc", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/"
+    assert genv.account.finish_calls == [("s1", "4/abc")]
+    # signed in: the settings were read right away and the gate is open
+    assert genv.cfg.provisioning.erase_storage is False
+    assert genv.client.get("/api/modules").status_code == 200
+    assert genv.client.get("/api/status").json()["google_ready"] is True
+
+
+def test_oauth_callback_errors(genv):
+    genv.account.finish_error = "this Google login is unknown or has expired; start it again from the page"
+    r = genv.client.get("/?state=old&code=c", follow_redirects=False)
+    assert r.status_code == 303
+    assert _google_error(r.headers["location"]) == genv.account.finish_error
+    assert genv.client.get("/api/modules").status_code == 401
+    # the operator declined on Google's consent screen: nothing is exchanged
+    r = genv.client.get("/?state=s1&error=access_denied", follow_redirects=False)
+    assert r.status_code == 303
+    assert _google_error(r.headers["location"]) == "Google sign-in was not completed: access_denied"
+    assert genv.account.finish_calls == [("old", "c")]
+
+
+def test_index_without_oauth_query_is_the_page(genv):
+    page = (genv.cfg.web_dir / "index.html").read_bytes()
+    for url in ("/", "/?state=s1", "/?code=c1", "/?google_error=x"):
+        r = genv.client.get(url, follow_redirects=False)
+        assert r.status_code == 200 and r.content == page, url
+    assert genv.account.finish_calls == []
+
+
+def test_google_logout_closes_the_gate(genv):
+    genv.account.signed_in = True
+    assert genv.client.get("/api/modules").status_code == 200
+    # a foreign page cannot sign the station out
+    assert genv.client.post("/api/google/logout", headers={"origin": "http://attacker.example"}).status_code == 403
+    assert genv.account.logout_calls == 0
+    r = genv.client.post("/api/google/logout")
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert genv.account.logout_calls == 1
+    r = genv.client.get("/api/modules")
+    assert r.status_code == 401 and r.json()["detail"].startswith(SIGN_IN_FIRST)
+    s = genv.client.get("/api/status").json()
+    assert s["google_ready"] is False and s["google"]["signed_in"] is False
+    assert s["settings"]["ok"] is False and s["settings"]["error"] == "not signed in to Google"
+
+
+def test_real_google_account_wiring(make_cfg, tmp_path):
+    """Without an injected store the server wires the real GoogleAccount; nothing here touches the network."""
+    from otp_server.google_account import GoogleAccount
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = make_cfg(tmp_path, repo_root=repo)
+    app = create_app(cfg, docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False)
+    svc = app.state.services
+    assert isinstance(svc.account, GoogleAccount) and svc.store.backend == "gsheets"
+    c = TestClient(app, base_url=BASE)
+    s = c.get("/api/status").json()
+    assert s["google"]["client"] is False and s["google"]["signed_in"] is False and s["google_ready"] is False
+    assert s["google"]["client_file"] == str(repo / "google-oauth-client.json")
+    assert s["storage"]["ok"] is False and s["storage"]["backend"] == "gsheets"
+    r = c.get("/api/modules")
+    assert r.status_code == 401 and r.json()["detail"].startswith("no Google OAuth client")
+    r = c.get("/api/google/login", follow_redirects=False)
+    assert r.status_code == 303 and _google_error(r.headers["location"]).startswith("no OAuth client")
+
+    pytest.importorskip("google_auth_oauthlib")
+    (repo / "google-oauth-client.json").write_text(json.dumps({"installed": {
+        "client_id": "station.apps.googleusercontent.com", "client_secret": "not-secret",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"]}}), encoding="utf-8")
+    assert c.get("/api/modules").json()["detail"].startswith(SIGN_IN_FIRST)
+    r = c.get("/api/google/login", follow_redirects=False)
+    assert r.status_code == 303
+    loc = r.headers["location"]
+    q = parse_qs(urlsplit(loc).query)
+    assert loc.startswith("https://accounts.google.com/o/oauth2/auth?")
+    assert q["redirect_uri"] == ["http://127.0.0.1:8765/"] and q["client_id"] == ["station.apps.googleusercontent.com"]
+    assert "code_challenge" in q and svc.account.pending_login(q["state"][0])
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -713,7 +1352,7 @@ def test_real_artifacts_stage1_waits_for_tools_image(make_cfg, tmp_path):
     docker = FakeDocker()
     docker.release.clear()  # the tools image build blocks until released
     jobs = JobManager(cfg.work_dir)
-    app = create_app(cfg, docker=docker, jobs=jobs, auto_build=False)
+    app = create_app(cfg, store=MemoryStore(), docker=docker, jobs=jobs, auto_build=False)
     c = TestClient(app, base_url=BASE)
     assert hello(c).status_code == 200
     r = c.get(f"/api/modules/{SERIAL}/stage/1")
@@ -727,6 +1366,10 @@ def test_real_artifacts_stage1_waits_for_tools_image(make_cfg, tmp_path):
         assert a["target"] == t
         assert set(a) >= {"target", "ready", "source", "version", "path", "size", "built", "detail", "job"}
     assert st["tools"]["ready"] is False
+    # the gadget is always built here (no prebuilt source); the image has a clear and a crypt variant
+    assert st["gadget"]["ready"] is False and st["gadget"]["source"] is None
+    assert st["image"]["ready"] is False and set(st["image"]["variants"]) == {"clear", "crypt"}
+    assert all(v["ready"] is False for v in st["image"]["variants"].values())
     docker.release.set()
     wait_job(jobs.get(body["job"]["id"]))
     assert jobs.get(body["job"]["id"]).status == "succeeded"
@@ -735,7 +1378,7 @@ def test_real_artifacts_stage1_waits_for_tools_image(make_cfg, tmp_path):
 
 def test_real_artifacts_unknown_module_and_bad_target(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path)
-    app = create_app(cfg, docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False)
+    app = create_app(cfg, store=MemoryStore(), docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False)
     c = TestClient(app, base_url=BASE)
     assert c.get("/api/modules/deadbeef/stage/1").status_code == 404
     assert c.get("/api/modules/deadbeef/stage/1/files/pieeprom.bin").status_code == 404
@@ -751,8 +1394,9 @@ def test_real_artifacts_unknown_module_and_bad_target(make_cfg, tmp_path):
                                   "evil.com:80@127.0.0.1", "192.168.1.5:8765", ""])
 def test_foreign_host_is_rejected(env, host):
     hello(env.client)
-    for url in ("/api/status", f"/api/modules/{SERIAL}", f"/api/modules/{SERIAL}/stage/3", "/"):
-        r = env.client.get(url, headers={"host": host})
+    for url in ("/api/status", f"/api/modules/{SERIAL}", f"/api/modules/{SERIAL}/stage/3", "/",
+                "/?state=s1&code=c1", "/api/google/login"):
+        r = env.client.get(url, headers={"host": host}, follow_redirects=False)
         assert r.status_code == 403, (host, url, r.text)
         assert "not allowed" in r.json()["detail"] or "no Host" in r.json()["detail"]
 
@@ -765,6 +1409,8 @@ def test_loopback_hosts_pass(env, host):
 
 
 def test_cross_site_post_is_rejected(env):
+    der, pub, _ = _p256()
+    hello(env.client, serial="0c4f88d1")
     for headers in ({"origin": "http://attacker.example"}, {"origin": "null"},
                     {"origin": "http://127.0.0.1.attacker.example:8765"},
                     {"referer": "http://attacker.example/page.html"}):
@@ -773,8 +1419,15 @@ def test_cross_site_post_is_rejected(env):
         assert "cross-site POST" in r.json()["detail"]
         r = env.client.post("/api/modules/hello", json={"serial": SERIAL}, headers=headers)
         assert r.status_code == 403
+        r = env.client.post("/api/modules/0c4f88d1/mode", json={"mode": "secure"}, headers=headers)
+        assert r.status_code == 403
+        r = env.client.post("/api/modules/0c4f88d1/device-key", json={"key_der_b64": _b64(der), "device_key_pem": pub},
+                            headers=headers)
+        assert r.status_code == 403
     assert env.jobs.list() == []  # no build was started
     assert env.modules.get(SERIAL) is None  # nothing written to the registry
+    rec = env.modules.get("0c4f88d1")
+    assert rec["mode"] == "" and rec["device_private_pem"] == ""
 
 
 def test_same_origin_and_originless_posts_pass(env):
@@ -788,7 +1441,8 @@ def test_same_origin_and_originless_posts_pass(env):
 
 def test_configured_host_is_allowed(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path, server={"host": "192.168.1.5"})
-    c = TestClient(create_app(cfg, docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False), base_url=BASE)
+    c = TestClient(create_app(cfg, store=MemoryStore(), docker=FakeDocker(), jobs=JobManager(cfg.work_dir),
+                              auto_build=False), base_url=BASE)
     assert c.get("/api/status", headers={"host": "192.168.1.5:8765"}).status_code == 200
     assert c.get("/api/status", headers={"host": "10.0.0.7:8765"}).status_code == 403
     assert c.post("/api/modules/hello", json={"serial": SERIAL},
@@ -797,7 +1451,8 @@ def test_configured_host_is_allowed(make_cfg, tmp_path):
 
 def test_wildcard_listen_accepts_ip_literals_only(make_cfg, tmp_path):
     cfg = make_cfg(tmp_path, server={"host": "0.0.0.0"})
-    c = TestClient(create_app(cfg, docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False), base_url=BASE)
+    c = TestClient(create_app(cfg, store=MemoryStore(), docker=FakeDocker(), jobs=JobManager(cfg.work_dir),
+                              auto_build=False), base_url=BASE)
     assert c.get("/api/status", headers={"host": "10.0.0.7:8765"}).status_code == 200
     assert c.get("/api/status", headers={"host": "[fe80::1]:8765"}).status_code == 200
     assert c.get("/api/status", headers={"host": "rebind.attacker.example:8765"}).status_code == 403
@@ -808,7 +1463,8 @@ def test_wildcard_listen_accepts_ip_literals_only(make_cfg, tmp_path):
 def test_wildcard_listen_origin_must_be_same_origin(make_cfg, tmp_path):
     """With a wildcard listen an IP-literal Origin passes only when it is this server (host AND port)."""
     cfg = make_cfg(tmp_path, server={"host": "0.0.0.0"})
-    c = TestClient(create_app(cfg, docker=FakeDocker(), jobs=JobManager(cfg.work_dir), auto_build=False), base_url=BASE)
+    c = TestClient(create_app(cfg, store=MemoryStore(), docker=FakeDocker(), jobs=JobManager(cfg.work_dir),
+                              auto_build=False), base_url=BASE)
     host = {"host": "10.0.0.7:8765"}
     # a foreign site reached by IP address must not be able to POST (no-cors fetch, empty body)
     assert c.post("/api/builds/tools", headers={**host, "origin": "http://203.0.113.7"}).status_code == 403

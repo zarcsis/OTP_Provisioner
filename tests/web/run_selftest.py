@@ -6,9 +6,10 @@
     python tests/web/run_selftest.py --serve               # serve the page + fake API until Ctrl-C
 
 A stdlib HTTP server serves the repository read-only (GET/HEAD only, no directory listings, nothing outside the
-repo), the self-test page (/__selftest.html = index.html + tests/web/mocks.js + selftest.js), a canned API under
-/api/ (tests/web/fake_api.py) and accepts the result on POST /__result. Chrome: --chrome, env OTP_CHROME, the
-default Windows install path, or google-chrome / chromium / chrome / msedge on PATH.
+repo), the self-test page (/__selftest.html = index.html + tests/web/mocks.js + selftest.js, opened with
+?google_error=...), a canned API under /api/ (tests/web/fake_api.py) with test hooks (POST /__fake/status merges
+into /api/status, POST /__fake/reset, GET /__fake/counts) and accepts the result on POST /__result. Chrome:
+--chrome, env OTP_CHROME, the default Windows install path, or google-chrome / chromium / chrome / msedge on PATH.
 """
 from __future__ import annotations
 
@@ -40,10 +41,10 @@ CHROME_CANDIDATES = [
 CHROME_NAMES = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome", "msedge"]
 
 # Real rpiboot fixtures inside the repo (first existing regular file wins; git symlinks on Windows are text stubs).
-BOOTFILES = ["external/usbboot/firmware/bootfiles.bin", "stage-dirs/mass-storage-gadget/bootfiles.bin",
-             "stage-dirs/fastboot-gadget/bootfiles.bin"]
-CONFIGS = ["stage-dirs/mass-storage-gadget/config.txt", "external/usbboot/mass-storage-gadget64/config.txt",
-           "stage-dirs/fastboot-gadget/config.txt"]
+BOOTFILES = ["external/usbboot/firmware/bootfiles.bin"]
+CONFIGS = ["external/usbboot/mass-storage-gadget64/config.txt"]
+# The self-test page is opened with ?google_error=<this> (selftest.js checks that the page shows it once).
+GOOGLE_ERROR = "Google sign-in was not completed: access_denied"
 
 
 def find_chrome(explicit: str | None) -> str:
@@ -70,6 +71,9 @@ class State:
     inject = ""
     result: str | None = None
     done = threading.Event()
+    # seconds the SSE log of a running job stays open; 0 for screenshots: Chrome's --virtual-time-budget does not
+    # advance while a request is pending, so a held stream would keep the screenshot from ever being taken
+    sse_hold = 20
 
 
 def page_html(extra: str) -> bytes:
@@ -121,7 +125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(f)
                 self.wfile.flush()
             if not finished:
-                for _ in range(20):  # a running job: keep the stream open for a while
+                for _ in range(State.sse_hold):  # a running job: keep the stream open for a while
                     time.sleep(1.0)
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
@@ -142,6 +146,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path.startswith("/api/"):
             self._api("GET", self.path, b"")
+            return
+        if path == "/__fake/counts":
+            self._json(200, fake_api.counts())
             return
         rel = urllib.parse.unquote(path).lstrip("/")
         target = (REPO / rel).resolve()
@@ -169,6 +176,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path.startswith("/api/"):
             self._api("POST", self.path, body)
+            return
+        if path == "/__fake/status":   # self-test hook: merge into every later /api/status
+            try:
+                fake_api.set_status_overrides(json.loads(body or b"{}"))
+            except ValueError:
+                self._json(400, {"detail": "body is not JSON"})
+                return
+            self._json(200, {"ok": True})
+            return
+        if path == "/__fake/reset":
+            fake_api.reset()
+            self._json(200, {"ok": True})
             return
         self._json(405, {"detail": "read-only"})
 
@@ -202,7 +221,8 @@ def chrome_cmd(chrome: str, profile: str, url: str, extra: list[str]) -> list[st
 
 
 def run_selftest(args: argparse.Namespace) -> int:
-    fix = {"bootfiles": pick_fixture(BOOTFILES, 100_000), "config": pick_fixture(CONFIGS, 10)}
+    fake_api.reset()
+    fix = {"bootfiles": pick_fixture(BOOTFILES, 100_000), "config": pick_fixture(CONFIGS, 10), "googleError": GOOGLE_ERROR}
     State.inject = ('<pre id="test-out" class="hidden">running</pre>\n'
                     f"<script>window.__FIX = {json.dumps(fix)};</script>\n"
                     '<script src="/tests/web/mocks.js"></script>\n<script src="/tests/web/selftest.js"></script>')
@@ -213,7 +233,9 @@ def run_selftest(args: argparse.Namespace) -> int:
     errlog = pathlib.Path(profile) / "chrome-stderr.txt"
     t0 = time.time()
     with open(errlog, "w", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(chrome_cmd(chrome, profile, f"http://127.0.0.1:{port}/__selftest.html",
+        # ?google_error=...: what /api/google/login appends when the sign-in failed; the page shows it once
+        url = f"http://127.0.0.1:{port}/__selftest.html?google_error=" + urllib.parse.quote(GOOGLE_ERROR)
+        proc = subprocess.Popen(chrome_cmd(chrome, profile, url,
                                            ["--enable-logging=stderr", "--v=0", "--window-size=1400,1000"]),
                                 stdout=subprocess.DEVNULL, stderr=err)
         ok = State.done.wait(timeout=args.timeout)
@@ -229,7 +251,8 @@ def run_selftest(args: argparse.Namespace) -> int:
         print("\n".join(shown))
         passed = sum(1 for ln in lines if ln.startswith("PASS"))
         failed = sum(1 for ln in lines if ln.startswith("FAIL"))
-        print(f"-- {passed} passed, {failed} failed, {time.time() - t0:.1f} s (chrome: {chrome})")
+        known = sum(1 for ln in lines if ln.startswith(("XFAIL", "XPASS")))   # known product bugs (selftest.js xfail)
+        print(f"-- {passed} passed, {failed} failed, {known} xfail/xpass, {time.time() - t0:.1f} s (chrome: {chrome})")
         if args.verbose and applog.strip():
             print("--- app log ---\n" + applog)
         rc = 0 if ("SUMMARY ALL PASS" in report and failed == 0) else 1
@@ -244,6 +267,7 @@ def run_selftest(args: argparse.Namespace) -> int:
 
 def screenshot(args: argparse.Namespace) -> int:
     State.offline = args.state == "offline"
+    State.sse_hold = 0
     State.inject = demo_inject(args.state)
     srv = start_server(args.port)
     port = srv.server_address[1]

@@ -1,0 +1,2 @@
+/etc/systemd/system/otp-keyexport-boot.service /etc/systemd/system/multi-user.target.wants/otp-keyexport-boot.service
+/etc/systemd/system/otp-keyexport-request.path /etc/systemd/system/multi-user.target.wants/otp-keyexport-request.path

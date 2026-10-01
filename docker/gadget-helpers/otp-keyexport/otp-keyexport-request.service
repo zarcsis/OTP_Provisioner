@@ -1,0 +1,7 @@
+[Unit]
+Description=Generate (if blank) and export the OTP device key on the station's request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/otp-keyexport request
+TimeoutStartSec=60

@@ -1,0 +1,10 @@
+[Unit]
+Description=Wait for an OTP device key export request from the provisioning station
+
+[Path]
+PathExists=/run/otp-keyexport/request
+MakeDirectory=yes
+DirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

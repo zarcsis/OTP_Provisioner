@@ -2,16 +2,18 @@
 
 Commands::
 
-    serve   [--host H] [--port N] [--no-browser] [--no-auto-build]   run the server (default command)
-    build   tools|gadget|image [--force]                             run one build, stream its log, exit with its result
-    modules [--json]                                                 list the registry (public view, no secrets)
-    modules mark-locked <serial> [--yes]                             record that the board OTP holds our key hash
-    modules mark-unlocked <serial> [--yes]                           undo mark-locked (clear the OTP lock state)
-    status                                                           print the /api/status document as JSON
-    login                                                            sign in to / check the Google storage backend
+    serve   [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build]   run the server (default)
+    build   tools|gadget|image [--force]          run one build, stream its log, exit with its result
+    modules [--json]                              list the registry (public view, no secrets)
+    modules mark-locked <serial> [--yes]          record that the board OTP holds our key hash
+    modules mark-unlocked <serial> [--yes]        undo mark-locked (clear the OTP lock state)
+    status                                        print the /api/status document as JSON
+    login                                         sign in to Google from a terminal (the page has a button too)
 
-``--config PATH`` (before or after the command) selects the config file (SPEC section 4 search order
-otherwise).
+There is no config file: the settings live in the ``settings`` worksheet of the station spreadsheet, so
+every command except ``serve`` and ``status`` needs the Google login. ``--work DIR`` (before or after the
+command; default ``$OTP_WORK_DIR`` or the platform default) selects the work directory, which holds the
+Google token, the spreadsheet id and the build artifacts.
 """
 
 from __future__ import annotations
@@ -46,16 +48,18 @@ BUILD_TARGETS = ("tools", "gadget", "image")
 
 
 def _add_common(p: argparse.ArgumentParser, *, top: bool) -> None:
-    # The sub-parsers use SUPPRESS so a --config given before the command is not reset to None.
-    p.add_argument("--config", metavar="PATH", default=None if top else argparse.SUPPRESS,
-                   help="config file (default: $OTP_CONFIG, <repo>/config.yaml, <work>/config.yaml)")
+    # The sub-parsers use SUPPRESS so a --work given before the command is not reset to None.
+    p.add_argument("--work", metavar="DIR", default=None if top else argparse.SUPPRESS,
+                   help="work directory (default: $OTP_WORK_DIR or the platform default)")
 
 
 def _add_serve_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--host", default=None, help="listen address (default: server.host, 127.0.0.1)")
-    p.add_argument("--port", type=int, default=None, help="listen port (default: server.port, 8765)")
-    p.add_argument("--no-browser", action="store_true", help="do not open the page in Chrome")
-    p.add_argument("--no-auto-build", action="store_true", help="do not start missing builds at startup")
+    p.add_argument("--host", default=None, help="listen address (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=None, help="listen port (default 8765, or $OTP_PORT)")
+    p.add_argument("--browser", metavar="EXE", default=None,
+                   help="browser to open the page in (default: Chrome, else Edge, in the usual places)")
+    p.add_argument("--no-browser", action="store_true", help="do not open the page in a browser")
+    p.add_argument("--no-auto-build", action="store_true", help="do not start missing builds after signing in")
 
 
 def build_parser(prog: str = "python -m otp_server") -> argparse.ArgumentParser:
@@ -89,7 +93,7 @@ def build_parser(prog: str = "python -m otp_server") -> argparse.ArgumentParser:
     pt = sub.add_parser("status", help="print the server status document")
     _add_common(pt, top=False)
 
-    pl = sub.add_parser("login", help="sign in to the Google storage backend (OAuth) or check its access")
+    pl = sub.add_parser("login", help="sign in to Google (OAuth in the browser) and open the station spreadsheet")
     _add_common(pl, top=False)
     return parser
 
@@ -99,7 +103,8 @@ def parse_args(argv: Sequence[str] | None = None, *, prog: str = "python -m otp_
     args_list = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser(prog)
     # Default command: insert "serve" before the first argument that is not a global option.
-    if not any(a in COMMANDS for a in args_list) and not any(a in ("-h", "--help", "--version") for a in args_list):
+    if not any(a in COMMANDS for a in _positionals(args_list)) and \
+            not any(a in ("-h", "--help", "--version") for a in args_list):
         args_list = _insert_serve(args_list)
     ns = parser.parse_args(args_list)
     if ns.command is None:
@@ -107,16 +112,36 @@ def parse_args(argv: Sequence[str] | None = None, *, prog: str = "python -m otp_
     return ns
 
 
+#: Options that take a value (their value is never a command name, e.g. "--work modules").
+_VALUED = ("--work", "--host", "--port", "--browser")
+
+
+def _positionals(args: list[str]) -> list[str]:
+    """``args`` without the options and the values of the valued options."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in _VALUED:
+            skip = True
+            continue
+        if not a.startswith("-"):
+            out.append(a)
+    return out
+
+
 def _insert_serve(args: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--config" and i + 1 < len(args):
+        if a == "--work" and i + 1 < len(args):
             out += [a, args[i + 1]]
             i += 2
             continue
-        if a.startswith("--config="):
+        if a.startswith("--work="):
             out.append(a)
             i += 1
             continue
@@ -130,8 +155,12 @@ def _overrides(ns: argparse.Namespace) -> dict:
         ov.setdefault("server", {})["host"] = ns.host
     if getattr(ns, "port", None) is not None:
         ov.setdefault("server", {})["port"] = ns.port
+    if getattr(ns, "browser", None):
+        ov.setdefault("server", {})["browser"] = str(Path(ns.browser).resolve())
     if getattr(ns, "no_browser", False):
         ov.setdefault("server", {})["open_browser"] = False
+    if getattr(ns, "work", None):
+        ov.setdefault("paths", {})["work"] = str(Path(ns.work).resolve())
     if getattr(ns, "no_auto_build", False):
         ov.setdefault("builds", {})["auto"] = False
     return ov
@@ -140,7 +169,9 @@ def _overrides(ns: argparse.Namespace) -> dict:
 def _load(ns: argparse.Namespace):
     from .config import load_config
 
-    return load_config(getattr(ns, "config", None), overrides=_overrides(ns) or None)
+    cfg = load_config(overrides=_overrides(ns) or None)
+    cfg.bootstrap = _overrides(ns)
+    return cfg
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -148,28 +179,17 @@ def _load(ns: argparse.Namespace):
 # ----------------------------------------------------------------------------------------------------
 
 
-def _win_app_path(exe: str) -> str | None:
-    """``App Paths`` registry entry of ``exe`` (HKCU, then HKLM)."""
-    try:
-        import winreg
-    except ImportError:
-        return None
-    key = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
-    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-        try:
-            with winreg.OpenKey(hive, key) as k:
-                val, _ = winreg.QueryValueEx(k, "")
-        except OSError:
-            continue
-        if val:
-            p = Path(os.path.expandvars(str(val).strip().strip('"')))
-            if p.is_file():
-                return str(p)
-    return None
+def find_browser(configured: Path | None = None) -> tuple[str, str] | None:
+    """``(name, executable)`` of the browser to open the page in, or ``None``.
 
-
-def find_browser() -> tuple[str, str] | None:
-    """``(name, executable)`` of Chrome (else Edge on Windows), or ``None``."""
+    ``configured`` (``--browser``, i.e. ``server.browser``) wins when it exists; otherwise Chrome in its
+    standard install locations (else Edge on Windows). The Windows registry is never consulted.
+    """
+    if configured is not None:
+        p = Path(configured)
+        if p.is_file():
+            return p.stem.lower(), str(p)
+        log.warning("server.browser %s does not exist; looking for Chrome/Edge in the usual places", p)
     if sys.platform == "win32":
         pf = os.environ.get("ProgramFiles", r"C:\Program Files")
         pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
@@ -181,9 +201,6 @@ def find_browser() -> tuple[str, str] | None:
             ("msedge", "msedge.exe", [Path(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
                                       Path(pf, "Microsoft", "Edge", "Application", "msedge.exe")]),
         ):
-            found = _win_app_path(exe)
-            if found:
-                return name, found
             for c in candidates:
                 if c is not None and c.is_file():
                     return name, str(c)
@@ -198,12 +215,13 @@ def find_browser() -> tuple[str, str] | None:
     return None
 
 
-def open_browser(url: str) -> str:
-    """Open ``url`` in Chrome/Chromium (WebUSB), else Edge (Windows), else the default browser.
+def open_browser(url: str, configured: Path | None = None) -> str:
+    """Open ``url`` in ``configured`` (``server.browser``), else Chrome/Chromium (WebUSB), else Edge
+    (Windows), else the default browser.
 
     :returns: a short description of what was launched.
     """
-    found = find_browser()
+    found = find_browser(configured)
     if found is not None:
         name, exe = found
         if sys.platform == "win32":
@@ -295,21 +313,22 @@ def cmd_serve(ns: argparse.Namespace, cfg) -> int:
         if other is not None:
             print(f"OTP_Provisioner {other} is already running at {url}")
             if cfg.server.open_browser:
-                print(f"Opening {url} in {open_browser(url)}")
+                print(f"Opening {url} in {open_browser(url, cfg.server.browser)}")
             return 0
         print(f"ERROR: port {port} on {host} is in use by another program; pick another with --port", file=sys.stderr)
         return 2
 
-    app = create_app(cfg)
+    app = create_app(cfg, bootstrap=getattr(cfg, "bootstrap", None))
     svc = app.state.services
     print(f"OTP_Provisioner {__version__}")
-    print(f"  config : {cfg.config_path or '(defaults, no config file)'}")
     print(f"  work   : {cfg.work_dir}")
-    st = svc.storage_status()
-    print(f"  storage: {st.get('backend')} {'ok' if st.get('ok') else 'NOT USABLE'} - {st.get('location') or st.get('detail')}")
-    if not st.get("ok") and st.get("detail"):
-        print(f"           {st.get('detail')}")
-    print(f"  builds : auto={'on' if cfg.builds.auto else 'off'}")
+    g = svc.account.status() if svc.account is not None else {}
+    if not g.get("client"):
+        print(f"  google : NO OAUTH CLIENT - save the 'Desktop app' client JSON as {g.get('client_file')}")
+    elif not g.get("signed_in"):
+        print("  google : not signed in - sign in on the page (settings and the registry live in Google Sheets)")
+    else:
+        print(f"  google : signed in, spreadsheet {g.get('spreadsheet_url') or '(created on first use)'}")
 
     logging.getLogger("uvicorn.access").addFilter(_QuietPolls())
     server = uvicorn.Server(uvicorn.Config(app, host=host.strip("[]"), port=port, log_level="info"))
@@ -323,7 +342,7 @@ def cmd_serve(ns: argparse.Namespace, cfg) -> int:
         print(f"\n  Open {url}  (Chrome or Edge: WebUSB)\n", flush=True)
         if cfg.server.open_browser:
             try:
-                print(f"  Opening the page in {open_browser(url)}", flush=True)
+                print(f"  Opening the page in {open_browser(url, cfg.server.browser)}", flush=True)
             except Exception as exc:  # noqa: BLE001 - never kill the server over a browser
                 print(f"  Could not open a browser: {exc}", flush=True)
 
@@ -337,10 +356,15 @@ def cmd_serve(ns: argparse.Namespace, cfg) -> int:
 # ----------------------------------------------------------------------------------------------------
 
 
-def _services(cfg):
+def _services(cfg, *, need_google: bool = True):
+    """The services with the sheet settings applied; exits (code 2) when Google is not usable."""
     from .app import create_services
 
-    return create_services(cfg)
+    svc = create_services(cfg, bootstrap=getattr(cfg, "bootstrap", None))
+    if need_google and not (svc.refresh_settings(force=True) and svc.google_ready()):
+        print(f"ERROR: {svc.google_problem()}", file=sys.stderr)
+        raise SystemExit(2)
+    return svc
 
 
 def cmd_build(ns: argparse.Namespace, cfg) -> int:
@@ -493,38 +517,32 @@ def _mark_otp(modules, serial: str, *, locked: bool, yes: bool, server_url: str 
     return 0
 
 
-def _make_store(cfg):
-    from .storage import make_store
-
-    return make_store(cfg)
-
-
 def cmd_login(ns: argparse.Namespace, cfg) -> int:
-    """``login``: interactive OAuth (or a service-account connectivity check) for the Google backends."""
-    backend = cfg.storage.backend
-    if backend not in ("gsheets", "gdrive"):
-        print(f"backend {backend} needs no login")
-        return 0
+    """``login``: the Google OAuth login in a browser (loopback redirect), then open the spreadsheet."""
     from .storage.base import StoreError
 
+    svc = _services(cfg, need_google=False)
     try:
-        store = _make_store(cfg)
-        if not hasattr(store, "login"):
-            print(f"backend {backend} needs no login")
-            return 0
-        msg = store.login()
+        svc.account.login_interactive()
+        svc.on_google_login()
     except StoreError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("login interrupted", file=sys.stderr)
         return 130
-    print(msg or f"backend {backend}: login done")
+    if not svc.google_ready():
+        print(f"ERROR: signed in, but {svc.google_problem()}", file=sys.stderr)
+        return 1
+    who = svc.account.account_email()
+    url = svc.account.spreadsheet_url() or "(found or created when the station connects)"
+    print(f"signed in to Google{' as ' + who if who else ''}; station spreadsheet: {url}")
     return 0
 
 
 def cmd_status(ns: argparse.Namespace, cfg) -> int:
-    svc = _services(cfg)
+    svc = _services(cfg, need_google=False)
+    svc.refresh_settings(force=True)
     print(json.dumps(svc.status(), indent=2, default=str))
     return 0
 
@@ -536,7 +554,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "python -m otp_server
     try:
         cfg = _load(ns)
     except (FileNotFoundError, ValueError) as exc:
-        # Config problems (missing --config file, invalid value) are user errors: no traceback.
+        # Config problems (an invalid flag value) are user errors: no traceback.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     handlers = {"build": cmd_build, "modules": cmd_modules, "status": cmd_status, "login": cmd_login}

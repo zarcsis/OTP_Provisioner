@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """OTP_Provisioner launcher.
 
-    python server.py [--config PATH] [--host H] [--port N] [--no-browser] [--no-auto-build]
+    python server.py [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build] [--work DIR]
 
-Loads the configuration, starts the web server on http://127.0.0.1:8765/ (by default), prints the URL
-and opens the page in Chrome (Edge on Windows when Chrome is missing). Other commands are available
-through ``python -m otp_server`` (build, modules, status, login).
+Starts the web server on http://127.0.0.1:8765/ (by default), prints the URL and opens the page in
+Chrome (Edge on Windows when Chrome is missing). There is no config file: sign in to Google on the
+page; the settings and the board registry live in the station spreadsheet. Other commands are available
+through ``python -m otp_server`` (login, build, modules, status).
 """
 
 from __future__ import annotations

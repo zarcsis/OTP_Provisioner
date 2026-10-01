@@ -15,12 +15,15 @@ import re
 import threading
 from typing import Any
 
-from .secrets_gen import customer_key_hash, new_module_secrets, public_key_fingerprint, public_pem_from_private
+from .secrets_gen import (customer_key_hash, new_module_secrets, otp_zero_words, parse_device_private_key,
+                          public_key_fingerprint, public_pem_from_private, same_public_key)
 from .storage.base import MAX_EVENTS, StoreError, normalize_record, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 STAGES = ("new", "eeprom", "gadget", "flashed")
+#: Provisioning scenarios a board can be run in (chosen per board on the page).
+MODES = ("open", "secure")
 STAGE_LABELS = {
     "new": "New",
     "eeprom": "EEPROM flashed",
@@ -48,7 +51,9 @@ FASTBOOT_VARS = (
 USB_KEYS = ("vendor_id", "product_id", "product_name", "manufacturer", "serial_number")
 
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
-_SECRET_KEYS = ("rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret")
+_SECRET_KEYS = ("rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret", "device_private_pem")
+#: Largest exported device key accepted (DER of a P-256 key is ~121-138 bytes).
+MAX_DEVICE_KEY_BYTES = 1024
 
 
 def normalize_serial(s: str) -> str:
@@ -255,6 +260,9 @@ class ModuleService:
             rec = normalize_record(self.require(serial))
             if pem is not None:
                 pem = pem.replace("\r\n", "\n").strip() + "\n"
+                if rec["device_private_pem"] and not same_public_key(pem, rec["device_private_pem"]):
+                    raise ValueError(f"module {rec['serial']}: the reported device key differs from the exported one "
+                                     "kept for this board (an OTP key cannot change)")
                 if pem != rec["device_key_pem"]:
                     rec["device_key_pem"] = pem
                     fp = _fingerprint(pem)
@@ -268,6 +276,94 @@ class ModuleService:
             if ev is not None:
                 _add_event(rec, _clean_text(ev.get("kind"), 64), _clean_text(ev.get("note"), 500))
             return self._save(rec)
+
+    def mode_of(self, record: dict) -> str:
+        """The scenario the board's stages are planned for.
+
+        ``secure`` whenever the board OTP holds a key hash (it only runs signed code any more), else the
+        scenario chosen for it, else ``provisioning.default_mode``.
+        """
+        r = record or {}
+        if self.is_locked(r) or bool(r.get("secure_boot_provisioned")):
+            return "secure"
+        m = str(r.get("mode") or "").strip().lower()
+        if m in MODES:
+            return m
+        prov = getattr(self.cfg, "provisioning", None)
+        default = str(getattr(prov, "default_mode", "") or "open")
+        return default if default in MODES else "open"
+
+    def set_mode(self, serial: str, mode: str) -> dict:
+        """Choose the scenario for a board (``open`` or ``secure``).
+
+        Refused for ``open`` once the board OTP holds a key hash. Switching a board that already went
+        through stages in the other scenario -- the one :meth:`mode_of` gave before, which for a record
+        without a choice is ``provisioning.default_mode`` -- resets its stage to ``new`` (every stage has to
+        be redone: the EEPROM, the gadget signing and the image all differ). Appends a ``mode`` event.
+
+        :raises KeyError: unknown module. :raises ValueError: unknown scenario or ``open`` on a locked board.
+        """
+        m = str(mode or "").strip().lower()
+        if m not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+        with self._lock:
+            rec = normalize_record(self.require(serial))
+            if m == "open" and (self.is_locked(rec) or rec["secure_boot_provisioned"]):
+                raise ValueError(f"board {rec['serial']}: its OTP holds a key hash (secure boot is provisioned), so it "
+                                 "only runs signed code; only the secure scenario is possible")
+            prev = rec["mode"]
+            if prev == m:
+                return copy.deepcopy(rec)
+            effective = self.mode_of(rec)      # the scenario the stages done so far ran in
+            rec["mode"] = m
+            note = f"scenario {m}" + (f" (was {prev})" if prev else "")
+            if effective != m and rec["stage"] != "new":
+                if not prev:
+                    note += f" (the stages so far ran as {effective})"
+                note += f"; stage {rec['stage']} reset to new: every stage is redone in the new scenario"
+                rec["stage"] = "new"
+            _add_event(rec, "mode", note)
+            return self._save(rec)
+
+    def store_device_key(self, serial: str, key_der: bytes, reported_pem: str) -> tuple[dict, dict]:
+        """Keep the board's OTP device private key exported by the fastboot gadget (``secure`` mode).
+
+        ``key_der`` is the gadget's ``rpi-fw-crypto privkey --key-id 1`` output (DER, or the raw
+        32-byte scalar); ``reported_pem`` is ``getvar:public-key`` read from the same gadget. The key
+        is accepted only when its public half equals ``reported_pem`` and, when the record already
+        knows the board's device key, that one too (an OTP key can never change). A second export of
+        the same key changes nothing.
+
+        :returns: ``(record, info)`` with ``info = {"fingerprint", "already", "zero_words"}``;
+            ``zero_words`` > 0 means OTP rows of the key are zero (a key write that was cut short).
+        :raises KeyError: unknown module. :raises ValueError: unusable key or a public-key mismatch.
+        """
+        raw = bytes(key_der or b"")
+        if not raw or len(raw) > MAX_DEVICE_KEY_BYTES:
+            raise ValueError(f"the exported device key must be 1..{MAX_DEVICE_KEY_BYTES} bytes, got {len(raw)}")
+        if not _is_public_pem(reported_pem):
+            raise ValueError("device_key_pem must be the PEM public key the board reports (getvar:public-key)")
+        d, priv, pub = parse_device_private_key(raw)
+        if not same_public_key(pub, reported_pem):
+            raise ValueError("the exported device key does not match the public key the board reports")
+        fp = _fingerprint(pub)
+        zero = otp_zero_words(d)
+        with self._lock:
+            rec = normalize_record(self.require(serial))
+            if rec["device_key_pem"] and not same_public_key(pub, rec["device_key_pem"]):
+                raise ValueError(f"module {rec['serial']}: the exported device key differs from the one recorded "
+                                 f"for this board ({_fingerprint(rec['device_key_pem'])[:16]}); an OTP key cannot change")
+            if rec["device_private_pem"]:
+                if not same_public_key(rec["device_private_pem"], pub):
+                    raise ValueError(f"module {rec['serial']}: a different device private key is already stored")
+                return copy.deepcopy(rec), {"fingerprint": fp, "already": True, "zero_words": zero}
+            rec["device_private_pem"] = priv
+            rec["device_key_pem"] = pub
+            note = f"device key {fp[:16]} exported"
+            if zero:
+                note += f"; WARNING: {zero} of its 8 OTP words are zero (key generation was probably interrupted)"
+            _add_event(rec, "device_key_export", note)
+            return self._save(rec), {"fingerprint": fp, "already": False, "zero_words": zero}
 
     def record_result(self, serial: str, stage: int, result: dict) -> tuple[dict, dict]:
         """Apply the page's report of a stage run (rules in SPEC section 7).
@@ -388,12 +484,18 @@ class ModuleService:
         details = result.get("details") if isinstance(result.get("details"), dict) else {}
         pem = details.get("device_key_pem")
         if pem:
-            if _is_public_pem(pem):
+            if not _is_public_pem(pem):
+                notes.append("warning: device_key_pem ignored (not a PEM public key)")
+            elif rec["device_private_pem"] and not same_public_key(pem, rec["device_private_pem"]):
+                notes.append("the board reports a device key that differs from the exported one")
+                ok = False
+            else:
                 pem = pem.replace("\r\n", "\n").strip() + "\n"
                 if pem != rec["device_key_pem"]:
                     rec["device_key_pem"] = pem
-            else:
-                notes.append("warning: device_key_pem ignored (not a PEM public key)")
+        if ok and self.mode_of(rec) == "secure" and not rec["device_private_pem"]:
+            notes.append("the OTP device key was not exported to the server (secure mode needs it)")
+            ok = False
         if ok:
             rec["stage"] = "flashed"
         return ok
@@ -487,6 +589,9 @@ class ModuleService:
             "serial": r["serial"],
             "stage": stage,
             "stage_label": STAGE_LABELS.get(stage, stage),
+            "mode": self.mode_of(r),
+            "mode_chosen": r["mode"],
+            "mode_locked": self.is_locked(r) or r["secure_boot_provisioned"],
             "created": r["created"],
             "updated": r["updated"],
             "chip": r["chip"],
@@ -508,6 +613,7 @@ class ModuleService:
                 "secure_boot_provisioned": r["secure_boot_provisioned"],
                 "device_key": bool(r["device_key_pem"]),
                 "device_key_fingerprint": _fingerprint(r["device_key_pem"]) if r["device_key_pem"] else "",
+                "device_key_exported": bool(r["device_private_pem"]),
             },
             "metadata": r["metadata"],
             "facts": r["facts"],
@@ -515,8 +621,9 @@ class ModuleService:
         }
 
     def secrets_for(self, serial: str) -> dict:
-        """``{"rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret"}`` for the
-        module (missing secrets are generated and stored first). :raises KeyError: unknown module."""
+        """``{"rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret", "device_private_pem"}``
+        for the module (missing secrets are generated and stored first; ``device_private_pem`` is ``""``
+        until the gadget exported the OTP device key). :raises KeyError: unknown module."""
         with self._lock:
             rec = normalize_record(self.require(serial))
             if self._ensure_secrets(rec):
