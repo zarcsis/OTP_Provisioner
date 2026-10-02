@@ -1,7 +1,7 @@
 #!/bin/bash
-# image-collect.sh - copy one droneos (rpi-image-gen) IDP set out of the build volume.
+# image-collect.sh - copy one rpi-image-gen IDP set out of the image build volume.
 #
-# Mounts:  /work ro  the droneos work volume (rpi-image-gen -B /work)
+# Mounts:  /work ro  the image work volume (rpi-image-gen -B /work)
 #          /out  rw  the image set directory being built (<set>.partial)
 # Env:     MAX_PIECE=<bytes> (default 268435456 = rpi-fastbootd max-download-size)
 # Reads:   /work/bootstrap/final.env (IGconf_image_outputdir, IGconf_image_name, IGconf_deploy_dir),
@@ -77,9 +77,9 @@ split_sparse() {
 # ---------------------------------------------------------------------------
 step "image-collect: MAX_PIECE=${MAX_PIECE}"
 [[ "${MAX_PIECE}" =~ ^[0-9]+$ ]] && [ "${MAX_PIECE}" -ge 1048576 ] || die "MAX_PIECE must be an integer >= 1048576"
-[ -d "${WORK_DIR}" ] || die "${WORK_DIR} is not mounted (the droneos work volume)"
+[ -d "${WORK_DIR}" ] || die "${WORK_DIR} is not mounted (the image work volume)"
 [ -d "${OUT}" ] || die "${OUT} is not mounted"
-[ -f "${FINAL_ENV}" ] || die "${FINAL_ENV} not found: has the droneos image been built into this volume?"
+[ -f "${FINAL_ENV}" ] || die "${FINAL_ENV} not found: has the OS image been built into this volume?"
 
 IMAGE_NAME="$(env_get IGconf_image_name)"
 OUTPUTDIR="$(env_get IGconf_image_outputdir)"

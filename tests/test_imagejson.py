@@ -10,7 +10,7 @@ import pytest
 from otp_server import imagejson
 
 REPO = Path(__file__).resolve().parent.parent
-RIG = (REPO.parent / "droneos" / "rpi-image-gen").resolve()
+RIG = (REPO / "image" / "rpi-image-gen").resolve()
 RPIOS_DEV = RIG / "image" / "mbr" / "simple_dual" / "device"
 ROTA_DEV = RIG / "image" / "gpt" / "ab_userdata" / "device"
 
@@ -23,13 +23,13 @@ SUBST = {"LUKS_KEYSIZE": "512", "LUKS_CIPHER": "aes-xts-plain64", "LUKS_HASH": "
 def load_pmap(path: Path) -> list:
     """Read a provisionmap template the way customize10-pmap renders it (envsubst of ${VARS})."""
     if not path.is_file():
-        pytest.skip(f"{path} not available (droneos checkout missing)")
+        pytest.skip(f"{path} not available (image/rpi-image-gen submodule not checked out)")
     text = re.sub(r"\$\{(\w+)\}", lambda m: SUBST[m.group(1)], path.read_text(encoding="utf-8"))
     return json.loads(text)
 
 
 def rpios_image_json(pmap: list, storage: str = "sd") -> dict:
-    """A realistic image2json 2.2.0 document for droneos (image-rpios, MBR boot + root)."""
+    """A realistic image2json 2.2.0 document of the station image (image-rpios, MBR boot + root)."""
     return {
         "IGversion": "2.2.0",
         "IGmeta": {"IGconf_device_class": "pi5", "IGconf_device_variant": "8G",

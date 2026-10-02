@@ -366,6 +366,196 @@
     }
     $('#btn-registry-refresh').addEventListener('click', refreshModules);
 
+    // ---------- OS image settings (image.* in the settings sheet) ----------
+    const imageForm = $('#image-form');
+    const IMAGE_TEXT = ['name', 'hostname', 'timezone', 'user', 'wifi_ssid', 'wifi_country'];
+    const IMAGE_BOOL = ['ssh', 'ssh_password_login', 'wifi_hidden'];
+    const IMAGE_SECRETS = ['password', 'wifi_password'];
+    const img = { loaded: null, warnings: [], remove: { password: false, wifi_password: false }, saving: false, loading: false, choicesKey: '' };
+    const imageInput = (name) => imageForm.elements.namedItem(name);
+    const imageKeys = () => imageInput('ssh_authorized_keys').value.split('\n').map((x) => x.trim()).filter(Boolean);
+
+    /** What differs from the loaded settings: only these fields are sent ("" for a removed password). */
+    function imageChanges() {
+        const s = img.loaded;
+        if (!s) return {};
+        const out = {};
+        for (const k of IMAGE_TEXT) {
+            let v = imageInput(k).value.trim();
+            if (k === 'wifi_country') v = v.toUpperCase();
+            if (v !== String(s[k] || '')) out[k] = v;
+        }
+        for (const k of IMAGE_BOOL) if (imageInput(k).checked !== !!s[k]) out[k] = imageInput(k).checked;
+        const keys = imageKeys();
+        if (keys.join('\n') !== (s.ssh_authorized_keys || []).join('\n')) out.ssh_authorized_keys = keys;
+        for (const k of IMAGE_SECRETS) {
+            const v = imageInput(k).value;
+            if (v) out[k] = v;
+            else if (img.remove[k]) out[k] = '';
+        }
+        return out;
+    }
+
+    /** Current UTC offset of an IANA zone as "UTC+03:00" ("" when the browser does not know the zone). */
+    function tzOffset(tz) {
+        try {
+            const part = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'longOffset' })
+                .formatToParts(new Date()).find((x) => x.type === 'timeZoneName');
+            return part ? part.value.replace(/^GMT/, 'UTC') : '';
+        } catch (e) { return ''; }
+    }
+
+    /** The time zone and Wi-Fi country lists (the image's tzdata and wireless-regdb, from the server). */
+    function fillImageChoices(choices) {
+        const tzs = (choices && choices.timezones) || [];
+        const countries = (choices && choices.countries) || [];
+        const key = `${tzs.length}:${tzs[0] || ''}:${countries.length}`;
+        if (key === img.choicesKey) return;
+        img.choicesKey = key;
+        const groups = new Map();
+        const loose = [];
+        for (const tz of tzs) {
+            const i = tz.indexOf('/');
+            const off = tzOffset(tz);
+            if (i < 0) { loose.push(el('option', { value: tz }, off && tz !== 'UTC' ? `${tz} (${off})` : tz)); continue; }
+            const region = tz.slice(0, i);
+            const label = tz.slice(i + 1).replace(/_/g, ' ');
+            if (!groups.has(region)) groups.set(region, []);
+            groups.get(region).push({ tz, text: off ? `${label} (${off})` : label, sort: label });
+        }
+        const optgroups = [...groups.keys()].sort().map((region) => el('optgroup', { label: region },
+            ...groups.get(region).sort((a, b) => a.sort.localeCompare(b.sort)).map((o) => el('option', { value: o.tz }, o.text))));
+        imageInput('timezone').replaceChildren(...loose, ...optgroups);
+        const world = countries.filter(([code]) => code === '00');
+        const named = countries.filter(([code]) => code !== '00').sort((a, b) => a[1].localeCompare(b[1]));
+        imageInput('wifi_country').replaceChildren(...[...world, ...named].map(([code, name]) => el('option', { value: code }, `${name} (${code})`)));
+    }
+
+    /** Select ``value``; a value the list lacks (typed into the sheet by hand) stays selectable, marked as such. */
+    function setImageSelect(select, value) {
+        for (const o of select.querySelectorAll('option[data-extra]')) o.remove();
+        if (value && ![...select.options].some((o) => o.value === value)) {
+            select.prepend(el('option', { value, 'data-extra': '1' }, `${value} (current value, not in the list)`));
+        }
+        select.value = value || '';
+    }
+
+    function setImageStatus(text, bad) {
+        const box = $('#image-status');
+        box.textContent = text || '';
+        box.classList.toggle('bad', !!bad);
+    }
+
+    function renderImagePanel() {
+        const s = img.loaded;
+        const usable = !!s && api.available && googleReady();
+        for (const field of imageForm.elements) field.disabled = !usable || img.saving;
+        if (usable && !img.saving) {
+            const ssh = imageInput('ssh').checked;
+            imageInput('ssh_password_login').disabled = !ssh;
+            imageInput('ssh_authorized_keys').disabled = !ssh;
+        }
+        const set = { password: !!(s && s.password_set), wifi_password: !!(s && s.wifi_password_set) };
+        imageInput('password').placeholder = img.remove.password ? 'will be removed'
+            : set.password ? 'set: type to change' : 'none: password login is off';
+        imageInput('wifi_password').placeholder = img.remove.wifi_password ? 'will be removed (open network)'
+            : set.wifi_password ? 'saved: type to change' : 'none (open network)';
+        for (const b of imageForm.querySelectorAll('button[data-remove]')) {
+            const k = b.dataset.remove;
+            b.textContent = img.remove[k] ? 'keep' : 'remove';
+            b.disabled = !usable || img.saving || (!set[k] && !img.remove[k]);
+        }
+        const dirty = Object.keys(imageChanges()).length > 0;
+        $('#btn-image-save').disabled = !usable || img.saving || !dirty;
+        $('#btn-image-revert').disabled = !usable || img.saving || !dirty;
+        $('#image-warnings').replaceChildren(...img.warnings.map((w) => el('li', {}, w)));
+        if (!s && !img.loading && !(api.available && googleReady())) setImageStatus('Available once the server is running and signed in to Google.');
+    }
+
+    function fillImageForm(view) {
+        const s = view.settings || {};
+        img.loaded = s;
+        img.warnings = view.warnings || [];
+        img.remove = { password: false, wifi_password: false };
+        if (view.choices) fillImageChoices(view.choices);
+        for (const k of IMAGE_TEXT) {
+            const f = imageInput(k);
+            if (f.tagName === 'SELECT') setImageSelect(f, s[k] || '');
+            else f.value = s[k] || '';
+        }
+        for (const k of IMAGE_BOOL) imageInput(k).checked = !!s[k];
+        imageInput('ssh_authorized_keys').value = (s.ssh_authorized_keys || []).join('\n');
+        for (const k of IMAGE_SECRETS) { imageInput(k).value = ''; imageInput(k).type = 'password'; }
+        for (const b of imageForm.querySelectorAll('button[data-show]')) b.textContent = 'show';
+        renderImagePanel();
+    }
+
+    async function loadImageSettings() {
+        if (img.loading || !api.available || !googleReady()) return;
+        img.loading = true;
+        try {
+            fillImageForm(await api.imageSettings());
+            setImageStatus('');
+        } catch (e) {
+            setImageStatus(`Image settings: ${e.detail || e.message}`, true);
+        } finally {
+            img.loading = false;
+            renderImagePanel();
+        }
+    }
+
+    async function saveImageSettings() {
+        const body = imageChanges();
+        if (!Object.keys(body).length) return;
+        img.saving = true;
+        setImageStatus('Saving…');
+        renderImagePanel();
+        try {
+            const r = await api.saveImageSettings(body);
+            img.saving = false;
+            fillImageForm(r);
+            const names = (r.saved || []).map((k) => k.replace(/^image\./, '')).join(', ');
+            const builds = srv.status && srv.status.config && srv.status.config.builds;
+            const auto = !builds || builds.auto !== false;
+            setImageStatus(`Saved: ${names}. ` + (auto ? 'The server rebuilds both images now; stage 3 waits for them.'
+                : 'Start the OS image build under Server builds (automatic builds are off).'));
+            log('ok', `OS image settings saved: ${names}`);
+            refreshStatus();
+        } catch (e) {
+            setImageStatus(`Not saved: ${e.detail || e.message}`, true);
+        } finally {
+            img.saving = false;
+            renderImagePanel();
+        }
+    }
+
+    imageForm.addEventListener('submit', (ev) => { ev.preventDefault(); saveImageSettings(); });
+    imageForm.addEventListener('input', (ev) => {
+        if (IMAGE_SECRETS.includes(ev.target.name) && ev.target.value) img.remove[ev.target.name] = false;
+        renderImagePanel();
+    });
+    imageForm.addEventListener('change', () => renderImagePanel());
+    for (const b of imageForm.querySelectorAll('button[data-show]')) {
+        b.addEventListener('click', () => {
+            const f = imageInput(b.dataset.show);
+            f.type = f.type === 'password' ? 'text' : 'password';
+            b.textContent = f.type === 'password' ? 'show' : 'hide';
+        });
+    }
+    for (const b of imageForm.querySelectorAll('button[data-remove]')) {
+        b.addEventListener('click', () => {
+            const k = b.dataset.remove;
+            img.remove[k] = !img.remove[k];
+            if (img.remove[k]) imageInput(k).value = '';
+            renderImagePanel();
+        });
+    }
+    $('#btn-image-save').addEventListener('click', saveImageSettings);
+    $('#btn-image-revert').addEventListener('click', () => {
+        if (img.loaded) fillImageForm({ settings: img.loaded, warnings: img.warnings });   // the lists stay
+        setImageStatus('');
+    });
+
     // ---------- server badges + builds ----------
     function renderServerBadges() {
         const s = srv.status;
@@ -473,7 +663,7 @@
         });
     }
 
-    const BUILD_TITLES = { tools: 'Tools image', gadget: 'Fastboot gadget', image: 'droneos image' };
+    const BUILD_TITLES = { tools: 'Tools image', gadget: 'Fastboot gadget', image: 'OS image' };
     function renderBuilds() {
         const box = $('#builds');
         const s = srv.status;
@@ -559,10 +749,15 @@
         $('#offline-box').classList.toggle('hidden', !!s);
         renderServerBadges();
         renderBuilds();
+        if (!googleReady() && img.loaded) {           // signed out: the next account has its own settings
+            img.loaded = null;
+            img.warnings = [];
+        }
         if (!!s !== was || first || googleReady() !== wasReady) {
-            renderBoard(); renderRegistry(); updateButtons();
+            renderBoard(); renderRegistry(); updateButtons(); renderImagePanel();
             if (s && googleReady() && !wasReady && !first) refreshModules();
         }
+        if (s && googleReady() && !img.loaded) loadImageSettings();
         if (s && !srv.jobLogId) {
             const running = (s.jobs || []).find((j) => j.status === 'running' || j.status === 'queued');
             if (running) selectJobLog(running);
@@ -1262,5 +1457,6 @@
     });
 
     // exposed for the self-test page
-    OTP.app = { state, panels, log, runBootDir, waitForDevice, BootRunPanel, flow, srv, steps, setStep, renderBoard, renderRegistry, refreshStatus, ready, confirmIrreversible, renderGoogle, renderScenario, currentScenario };
+    OTP.app = { state, panels, log, runBootDir, waitForDevice, BootRunPanel, flow, srv, steps, setStep, renderBoard, renderRegistry, refreshStatus, ready, confirmIrreversible, renderGoogle, renderScenario, currentScenario,
+        img, loadImageSettings, renderImagePanel, tzOffset };
 })();

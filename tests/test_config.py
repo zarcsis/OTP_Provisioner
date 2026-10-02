@@ -63,7 +63,7 @@ def test_defaults(tmp_path):
     cfg = load(tmp_path)
     assert cfg.repo_root == REPO_ROOT
     assert cfg.work_dir == tmp_path / "w"
-    assert cfg.droneos_dir == REPO_ROOT / "external" / "droneos"
+    assert cfg.image_dir == REPO_ROOT / "image"
     s = cfg.server
     assert (s.host, s.port, s.open_browser, s.browser) == ("127.0.0.1", 8765, True, None)
     p = cfg.provisioning
@@ -77,11 +77,14 @@ def test_defaults(tmp_path):
     assert b.auto is True and b.tools.image_tag == "otp-tools:latest"
     assert (b.gadget.targets, b.gadget.image_tag, b.gadget.volume) == (
         "pi5-family", "otp-gadget-builder:trixie", "otp-pgm-work")
-    assert b.image.config == "droneos.yaml"
     assert b.image.overrides == []          # IGconf_image_pmap is set per scenario, not here
     assert (b.image.builder_tag, b.image.volume, b.image.keep_raw_image) == (
-        "droneos-builder:trixie", "otp-droneos-work", False)
-    assert cfg.image_config_path == cfg.droneos_dir / "droneos.yaml"
+        "otp-image-builder:trixie", "otp-image-work", False)
+    i = cfg.image
+    assert (i.name, i.hostname, i.timezone, i.user, i.password_hash) == (
+        "deb13-arm64-min", "pi5", "Europe/Kyiv", "pi", "")
+    assert (i.ssh, i.ssh_password_login, i.ssh_authorized_keys) == (False, True, [])
+    assert (i.wifi_ssid, i.wifi_password, i.wifi_country, i.wifi_hidden) == ("", "", "UA", False)
     assert cfg.docker.binary == "docker" and cfg.docker.start_desktop is True
     assert cfg.docker.idle_timeout == 1800
     if sys.platform == "win32":
@@ -98,6 +101,9 @@ def test_retired_attributes_are_gone(tmp_path):
     cfg = load(tmp_path)
     assert not hasattr(cfg, "storage")
     assert not hasattr(cfg, "config_path")
+    assert not hasattr(cfg, "droneos_dir") and not hasattr(cfg, "image_config_path")
+    assert not hasattr(cfg.builds.image, "config")
+    assert "droneos" not in DEFAULTS["paths"] and "config" not in DEFAULTS["builds"]["image"]
     assert not hasattr(cfg.provisioning, "secure_boot")
     assert not hasattr(cfg.provisioning, "mode")
     assert not hasattr(cfg.builds.gadget, "source")
@@ -222,13 +228,13 @@ def test_overrides_beat_settings(tmp_path):
     assert cfg.provisioning.jtag_lock is True
     assert cfg.builds.auto is False
     assert cfg.builds.image.overrides == ["A=1"] and cfg.builds.image.keep_raw_image is True
-    assert cfg.builds.image.builder_tag == "droneos-builder:trixie"   # untouched default in a partial section
+    assert cfg.builds.image.builder_tag == "otp-image-builder:trixie"   # untouched default in a partial section
 
 
 def test_env_beats_settings_and_overrides_beat_env(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     settings = {"server": {"port": "1111", "host": "10.0.0.1"},
-                "paths": {"work": str(tmp_path / "sheetwork"), "droneos": "dos"},
+                "paths": {"work": str(tmp_path / "sheetwork")},
                 "provisioning": {"default_mode": "secure"}}
     cfg = load_config(settings=settings, repo_root=repo)
     assert cfg.server.port == 1111 and cfg.work_dir == tmp_path / "sheetwork"
@@ -238,7 +244,7 @@ def test_env_beats_settings_and_overrides_beat_env(tmp_path, monkeypatch):
     cfg = load_config(settings=settings, repo_root=repo)
     assert cfg.server.port == 2222 and cfg.work_dir == tmp_path / "envwork"
     assert cfg.server.host == "10.0.0.1"                      # the environment says nothing about it
-    assert cfg.droneos_dir == repo.resolve() / "dos"
+    assert cfg.image_dir == repo.resolve() / "image"
     assert cfg.provisioning.default_mode == "secure"
 
     cfg = load_config(settings=settings, repo_root=repo,
@@ -248,9 +254,10 @@ def test_env_beats_settings_and_overrides_beat_env(tmp_path, monkeypatch):
 
 
 def test_empty_sections_keep_defaults(tmp_path):
-    cfg = load(tmp_path, settings={"server": None, "builds": {"image": None}, "docker": {}}, provisioning=None)
+    cfg = load(tmp_path, settings={"server": None, "builds": {"image": None}, "docker": {}, "image": None},
+               provisioning=None)
     assert cfg.server.port == 8765
-    assert cfg.builds.image.config == "droneos.yaml"
+    assert cfg.builds.image.builder_tag == "otp-image-builder:trixie" and cfg.image.hostname == "pi5"
     assert cfg.provisioning.default_mode == "open"
     assert cfg.docker.binary == "docker"
     assert cfg.unknown_keys == []
@@ -267,41 +274,24 @@ def test_relative_paths_are_repo_relative(tmp_path):
     cfg = load_config(
         repo_root=repo,
         overrides={"paths": {"work": "state"}, "server": {"browser": "tools/chrome.exe"}},
-        settings={"paths": {"droneos": "../dos"}, "docker": {"desktop_path": "D/docker.exe"}},
+        settings={"docker": {"desktop_path": "D/docker.exe"}},
     )
     r = repo.resolve()
     assert cfg.repo_root == r
     assert cfg.work_dir == r / "state"
-    assert cfg.droneos_dir == tmp_path.resolve() / "dos"
     assert cfg.server.browser == r / "tools" / "chrome.exe"
     assert cfg.docker.desktop_path == r / "D" / "docker.exe"
-    assert cfg.external_dir == r / "external" and cfg.web_dir == r
-    assert load_config(repo_root=repo, overrides={"paths": {"work": "state"}}).droneos_dir == r / "external" / "droneos"
+    assert cfg.external_dir == r / "external" and cfg.web_dir == r and cfg.image_dir == r / "image"
 
 
-def test_image_config_is_relative_to_droneos(tmp_path):
-    dos = tmp_path / "dos"
-    cfg = load(tmp_path, repo_root=tmp_path / "repo", paths={"droneos": str(dos)},
-               settings={"builds": {"image": {"config": "configs/x.yaml"}}})
-    assert cfg.builds.image.config == "configs/x.yaml"
-    assert cfg.image_config_path == dos / "configs" / "x.yaml"      # not under the repository
-    assert "/src/" + cfg.builds.image.config == "/src/configs/x.yaml"
-    # an absolute path inside the checkout is kept relative (POSIX), a ./.. path is normalised
-    cfg = load(tmp_path, paths={"droneos": str(dos)},
-               builds={"image": {"config": str(dos / "configs" / "y.yaml")}})
-    assert cfg.builds.image.config == "configs/y.yaml"
-    cfg = load(tmp_path, paths={"droneos": str(dos)}, builds={"image": {"config": "./configs/../z.yaml"}})
-    assert cfg.builds.image.config == "z.yaml"
-
-
-@pytest.mark.parametrize("where", ["absolute", "dotdot"])
-def test_image_config_outside_droneos_is_absolute(tmp_path, where):
-    outside = tmp_path / "elsewhere" / "img.yaml"
-    value = str(outside) if where == "absolute" else "../elsewhere/img.yaml"
-    cfg = load(tmp_path, paths={"droneos": str(tmp_path / "dos")}, builds={"image": {"config": value}})
-    assert Path(cfg.builds.image.config).is_absolute()
-    assert cfg.image_config_path == outside
-    assert cfg.droneos_dir / cfg.builds.image.config == outside
+@pytest.mark.parametrize("layer", ["settings", "overrides"])
+def test_retired_droneos_keys_are_dropped(tmp_path, caplog, layer):
+    tree = {"paths": {"droneos": "external/droneos"}, "builds": {"image": {"config": "droneos.yaml"}}}
+    cfg = load(tmp_path, settings=tree) if layer == "settings" else load(tmp_path, **tree)
+    assert cfg.unknown_keys == [] and not hasattr(cfg, "droneos_dir")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(f"config {layer}: paths.droneos is retired" in m for m in msgs)
+    assert any(f"config {layer}: builds.image.config is retired" in m for m in msgs)
 
 
 def test_server_browser_path(tmp_path):
@@ -419,9 +409,24 @@ def test_ints_given_as_text(tmp_path, section, key, text, expected):
         ({"docker": {"idle_timeout": "-1"}}, "docker.idle_timeout"),
         ({"builds": {"image": {"overrides": {"a": 1}}}}, "builds.image.overrides"),
         ({"builds": {"image": {"overrides": [{"a": 1}]}}}, "builds.image.overrides"),
-        ({"builds": {"image": {"config": ""}}}, "builds.image.config"),
         ({"builds": {"tools": {"image_tag": ["x"]}}}, "builds.tools.image_tag"),
-        ({"paths": {"droneos": ""}}, "paths.droneos"),
+        ({"image": {"hostname": "bad_host"}}, "image.hostname"),
+        ({"image": {"hostname": "-x"}}, "image.hostname"),
+        ({"image": {"hostname": ""}}, "image.hostname"),
+        ({"image": {"user": "root"}}, "image.user"),
+        ({"image": {"user": "Pi"}}, "image.user"),
+        ({"image": {"timezone": "Kyiv time"}}, "image.timezone"),
+        ({"image": {"password_hash": "plain-password"}}, "image.password_hash"),
+        ({"image": {"password_hash": "$6$a b$c"}}, "image.password_hash"),
+        ({"image": {"ssh": "maybe"}}, "image.ssh"),
+        ({"image": {"ssh_authorized_keys": ["not a key"]}}, "image.ssh_authorized_keys"),
+        ({"image": {"wifi_ssid": "x" * 33}}, "image.wifi_ssid"),
+        ({"image": {"wifi_ssid": " lead"}}, "image.wifi_ssid"),
+        ({"image": {"wifi_password": "short"}}, "image.wifi_password"),
+        ({"image": {"wifi_password": "x" * 64}}, "image.wifi_password"),
+        ({"image": {"wifi_password": "naïve-pass"}}, "image.wifi_password"),
+        ({"image": {"wifi_country": "Ukraine"}}, "image.wifi_country"),
+        ({"image": {"name": "bad name"}}, "image.name"),
         ({"provisioning": {"secure_boot": "perhaps"}}, "provisioning.secure_boot"),
     ],
 )
@@ -615,11 +620,13 @@ def test_summary(make_cfg, tmp_path):
     s = cfg.summary()
     text = json.dumps(s)     # JSON-safe
     assert secret not in text
-    assert set(s) == {"version", "repo_root", "work_dir", "droneos_dir", "settings", "server", "provisioning",
-                      "builds", "docker", "unknown_keys"}
+    assert set(s) == {"version", "repo_root", "work_dir", "image_dir", "settings", "server", "provisioning",
+                      "image", "builds", "docker", "unknown_keys"}
     assert s["version"] == __version__
     assert s["repo_root"] == str(cfg.repo_root) and s["work_dir"] == str(cfg.work_dir)
-    assert s["droneos_dir"] == str(cfg.droneos_dir)
+    assert s["image_dir"] == str(cfg.image_dir)
+    assert s["image"]["hostname"] == "pi5" and s["image"]["password_set"] is False
+    assert "password_hash" not in s["image"] and "wifi_password" not in s["image"]
     assert s["settings"] == "Google Sheets (worksheet settings)"
     assert s["server"] == {"host": "127.0.0.1", "port": 8765, "open_browser": False,
                            "browser": str(tmp_path / "chrome.exe")}
@@ -633,9 +640,8 @@ def test_summary(make_cfg, tmp_path):
     assert s["builds"]["tools"] == {"image_tag": "otp-tools:latest"}
     assert s["builds"]["gadget"] == {"targets": "pi5-family", "image_tag": "otp-gadget-builder:trixie",
                                      "volume": "otp-pgm-work"}
-    img = s["builds"]["image"]
-    assert img["config"] == "droneos.yaml" and img["overrides"] == []
-    assert img["config_path"] == str(cfg.image_config_path)
+    assert s["builds"]["image"] == {"overrides": [], "builder_tag": "otp-image-builder:trixie",
+                                    "volume": "otp-image-work", "keep_raw_image": False}
     d = s["docker"]
     assert set(d) == {"binary", "start_desktop", "desktop_path", "idle_timeout"}
     assert d["desktop_path"] == (str(cfg.docker.desktop_path) if cfg.docker.desktop_path else None)
@@ -656,9 +662,9 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     server_before = copy.deepcopy(cfg.server)
     new = load_config(
         repo_root=repo,
-        settings={"paths": {"droneos": str(tmp_path / "dos2")},
-                  "provisioning": {"default_mode": "secure", "jtag_lock": "true", "firmware_channel": "latest"},
-                  "builds": {"auto": "false", "image": {"config": "c/y.yaml", "overrides": ["A=1"]}},
+        settings={"provisioning": {"default_mode": "secure", "jtag_lock": "true", "firmware_channel": "latest"},
+                  "image": {"hostname": "drone9", "wifi_ssid": "Field"},
+                  "builds": {"auto": "false", "image": {"overrides": ["A=1"]}},
                   "docker": {"binary": "podman", "idle_timeout": "5"},
                   "typo": "1"},
         overrides={"paths": {"work": str(tmp_path / "other")}, "server": {"port": 1234, "host": "10.1.1.1"}},
@@ -666,12 +672,11 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     cfg_id = id(cfg)
     cfg.apply_settings(new)
     assert id(cfg) == cfg_id
-    assert cfg.droneos_dir == tmp_path / "dos2"
+    assert cfg.image == new.image and cfg.image.hostname == "drone9" and cfg.image.wifi_ssid == "Field"
     assert cfg.provisioning == new.provisioning and cfg.provisioning.default_mode == "secure"
     assert cfg.provisioning.jtag_lock is True and cfg.provisioning.firmware_channel == "latest"
     assert cfg.builds == new.builds and cfg.builds.auto is False and cfg.builds.image.overrides == ["A=1"]
     assert cfg.docker == new.docker and cfg.docker.binary == "podman" and cfg.docker.idle_timeout == 5
-    assert cfg.image_config_path == tmp_path / "dos2" / "c" / "y.yaml"
     assert cfg.unknown_keys == ["typo"] and cfg.unknown_keys is not new.unknown_keys
     # bootstrap parts stay
     assert cfg.server == server_before and cfg.server.port == 9001 and cfg.server.host == "0.0.0.0"
@@ -682,7 +687,7 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     # a later clean sheet clears the reported unknown keys again
     cfg.apply_settings(load_config(repo_root=repo, overrides={"paths": {"work": str(tmp_path / "w")}}))
     assert cfg.unknown_keys == [] and cfg.provisioning.default_mode == "open"
-    assert cfg.droneos_dir == repo.resolve() / "external" / "droneos"
+    assert cfg.image.hostname == "pi5"
 
 
 def test_make_cfg_fixture_is_isolated(make_cfg, tmp_path):
@@ -693,3 +698,34 @@ def test_make_cfg_fixture_is_isolated(make_cfg, tmp_path):
     assert cfg.provisioning.default_mode == "secure"
     assert cfg.builds.auto is False and cfg.server.open_browser is False
     assert cfg.bootstrap == {} and cfg.unknown_keys == []
+
+
+# --------------------------------------------------------------------------------------------------
+# image.* (what goes into the OS image)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_image_settings_are_normalised(tmp_path):
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD op@station"
+    cfg = load(tmp_path, settings={"image": {
+        "hostname": " Drone-7 ", "user": "operator", "timezone": "UTC", "ssh": "yes", "ssh_password_login": "no",
+        "ssh_authorized_keys": f"{key}\r\n\n  ", "wifi_ssid": "Field Net", "wifi_password": "  spaced pass  ",
+        "wifi_country": "pl", "wifi_hidden": "true", "password_hash": " $6$salt$abc ", "name": "fleet-img.v2"}})
+    i = cfg.image
+    assert (i.hostname, i.user, i.timezone, i.name) == ("drone-7", "operator", "UTC", "fleet-img.v2")
+    assert i.ssh is True and i.ssh_password_login is False and i.ssh_authorized_keys == [key]
+    assert i.wifi_ssid == "Field Net" and i.wifi_password == "  spaced pass  "    # spaces belong to a passphrase
+    assert i.wifi_country == "PL" and i.wifi_hidden is True and i.password_hash == "$6$salt$abc"
+
+
+def test_image_wifi_password_forms(tmp_path):
+    hexkey = "AB" * 32
+    assert load(tmp_path, image={"wifi_password": hexkey}).image.wifi_password == hexkey.lower()
+    assert load(tmp_path, image={"wifi_password": "x" * 63}).image.wifi_password == "x" * 63
+    assert load(tmp_path, image={"wifi_password": None}).image.wifi_password == ""
+    assert load(tmp_path, image={"wifi_country": "00"}).image.wifi_country == "00"
+
+
+def test_image_section_is_a_setting(tmp_path):
+    cfg = load(tmp_path, settings={"image": {"hostname": "a1"}}, image={"user": "b1"})
+    assert cfg.image.hostname == "a1" and cfg.image.user == "b1"      # sheet and overrides merge per key

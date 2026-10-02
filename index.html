@@ -45,6 +45,52 @@
                 </table>
             </div>
         </section>
+
+        <section class="panel" id="image-panel">
+            <div class="panel-head">
+                <h2>OS image</h2>
+                <button id="btn-image-revert" class="small push" disabled>Revert</button>
+                <button id="btn-image-save" class="small primary" disabled>Save</button>
+            </div>
+            <p class="hint">Written into both images (open and secure). Saving rebuilds them on the server; stage 3 waits for the new image.</p>
+            <form id="image-form" class="form" autocomplete="off">
+                <h3>System</h3>
+                <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63"></label>
+                <label class="field"><span>Time zone</span><select name="timezone"></select></label>
+                <h3>Account</h3>
+                <label class="field"><span>User</span><input type="text" name="user" class="mono" spellcheck="false" maxlength="32"></label>
+                <div class="field"><span>Password</span>
+                    <div class="pw">
+                        <input type="password" name="password" autocomplete="new-password" spellcheck="false">
+                        <button type="button" class="small" data-show="password" title="Show the typed password">show</button>
+                        <button type="button" class="small" data-remove="password" title="Remove the password: nobody can log in with one">remove</button>
+                    </div>
+                </div>
+                <h3>SSH</h3>
+                <div class="checks">
+                    <label class="check"><input type="checkbox" name="ssh"> SSH server</label>
+                    <label class="check"><input type="checkbox" name="ssh_password_login"> password login</label>
+                </div>
+                <label class="field"><span>Authorized keys</span><textarea name="ssh_authorized_keys" rows="3" class="mono" spellcheck="false" placeholder="ssh-ed25519 AAAA… user@host (one per line)"></textarea></label>
+                <h3>Wi-Fi</h3>
+                <label class="field"><span>Network (SSID)</span><input type="text" name="wifi_ssid" spellcheck="false" maxlength="32" placeholder="empty = no Wi-Fi"></label>
+                <div class="field"><span>Password</span>
+                    <div class="pw">
+                        <input type="password" name="wifi_password" autocomplete="new-password" spellcheck="false" maxlength="64">
+                        <button type="button" class="small" data-show="wifi_password" title="Show the typed password">show</button>
+                        <button type="button" class="small" data-remove="wifi_password" title="Remove the password: an open network">remove</button>
+                    </div>
+                </div>
+                <label class="field"><span>Country</span><select name="wifi_country"></select></label>
+                <div class="checks">
+                    <label class="check"><input type="checkbox" name="wifi_hidden"> hidden network</label>
+                </div>
+                <h3>Image</h3>
+                <label class="field"><span>Name</span><input type="text" name="name" class="mono" spellcheck="false" maxlength="64"></label>
+            </form>
+            <ul id="image-warnings" class="image-warnings"></ul>
+            <div id="image-status" class="hint"></div>
+        </section>
     </div>
 
     <div class="col-right">

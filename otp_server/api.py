@@ -216,6 +216,17 @@ def api_router(svc: Any) -> APIRouter:
         svc.google_logout()
         return {"ok": True}
 
+    # ---------------------------------------------------------------- image settings
+    @r.get("/image")
+    def get_image() -> JSONResponse:
+        require_google()
+        return JSONResponse(svc.image_settings(), headers=NO_STORE)
+
+    @r.post("/image")
+    def save_image(body: Any = Body(default=None)) -> JSONResponse:
+        require_google()
+        return JSONResponse(call(svc.save_image_settings, body_dict(body)), headers=NO_STORE)
+
     # ---------------------------------------------------------------- modules
     @r.get("/modules")
     def list_modules() -> JSONResponse:

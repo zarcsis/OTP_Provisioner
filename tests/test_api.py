@@ -138,7 +138,7 @@ class FakeArtifacts:
     real facade it plans stage 3 in the board's scenario (``ModuleService.mode_of``)."""
 
     TITLES = {"tools": "Build otp-tools image", "gadget": "Build fastboot gadget",
-              "image": "Build droneos images (clear + crypt)"}
+              "image": "Build OS images (clear + crypt)"}
 
     def __init__(self, root: Path, jobs: JobManager, modules: ModuleService):
         self.jobs = jobs
@@ -295,12 +295,24 @@ class FakeSettings:
         self.error = error
         self.error_type = StoreError
         self.reads = 0
+        self.writes: list[dict] = []
+        self.write_error: str | None = None
 
     def read(self) -> dict:
         self.reads += 1
         if self.error:
             raise self.error_type(self.error)
         return dict(self.rows)
+
+    def write(self, updates: dict) -> dict:
+        from otp_server.settings import encode_value
+
+        if self.write_error:
+            raise StoreError(self.write_error)
+        written = {k: encode_value(v) for k, v in updates.items()}
+        self.writes.append(written)
+        self.rows.update(written)
+        return written
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -809,13 +821,13 @@ def test_stage_manifest_ok(env):
 
 def test_stage_manifest_not_ready_409(env):
     hello(env.client)
-    job = env.jobs.submit("image", "Build droneos images (clear + crypt)", lambda j: j.log("x"))
+    job = env.jobs.submit("image", "Build OS images (clear + crypt)", lambda j: j.log("x"))
     wait_job(job)
-    env.artifacts.not_ready[3] = NotReady("the droneos image for the open scenario (clear) is not built yet", job)
+    env.artifacts.not_ready[3] = NotReady("the OS image for the open scenario (clear) is not built yet", job)
     r = env.client.get(f"/api/modules/{SERIAL}/stage/3")
     assert r.status_code == 409
     body = r.json()
-    assert body["ready"] is False and body["reason"] == "the droneos image for the open scenario (clear) is not built yet"
+    assert body["ready"] is False and body["reason"] == "the OS image for the open scenario (clear) is not built yet"
     assert set(body["job"]) == JOB_KEYS and body["job"]["id"] == job.id
     r2 = env.client.get(f"/api/modules/{SERIAL}/stage/2")  # NotReady without a job
     assert r2.status_code == 409 and r2.json() == {"ready": False, "reason": "no fastboot gadget yet", "job": None}
@@ -1493,3 +1505,115 @@ def test_host_header_hostname(value, want):
     from otp_server.app import host_header_hostname
 
     assert host_header_hostname(value) == want
+
+
+# ----------------------------------------------------------------------------------------------------
+# OS image settings (/api/image)
+# ----------------------------------------------------------------------------------------------------
+
+KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD op@station"
+
+
+def test_image_settings_get_and_save_without_a_sheet(env):
+    r = env.client.get("/api/image")
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+    view = r.json()
+    assert view["settings"]["hostname"] == "pi5" and view["settings"]["password_set"] is False
+    assert view["settings"]["ssh_authorized_keys"] == [] and view["settings"]["wifi_password_set"] is False
+    assert view["warnings"] == ["no password and no SSH key: nobody can log in as pi (console or SSH)"]
+    assert "Europe/Kyiv" in view["choices"]["timezones"] and ["UA", "Ukraine"] in view["choices"]["countries"]
+
+    r = env.client.post("/api/image", json={
+        "hostname": "Drone-7", "password": "s3cret $x", "ssh": True, "ssh_password_login": False,
+        "ssh_authorized_keys": [KEY], "wifi_ssid": "Field Net", "wifi_password": " pass phrase ",
+        "wifi_country": "pl", "wifi_hidden": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["saved"] == ["image.hostname", "image.password_hash", "image.ssh", "image.ssh_authorized_keys",
+                             "image.ssh_password_login", "image.wifi_country", "image.wifi_hidden",
+                             "image.wifi_password", "image.wifi_ssid"]
+    st = body["settings"]
+    assert st["hostname"] == "drone-7" and st["wifi_country"] == "PL" and st["password_set"] is True
+    assert st["sudo"] == "passwd" and st["ssh_authorized_keys"] == [KEY] and body["warnings"] == []
+    img = env.cfg.image
+    assert img.password_hash.startswith("$6$") and img.wifi_password == " pass phrase "
+    from otp_server.passhash import verify
+    assert verify("s3cret $x", img.password_hash)
+    for text in (r.text, env.client.get("/api/image").text, env.client.get("/api/status").text):
+        assert "s3cret" not in text and "pass phrase" not in text and img.password_hash not in text
+
+    # null = unchanged, "" = remove
+    r = env.client.post("/api/image", json={"password": None, "wifi_password": None, "hostname": "drone-7"})
+    assert r.json()["saved"] == ["image.hostname"] and env.cfg.image.password_hash == img.password_hash
+    r = env.client.post("/api/image", json={"password": "", "wifi_password": ""})
+    assert r.json()["settings"]["password_set"] is False and r.json()["settings"]["wifi_password_set"] is False
+    assert env.cfg.image.password_hash == "" and env.cfg.image.wifi_password == ""
+    assert env.client.post("/api/image", json={}).json()["saved"] == []
+
+
+@pytest.mark.parametrize("body, needle", [
+    ({"hostname": "bad_host"}, "image.hostname"),
+    ({"wifi_password": "short"}, "image.wifi_password"),
+    ({"ssh_authorized_keys": ["not a key"]}, "image.ssh_authorized_keys"),
+    ({"user": "root"}, "image.user"),
+    ({"timezone": "Europe/Kiev"}, "image.timezone"),
+    ({"wifi_country": "XX"}, "image.wifi_country"),
+    ({"password": 5}, "password must be a string"),
+    ({"wifi_password": ["x"]}, "wifi_password must be a string"),
+    ({"password_hash": "$6$a$b"}, "unknown image setting(s): password_hash"),
+    ({"nope": 1, "zzz": 2}, "unknown image setting(s): nope, zzz"),
+])
+def test_image_settings_validation(env, body, needle):
+    before = env.cfg.image
+    r = env.client.post("/api/image", json=body)
+    assert r.status_code == 400 and needle in r.json()["detail"], r.text
+    assert env.cfg.image == before                        # nothing applied
+
+
+def test_image_settings_body_must_be_an_object(env):
+    assert env.client.post("/api/image", json=[1, 2]).status_code == 400
+
+
+def test_image_settings_go_to_the_sheet_and_start_a_rebuild(genv):
+    genv.account.signed_in = True
+    genv.svc.auto_build = True
+    assert genv.client.get("/api/image").status_code == 200
+    calls = genv.artifacts.auto_calls
+    r = genv.client.post("/api/image", json={"hostname": "drone8", "password": "pw", "wifi_ssid": "N",
+                                             "wifi_password": "password1"})
+    assert r.status_code == 200, r.text
+    assert len(genv.sheet.writes) == 1
+    written = genv.sheet.writes[0]
+    assert set(written) == {"image.hostname", "image.password_hash", "image.wifi_ssid", "image.wifi_password"}
+    assert written["image.password_hash"].startswith("$6$") and "pw" != written["image.password_hash"]
+    assert written["image.wifi_password"] == "password1"           # stored as typed (it must reach the board)
+    assert genv.cfg.image.hostname == "drone8"                      # read back from the sheet
+    assert r.json()["settings"]["hostname"] == "drone8"
+    deadline = __import__("time").monotonic() + 5
+    while genv.artifacts.auto_calls == calls and __import__("time").monotonic() < deadline:
+        __import__("time").sleep(0.01)
+    assert genv.artifacts.auto_calls == calls + 1                  # the images are rebuilt
+
+
+def test_image_settings_without_auto_build_do_not_build(genv):
+    genv.account.signed_in = True
+    genv.svc.auto_build = False
+    calls = genv.artifacts.auto_calls
+    assert genv.client.post("/api/image", json={"hostname": "drone9"}).status_code == 200
+    __import__("time").sleep(0.05)
+    assert genv.artifacts.auto_calls == calls
+
+
+def test_image_settings_sheet_failure_is_503(genv):
+    genv.account.signed_in = True
+    genv.sheet.write_error = "Google unreachable (ConnectionError)"
+    r = genv.client.post("/api/image", json={"hostname": "drone9"})
+    assert r.status_code == 503 and "Google unreachable" in r.json()["detail"]
+    assert genv.cfg.image.hostname == "pi5"
+
+
+def test_image_settings_need_the_google_login(genv):
+    for method, body in (("GET", None), ("POST", {"hostname": "x1"})):
+        r = genv.client.request(method, "/api/image", json=body)
+        assert r.status_code == 401
+    assert genv.sheet.writes == []

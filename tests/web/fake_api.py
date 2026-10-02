@@ -18,6 +18,7 @@ import binascii
 import copy
 import hashlib
 import json
+import pathlib
 import re
 import time
 from collections import Counter
@@ -32,7 +33,7 @@ MODES = ("open", "secure")
 DEFAULT_MODE = "open"
 
 _JOBS: dict[str, dict[str, Any]] = {
-    "b7c1d2e3": {"id": "b7c1d2e3", "target": "image", "title": "Build droneos images (clear + crypt)", "status": "running",
+    "b7c1d2e3": {"id": "b7c1d2e3", "target": "image", "title": "Build OS images (clear + crypt)", "status": "running",
                  "started": "2026-09-30T12:40:02Z", "finished": None, "rc": None, "error": "", "lines": 1834},
     "a1b2c3d4": {"id": "a1b2c3d4", "target": "gadget", "title": "Build fastboot gadget", "status": "succeeded",
                  "started": "2026-09-30T11:02:10Z", "finished": "2026-09-30T11:19:45Z", "rc": 0, "error": "", "lines": 5120},
@@ -101,12 +102,80 @@ MODULES: list[dict[str, Any]] = copy.deepcopy(_INITIAL_MODULES)
 _STATUS_OVERRIDES: dict[str, Any] = {}
 _COUNTS: Counter = Counter()
 
+#: The image.* settings (otp_server.config.ImageCfg) behind GET/POST /api/image; secrets as the server keeps them.
+_INITIAL_IMAGE: dict[str, Any] = {
+    "name": "deb13-arm64-min", "hostname": "pi5", "timezone": "Europe/Kyiv", "user": "pi", "password_hash": "",
+    "ssh": False, "ssh_password_login": True, "ssh_authorized_keys": [], "wifi_ssid": "", "wifi_password": "",
+    "wifi_country": "UA", "wifi_hidden": False,
+}
+IMAGE: dict[str, Any] = copy.deepcopy(_INITIAL_IMAGE)
+IMAGE_FIELDS = ("name", "hostname", "timezone", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
+                "wifi_ssid", "wifi_country", "wifi_hidden")
+
 
 def reset() -> None:
-    """Back to the canned state (modules, status overrides, request counts)."""
+    """Back to the canned state (modules, status overrides, request counts, image settings)."""
     MODULES[:] = copy.deepcopy(_INITIAL_MODULES)
     _STATUS_OVERRIDES.clear()
     _COUNTS.clear()
+    IMAGE.clear()
+    IMAGE.update(copy.deepcopy(_INITIAL_IMAGE))
+
+
+_CHOICES_FILE = pathlib.Path(__file__).resolve().parents[2] / "otp_server" / "image_choices.json"
+
+
+def _choices() -> dict[str, Any]:
+    """The real lists (otp_server/image_choices.json): what the page renders is what the server offers."""
+    d = json.loads(_CHOICES_FILE.read_text(encoding="utf-8"))
+    return {"timezones": d["timezones"], "countries": d["countries"], "_valid": set(d["timezones"]) | set(d["timezones_valid"])}
+
+
+def image_view() -> dict[str, Any]:
+    """otp_server.app.Services.image_settings: no password or hash, only whether they are set."""
+    i = IMAGE
+    sudo = "passwd" if i["password_hash"] else ("nopasswd" if i["ssh"] and i["ssh_authorized_keys"] else "none")
+    view = {k: copy.deepcopy(i[k]) for k in ("name", "hostname", "timezone", "user", "ssh", "ssh_password_login",
+                                             "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")}
+    view.update(password_set=bool(i["password_hash"]), wifi_password_set=bool(i["wifi_password"]), sudo=sudo)
+    warnings = []
+    if not i["password_hash"] and not (i["ssh"] and i["ssh_authorized_keys"]):
+        warnings.append(f"no password and no SSH key: nobody can log in as {i['user']} (console or SSH)")
+    if i["wifi_ssid"] and not i["wifi_password"]:
+        warnings.append(f"Wi-Fi {i['wifi_ssid']!r} has no password: the board joins it as an open network")
+    ch = _choices()
+    return {"settings": view, "warnings": warnings, "choices": {"timezones": ch["timezones"], "countries": ch["countries"]}}
+
+
+def _save_image(data: Any) -> tuple[int, Any]:
+    """otp_server.app.Services.save_image_settings (a few of its checks; the real ones live in config.py)."""
+    if not isinstance(data, dict):
+        return 400, {"detail": "body must be a JSON object"}
+    unknown = sorted(set(data) - set(IMAGE_FIELDS) - {"password", "wifi_password"})
+    if unknown:
+        return 400, {"detail": "unknown image setting(s): " + ", ".join(unknown)}
+    changed = {k: data[k] for k in IMAGE_FIELDS if data.get(k) is not None}
+    host = changed.get("hostname")
+    if host is not None and not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", str(host).strip().lower()):
+        return 400, {"detail": f"config image.hostname: hostname {host!r}: lower-case letters, digits and '-'"}
+    ch = _choices()
+    if changed.get("timezone") is not None and str(changed["timezone"]).strip() not in ch["_valid"]:
+        return 400, {"detail": f"config image.timezone: time zone {changed['timezone']!r} is not in the image's tzdata"}
+    if changed.get("wifi_country") is not None and str(changed["wifi_country"]).strip().upper() not in {c for c, _ in ch["countries"]}:
+        return 400, {"detail": f"config image.wifi_country: Wi-Fi country {changed['wifi_country']!r} is not in wireless-regdb"}
+    if data.get("password") is not None:
+        changed["password_hash"] = ("$6$fakesalt$" + "x" * 86) if data["password"] else ""
+    if data.get("wifi_password") is not None:
+        pw = data["wifi_password"]
+        if pw and not 8 <= len(pw) <= 63:
+            return 400, {"detail": "config image.wifi_password: Wi-Fi password: 8 to 63 characters"}
+        changed["wifi_password"] = pw
+    if "hostname" in changed:
+        changed["hostname"] = str(changed["hostname"]).strip().lower()
+    if "wifi_country" in changed:
+        changed["wifi_country"] = str(changed["wifi_country"]).strip().upper()
+    IMAGE.update(changed)
+    return 200, {**image_view(), "saved": sorted(f"image.{k}" for k in changed)}
 
 
 def _merge(dst: dict, src: dict) -> dict:
@@ -261,8 +330,12 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
                               "settings": {"ok": False, "error": "not signed in to Google"}})
         return 200, {"ok": True}
     st = status()
-    if rest[:1] in (["modules"], ["builds"], ["fastboot"]) and st.get("google_ready") is False:
+    if rest[:1] in (["modules"], ["builds"], ["fastboot"], ["image"]) and st.get("google_ready") is False:
         return 401, {"detail": _google_problem(st)}
+    if method == "GET" and rest == ["image"]:
+        return 200, image_view()
+    if method == "POST" and rest == ["image"]:
+        return _save_image(data)
     if method == "GET" and rest == ["modules"]:
         return 200, sorted(MODULES, key=lambda m: m["updated"], reverse=True)
     if len(rest) >= 2 and rest[0] == "modules" and rest[1] != "hello":
@@ -308,14 +381,15 @@ def job_log_lines(job: dict[str, Any]) -> list[str]:
     """A plausible log for the SSE endpoint."""
     if job["target"] == "image":
         return [
-            "==> droneos image (crypt) already built: deb13-arm64-min-crypt-368e8f0-e2798183",
+            "==> OS image (crypt) already built: deb13-arm64-min-crypt-v2.8.0-e2798183",
             "==> ensure docker daemon: ok (29.6.0)",
             "==> ensure arm64 emulation: aarch64",
-            "==> docker build -t droneos-builder:trixie external/droneos/docker",
+            "==> docker build -t otp-image-builder:trixie image/docker",
             "#8 [5/7] RUN apt-get install -y --no-install-recommends mmdebstrap genimage ...",
             "#8 DONE 41.2s",
-            "==> droneos 368e8f0 (clear): /src/droneos.yaml IGconf_image_pmap=clear",
-            "I: rpi-image-gen v2.8.0, config droneos.yaml, layer image-rpios (pmap clear)",
+            "==> rpi-image-gen v2.8.0 (clear): IGconf_image_pmap=clear",
+            "==> otp-image.yaml (from the image.* settings):",
+            "I: rpi-image-gen v2.8.0, config otp-image.yaml, layer image-rpios (pmap clear)",
             "I: bdebstrap: resolving 412 packages",
             "I: Retrieved 412 packages (138 MB)",
             "I: Unpacking base system ...",

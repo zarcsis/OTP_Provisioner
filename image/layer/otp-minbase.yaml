@@ -1,0 +1,19 @@
+# METABEGIN
+# X-Env-Layer-Name: otp-minbase
+# X-Env-Layer-Category: suite
+# X-Env-Layer-Desc: Debian Trixie with apt, utils, wired and wifi networking and
+#  the user1 account: rpi-image-gen's trixie-minbase without openssh-server. The
+#  station adds the openssh-server layer only when SSH is switched on.
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Requires: debian-trixie-arm64-multi,
+#  rpi-debian-trixie,
+#  rpi-misc-utils,
+#  rpi-essential-base,
+#  rpi-misc-skel,
+#  systemd-net-min,
+#  device-user-admin,
+#  systemd-timesyncd,
+#  wireless-regulatory,
+#  iwd
+# METAEND
+---

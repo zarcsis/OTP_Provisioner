@@ -6,7 +6,7 @@
       def test_x(make_cfg, tmp_path):
           cfg = make_cfg(tmp_path)                                         # defaults
           cfg = make_cfg(tmp_path, provisioning={"default_mode": "secure"})  # nested overrides
-          cfg = make_cfg(tmp_path, repo_root=fake_repo, paths={"droneos": str(tmp_path / "droneos")})
+          cfg = make_cfg(tmp_path, repo_root=fake_repo, image={"hostname": "drone7"})
 
   Signature: ``make_cfg(tmp_path, *, repo_root=None, ensure_dirs=True, **overrides) -> Config``.
 

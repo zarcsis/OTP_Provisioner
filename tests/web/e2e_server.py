@@ -8,7 +8,7 @@ nothing is gated (``/api/status`` says ``google: null``, ``google_ready: true``)
 server itself (stage files that need a per-board quick build are still prepared, as in production).
 ``cfg = load_config(overrides=...)``: the defaults (= an empty settings sheet) plus ``server.port``, no browser,
 ``builds.auto`` off, ``paths.work`` from ``--work`` (default: the normal work dir, so the real tools image, gadget
-and droneos images are used) and every ``--set`` (values are JSON when they parse, else text).
+and OS images are used) and every ``--set`` (values are JSON when they parse, else text).
 
 ``--registry DIR``: every record the store writes is also dumped to ``DIR/<serial>.json`` -- secrets included,
 it is test data -- so the runner can check what the server stored (the registry itself stays in memory).

@@ -87,13 +87,29 @@ button.small { padding: 3px 8px; font-size: 12px; }
 button.big { padding: 9px 18px; font-size: 15px; }
 @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(210, 153, 34, 0.55); } 50% { box-shadow: 0 0 0 6px rgba(210, 153, 34, 0); } }
 
-input[type="text"], input[type="search"], select {
+input[type="text"], input[type="search"], input[type="password"], select, textarea {
     font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 8px; min-width: 200px; max-width: 100%;
 }
+textarea.mono, input.mono { font-family: var(--mono); font-size: 12.5px; }
+input:disabled, textarea:disabled { opacity: 0.5; }
 input.mono { font-family: var(--mono); }
 input.wide { width: 100%; }
 label.check { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
+
+/* ---------- OS image form ---------- */
+.form h3:first-child { margin-top: 4px; }
+.form .field { display: grid; gap: 3px; margin: 6px 0; min-width: 0; }
+.form .field > span { color: var(--muted); font-size: 12.5px; }
+.form .field input, .form .field textarea, .form .field select { width: 100%; min-width: 0; box-sizing: border-box; }
+.form .field textarea { resize: vertical; }
+.form .checks { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: end; margin: 6px 0; }
+.form .pw { display: flex; gap: 6px; align-items: center; }
+.form .pw input { flex: 1; width: auto; }
+.image-warnings { margin: 8px 0 0; padding-left: 18px; font-size: 12.5px; }
+.image-warnings:empty { display: none; }
+.image-warnings li { color: var(--warn); }
+#image-status.bad { color: var(--err); }
 
 /* ---------- board card ---------- */
 .serial-big { font-family: var(--mono); font-size: 30px; letter-spacing: 0.06em; color: var(--meta); margin: 8px 0 2px; word-break: break-all; }

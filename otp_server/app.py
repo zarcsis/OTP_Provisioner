@@ -169,6 +169,68 @@ class Services:
         self.auto_build_done = True
         threading.Thread(target=self.run_auto_build, name="auto-build", daemon=True).start()
 
+    # ------------------------------------------------------------------ image settings (the page's form)
+    #: Fields of POST /api/image besides the two passwords.
+    IMAGE_FIELDS = ("name", "hostname", "timezone", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
+                    "wifi_ssid", "wifi_country", "wifi_hidden")
+
+    def image_settings(self) -> dict:
+        """The ``image.*`` settings for the page: no password or hash, only whether they are set; plus the time
+        zones and Wi-Fi countries the image knows (``choices``)."""
+        from . import image_choices, imageconfig
+
+        img = self.cfg.image
+        view = imageconfig.public_view(img)
+        view["ssh_authorized_keys"] = list(img.ssh_authorized_keys)
+        return {"settings": view, "warnings": imageconfig.warnings(img), "choices": image_choices.page_view()}
+
+    def save_image_settings(self, body: dict) -> dict:
+        """Validate and save the image settings form; the image is rebuilt when ``builds.auto`` is on.
+
+        ``password`` / ``wifi_password``: absent or null = unchanged, ``""`` = remove, else the new value
+        (the account password is stored as a SHA-512 crypt hash, never as text).
+
+        :raises ValueError: an unknown field or an invalid value (HTTP 400).
+        :raises StoreError: the settings sheet could not be written (HTTP 503).
+        """
+        from dataclasses import asdict
+
+        from .config import parse_image
+        from .passhash import sha512_crypt
+        from .storage.base import StoreError
+
+        unknown = sorted(set(body) - set(self.IMAGE_FIELDS) - {"password", "wifi_password"})
+        if unknown:
+            raise ValueError("unknown image setting(s): " + ", ".join(unknown))
+        changed = {k: body[k] for k in self.IMAGE_FIELDS if k in body and body[k] is not None}
+        password = body.get("password")
+        if password is not None:
+            if not isinstance(password, str):
+                raise ValueError("password must be a string")
+            changed["password_hash"] = sha512_crypt(password) if password else ""
+        wifi_password = body.get("wifi_password")
+        if wifi_password is not None:
+            if not isinstance(wifi_password, str):
+                raise ValueError("wifi_password must be a string")
+            changed["wifi_password"] = wifi_password
+        if not changed:
+            return {**self.image_settings(), "saved": []}
+        merged = {**asdict(self.cfg.image), **changed}
+        img = parse_image(merged)                      # ValueError names the field
+        values = asdict(img)
+        updates = {f"image.{k}": values[k] for k in changed}
+        if self.settings is None:                      # no sheet wired (tests): apply in place
+            self.cfg.image = img
+        else:
+            self.settings.write(updates)
+            if not self.refresh_settings(force=True) or self.settings_error:
+                raise StoreError(self.settings_error or "the settings sheet could not be read back")
+        log.info("image settings saved: %s", ", ".join(sorted(updates)))
+        want = self.cfg.builds.auto if self.auto_build is None else self.auto_build
+        if want and self.artifacts is not None:
+            threading.Thread(target=self.run_auto_build, name="image-settings-build", daemon=True).start()
+        return {**self.image_settings(), "saved": sorted(updates)}
+
     def settings_status(self) -> dict:
         return {
             "ok": self.account is None or self.settings_loaded_at is not None,

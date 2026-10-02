@@ -34,16 +34,16 @@ def test_mount_specs():
 
 def test_run_argv_order():
     argv = DockerRunner.run_argv(
-        "droneos-builder:trixie", ["--in-container", "-B", "/work"],
+        "otp-image-builder:trixie", ["--in-container", "-B", "/work"],
         mounts=[Mount("/d", "/src", readonly=True), Mount("vol", "/work", "volume")],
-        env={"DRONEOS_IN_CONTAINER": "1", "DRONEOS_VERSION": "v1"}, privileged=True,
-        platform="linux/arm64", hostname="droneos-builder", interactive=True)
+        env={"OTP_IMAGE_IN_CONTAINER": "1", "OTP_IMAGE_VERSION": "v1"}, privileged=True,
+        platform="linux/arm64", hostname="otp-image-builder", interactive=True)
     assert argv == ["run", "--rm", "-i", "--privileged", "--platform", "linux/arm64",
-                    "--hostname", "droneos-builder",
-                    "-e", "DRONEOS_IN_CONTAINER=1", "-e", "DRONEOS_VERSION=v1",
+                    "--hostname", "otp-image-builder",
+                    "-e", "OTP_IMAGE_IN_CONTAINER=1", "-e", "OTP_IMAGE_VERSION=v1",
                     "--mount", "type=bind,source=/d,target=/src,readonly",
                     "--mount", "type=volume,source=vol,target=/work",
-                    "droneos-builder:trixie", "--in-container", "-B", "/work"]
+                    "otp-image-builder:trixie", "--in-container", "-B", "/work"]
     assert DockerRunner.run_argv("img") == ["run", "--rm", "img"]
     assert DockerRunner.run_argv("img", entrypoint="")[:4] == ["run", "--rm", "--entrypoint", ""]
 

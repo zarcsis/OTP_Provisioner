@@ -1,13 +1,18 @@
-"""droneos image build (rpi-image-gen in Docker), IDP collect, and the stage-3 fastboot manifest.
+"""OS image build (rpi-image-gen in Docker), IDP collect, and the stage-3 fastboot manifest.
 
-Build = ``droneos build.sh --in-container`` in the owner's builder image (work volume keeps the image
-output), then ``image-collect.sh`` in the tools image copies ``image.json`` + the sparse partition images
-(split to ``max_piece_size``) into ``<work>/artifacts/image/<set>/``; Python validates them and writes
-``manifest.json`` + ``.complete`` and points ``current-<variant>.json`` at the set.
+Build = ``image/build.sh --in-container`` in the builder image (``image/docker``): rpi-image-gen
+(``image/rpi-image-gen``, a submodule) with the station layers (``image/layer``) and a config written
+from the ``image.*`` settings (:mod:`otp_server.imageconfig`), mounted at ``/cfg`` together with the
+secret files it points at; the work volume keeps the image output. Then ``image-collect.sh`` in the
+tools image copies ``image.json`` + the sparse partition images (split to ``max_piece_size``) into
+``<work>/artifacts/image/<set>/``; Python validates them and writes ``manifest.json`` + ``.complete``
+and points ``current-<variant>.json`` at the set.
 
 Two variants, one per provisioning mode: ``clear`` (``open``: plain root filesystem) and ``crypt``
 (``secure``: LUKS2 root container), built with ``IGconf_image_pmap=<variant>``. Each has its own current
-set, so switching the mode back and forth does not rebuild what is already there.
+set, so switching the mode back and forth does not rebuild what is already there. A set is served only
+while it matches the station: same rpi-image-gen revision, same image sources and the same image
+settings, overrides and partition map (``config_hash``).
 """
 from __future__ import annotations
 
@@ -17,16 +22,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import imageconfig
 from .. import imagejson
 from .. import sparse
 from ..docker import Mount
 from .common import (NotReady, StageFile, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
-                     git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, write_json)
+                     git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, rmtree,
+                     write_json)
 
 WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key the LUKS root is bound to; "
                 "a copy is exported to the station); it can never be changed or erased")
 WHY_ERASE = "wipes the whole storage device before the image is written"
 VARIANTS = ("clear", "crypt")
+#: Where the build container sees the config dir (config + secret files).
+CFG_MOUNT = "/cfg"
+#: The parts of ``image/`` an image depends on (rpi-image-gen itself is versioned by its commit).
+SOURCES = ("build.sh", "docker", "layer")
+#: Builds of one job before it gives up on settings that keep changing under it.
+MAX_ROUNDS = 3
 
 #: Where the gadget's otp-keyexport helper leaves its output (docker/gadget-helpers/otp-keyexport).
 KEY_EXPORT = {
@@ -38,7 +51,7 @@ KEY_EXPORT = {
 
 
 class ImageBuilder:
-    """droneos image sets (one current set per variant) and the stage-3 manifest."""
+    """OS image sets (one current set per variant) and the stage-3 manifest."""
 
     def __init__(self, cfg: Any, docker: Any, jobs: Any, tools: Any, hashes: Any):
         self.cfg = cfg
@@ -64,51 +77,82 @@ class ImageBuilder:
         return self.root / f"current-{check_variant(variant)}.json"
 
     @property
-    def droneos_dir(self) -> Path:
-        return Path(self.cfg.droneos_dir)
+    def source_dir(self) -> Path:
+        """``<repo>/image``: build.sh, docker/ (the builder image), layer/ (station layers), rpi-image-gen/."""
+        return Path(self.cfg.image_dir)
 
-    def config_path(self) -> Path:
-        p = Path(self.icfg.config)
-        return p if p.is_absolute() else self.droneos_dir / p
+    @property
+    def rig_dir(self) -> Path:
+        """The rpi-image-gen submodule."""
+        return self.source_dir / "rpi-image-gen"
+
+    def rendered(self) -> imageconfig.RenderedConfig:
+        """The rpi-image-gen config and secret files of the current ``image.*`` settings."""
+        return imageconfig.render(self.cfg.image, mount=CFG_MOUNT)
 
     def overrides(self, variant: str) -> list[str]:
         """``builds.image.overrides`` plus the variant's provisioning map (``IGconf_image_pmap``, last)."""
         return [*self.icfg.overrides, f"IGconf_image_pmap={check_variant(variant)}"]
 
-    def config_hash(self, variant: str) -> str:
-        """sha256(config text + overrides of the variant)[:8] — part of the set name."""
-        try:
-            text = self.config_path().read_bytes().replace(b"\r\n", b"\n").decode("utf-8", "replace")
-        except OSError:
-            text = ""
-        blob = text + "\n" + "\n".join(self.overrides(variant))
+    SOURCES_TTL = 10.0
+
+    def sources_hash(self) -> str:
+        """sha256 over build.sh, docker/ and layer/ of ``image/`` (line endings normalised), cached briefly."""
+        cached = getattr(self, "_sources_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self.SOURCES_TTL:
+            return cached[1]
+        h = hashlib.sha256()
+        for rel in SOURCES:
+            base = self.source_dir / rel
+            files = [base] if base.is_file() else sorted((f for f in base.rglob("*") if f.is_file()), key=str)
+            for f in files:
+                try:
+                    data = f.read_bytes().replace(b"\r\n", b"\n")
+                except OSError:
+                    data = b"<unreadable>"
+                h.update(f.relative_to(self.source_dir).as_posix().encode("utf-8") + b"\0" + data + b"\0")
+        value = h.hexdigest()[:16]
+        self._sources_cache = (now, value)
+        return value
+
+    def _config_hash(self, rendered: imageconfig.RenderedConfig, variant: str) -> str:
+        blob = "\n".join([rendered.digest(), self.sources_hash(), *self.overrides(variant)])
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+    def config_hash(self, variant: str) -> str:
+        """sha256(image settings incl. secret files + image sources + overrides of the variant)[:8] — part of
+        the set name. Changes whenever the image built now would differ."""
+        return self._config_hash(self.rendered(), variant)
 
     VERSION_TTL = 10.0   # status is polled every few seconds; git describe --dirty is not free on Windows
 
     def version(self, max_age: float | None = None) -> str:
-        """``git describe --tags --always --dirty`` of the droneos checkout (cached for a few seconds)."""
+        """``git describe --tags --always --dirty`` of the rpi-image-gen submodule (cached for a few seconds)."""
         ttl = self.VERSION_TTL if max_age is None else max_age
         cached = getattr(self, "_version_cache", None)
         now = time.monotonic()
         if cached is not None and now - cached[0] < ttl:
             return cached[1]
-        v = git_output(self.droneos_dir, "describe", "--tags", "--always", "--dirty") or "unknown"
+        v = git_output(self.rig_dir, "describe", "--tags", "--always", "--dirty") or "unknown"
         self._version_cache = (now, v)
         return v
 
-    def container_config(self) -> tuple[str, list[Mount]]:
-        """(-c argument, extra mounts): /src/<rel> inside the checkout, else /cfg/<name> with /cfg mounted."""
-        cfgp = self.config_path().resolve()
-        try:
-            rel = cfgp.relative_to(self.droneos_dir.resolve())
-            return "/src/" + rel.as_posix(), []
-        except ValueError:
-            return "/cfg/" + cfgp.name, [Mount.bind(cfgp.parent, "/cfg", readonly=True)]
+    def build_args(self, variant: str) -> list[str]:
+        """Arguments after the builder image (what build.sh --docker passes into its container)."""
+        return ["--in-container", "-B", "/work", "-o", "/out", "-c", f"{CFG_MOUNT}/{imageconfig.CONFIG_NAME}",
+                "--", *self.overrides(variant)]
 
-    def build_args(self, cfg_arg: str, variant: str) -> list[str]:
-        """Arguments after the builder image (exactly what droneos build.sh --docker passes)."""
-        return ["--in-container", "-B", "/work", "-o", "/out", "-c", cfg_arg, "--", *self.overrides(variant)]
+    def write_config_dir(self, rendered: imageconfig.RenderedConfig, where: Path) -> Path:
+        """``where`` (emptied) holding the config and its secret files, as the container sees them at /cfg."""
+        rmtree(where)
+        where.mkdir(parents=True)
+        (where / imageconfig.CONFIG_NAME).write_text(rendered.text, encoding="utf-8", newline="\n")
+        for rel, data in rendered.files.items():
+            f = where / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(data)
+        return where
 
     # ------------------------------------------------------------------ current sets
     def current_set(self, variant: str) -> tuple[Path, dict] | None:
@@ -128,10 +172,11 @@ class ImageBuilder:
         Pieces are split to ``provisioning.max_piece_size`` at build time; a set split with a larger
         limit than the current one would hand the page pieces bigger than it was told to expect.
 
-        The set must also come from the droneos commit the checkout is at now (the ``external/droneos``
-        submodule pins it) and from the current ``builds.image`` config + overrides: a board must never
-        be flashed with an older OS than the one the station is set up to provision. A mismatch makes
-        stage 3 wait for a rebuild (the server rebuilds at start with ``builds.auto``, or via Build).
+        The set must also come from the rpi-image-gen revision the submodule is at now and from the
+        current image settings, sources and overrides (``config_hash``): a board must never be flashed
+        with another OS than the one the station is set up to provision. A mismatch makes stage 3 wait
+        for a rebuild (the server rebuilds after a settings change and at start with ``builds.auto``, or
+        via Build).
         """
         cur = int(self.cfg.provisioning.max_piece_size)
         built = int(man.get("max_piece_size") or 0)
@@ -146,12 +191,12 @@ class ImageBuilder:
         if have_v:
             want_v = self.version()
             if want_v != "unknown" and want_v != have_v:      # unknown = git failed: cannot tell, keep serving
-                return (f"rebuild needed: droneos is at {want_v}, image set {man.get('set', '')} was built "
-                        f"from {have_v}")
+                return (f"rebuild needed: rpi-image-gen is at {want_v}, image set {man.get('set', '')} was "
+                        f"built from {have_v}")
         have_c = str(man.get("config_hash") or "")
         if have_c and have_c != self.config_hash(variant):
-            return (f"rebuild needed: builds.image config or overrides changed since image set "
-                    f"{man.get('set', '')} was built")
+            return (f"rebuild needed: the image settings, builds.image.overrides or the station's image sources "
+                    f"changed since image set {man.get('set', '')} was built")
         return None
 
     def published_set(self, variant: str) -> tuple[Path, dict] | None:
@@ -172,53 +217,89 @@ class ImageBuilder:
 
     # ------------------------------------------------------------------ build job
     def build(self, job: Any, force: bool = False, variants: list[str] | None = None) -> None:
-        """Job body "Build droneos images": every variant that is missing (all of them with ``force``)."""
+        """Job body "Build OS images": every variant that does not match the settings (all with ``force``).
+
+        Settings saved while a variant builds make it stale at once; the job then builds it again (up to
+        :data:`MAX_ROUNDS` rounds), so it ends with images of the settings in effect.
+        """
         wanted = [check_variant(v) for v in (variants or VARIANTS)]
-        todo = []
-        for v in wanted:
-            cur = None if force else self.current_set(v)
-            if cur is not None:
-                job.log(f"==> droneos image ({v}) already built: {cur[0]}")
-            else:
-                todo.append(v)
-        if not todo:
+        forced = set(wanted) if force else set()
+        for round_no in range(MAX_ROUNDS):
+            todo = []
+            for v in wanted:
+                cur = None if v in forced else self.current_set(v)
+                if cur is not None:
+                    job.log(f"==> OS image ({v}) already built: {cur[0]}")
+                else:
+                    todo.append(v)
+            if not todo:
+                return
+            if round_no:
+                job.log(f"==> the image settings changed during the build: building {', '.join(todo)} again")
+            if not (self.source_dir / "build.sh").is_file():
+                raise RuntimeError(f"image sources not found at {self.source_dir} (image/build.sh)")
+            if not (self.rig_dir / "rpi-image-gen").is_file():
+                raise RuntimeError(f"rpi-image-gen is not checked out at {self.rig_dir}: "
+                                   "git submodule update --init image/rpi-image-gen")
+            with heavy_lock(self.cfg.work_dir, job.log):
+                self._sweep_config_dirs(job)
+                for v in todo:
+                    cur = None if v in forced else self.current_set(v)
+                    if cur is not None:      # built meanwhile (another process)
+                        job.log(f"==> OS image ({v}) already built: {cur[0]}")
+                        continue
+                    self._build_locked(job, v)
+                    forced.discard(v)
+        stale = [v for v in wanted if self.current_set(v) is None]
+        if stale:
+            raise RuntimeError(f"the image settings changed during {MAX_ROUNDS} builds in a row; "
+                               f"{', '.join(stale)} is still out of date: build again")
+
+    def _sweep_config_dirs(self, job: Any) -> None:
+        """Config dirs (with secret files) a killed build left behind; called under the heavy lock, when no
+        other build can be using one."""
+        base = self.root / "cfg"
+        if not base.is_dir():
             return
-        if not (self.droneos_dir / "build.sh").is_file():
-            raise RuntimeError(f"droneos checkout not found at {self.droneos_dir} (paths.droneos)")
-        cfgp = self.config_path()
-        if not cfgp.is_file():
-            raise RuntimeError(f"image config {cfgp} not found (builds.image.config)")
-        with heavy_lock(self.cfg.work_dir, job.log):
-            for v in todo:
-                cur = None if force else self.current_set(v)
-                if cur is not None:      # built meanwhile (another process)
-                    job.log(f"==> droneos image ({v}) already built: {cur[0]}")
-                    continue
-                self._build_locked(job, v)
+        for d in base.iterdir():
+            if rmtree(d):
+                job.log(f"==> removed the config dir of an interrupted build: {d.name}")
 
     def _build_locked(self, job: Any, variant: str) -> None:
         self.docker.ensure_daemon(job.log)
         self.docker.ensure_arm64(job.log)
         self.tools.ensure(job.log)
-        self.docker.build_image(self.icfg.builder_tag, self.droneos_dir / "docker" / "Dockerfile",
-                                self.droneos_dir / "docker", log=job.log)
-        version = self.version()
-        commit = git_output(self.droneos_dir, "rev-parse", "HEAD") or ""
-        cfg_hash = self.config_hash(variant)
-        cfg_arg, extra = self.container_config()
-        self.staging.mkdir(parents=True, exist_ok=True)
-        mounts = [Mount.bind(self.droneos_dir, "/src", readonly=True),
-                  Mount.volume(self.icfg.volume, "/work"),
-                  Mount.bind(self.staging, "/out"), *extra]
-        env = {"DRONEOS_IN_CONTAINER": "1", "DRONEOS_ROOT": "/src", "DRONEOS_VERSION": version}
-        job.log(f"==> droneos {version} ({variant}): {cfg_arg} {' '.join(self.overrides(variant))}")
-        self.docker.run(self.icfg.builder_tag, self.build_args(cfg_arg, variant), mounts=mounts, env=env,
-                        privileged=True, hostname="droneos-builder", interactive=True, log=job.log,
-                        check=True)
-        set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash, variant=variant)
+        self.docker.build_image(self.icfg.builder_tag, self.source_dir / "docker" / "Dockerfile",
+                                self.source_dir / "docker", log=job.log)
+        version = self.version(max_age=0)
+        commit = git_output(self.rig_dir, "rev-parse", "HEAD") or ""
+        rendered = self.rendered()
+        cfg_hash = self._config_hash(rendered, variant)
+        cfg_dir = self.write_config_dir(rendered, self.root / "cfg" / f"{job.id}-{variant}")
+        try:
+            self.staging.mkdir(parents=True, exist_ok=True)
+            mounts = [Mount.bind(self.source_dir, "/src", readonly=True),
+                      Mount.volume(self.icfg.volume, "/work"),
+                      Mount.bind(self.staging, "/out"),
+                      Mount.bind(cfg_dir, CFG_MOUNT, readonly=True)]
+            env = {"OTP_IMAGE_IN_CONTAINER": "1", "OTP_IMAGE_ROOT": "/src", "OTP_IMAGE_VERSION": version,
+                   "OTP_IMAGE_CONFIG_ID": imageconfig.CONFIG_NAME}
+            job.log(f"==> rpi-image-gen {version} ({variant}): {' '.join(self.overrides(variant))}")
+            job.log(f"==> {imageconfig.CONFIG_NAME} (from the image.* settings):")
+            for line in rendered.text.splitlines():
+                job.log(f"    {line}")
+            job.log("==> secret files: " + (", ".join(sorted(rendered.files)) or "none"))
+            self.docker.run(self.icfg.builder_tag, self.build_args(variant), mounts=mounts, env=env,
+                            privileged=True, hostname="otp-image-builder", interactive=True, log=job.log,
+                            check=True)
+        finally:
+            rmtree(cfg_dir)          # the secret files only live as long as the build
+        set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash, variant=variant,
+                               settings=rendered.summary)
         job.log(f"==> image set ready: {set_dir}")
 
-    def collect(self, job: Any, *, version: str, commit: str, cfg_hash: str, variant: str) -> Path:
+    def collect(self, job: Any, *, version: str, commit: str, cfg_hash: str, variant: str,
+                settings: dict | None = None) -> Path:
         """Run image-collect.sh into a .partial dir, validate, write manifest.json, publish the set."""
         max_piece = int(self.cfg.provisioning.max_piece_size)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -247,8 +328,9 @@ class ImageBuilder:
                 "version": version,
                 "set": final.name,
                 "built": now_iso(),
-                "droneos_commit": commit,
-                "config": str(self.config_path()),
+                "rpi_image_gen_commit": commit,
+                "sources_hash": self.sources_hash(),
+                "image_settings": dict(settings or {}),
                 "config_hash": cfg_hash,
                 "overrides": self.overrides(variant),
                 "image_version": collect.get("image_version", ""),
@@ -372,7 +454,7 @@ class ImageBuilder:
         scenario = "secure" if secure else "open"
         cur = self.published_set(variant)
         if cur is None:
-            raise NotReady(f"the droneos image for the {scenario} scenario ({variant}) is not built yet",
+            raise NotReady(f"the OS image for the {scenario} scenario ({variant}) is not built yet",
                            self.jobs.active("image"))
         set_dir, man = cur
         why = self.rebuild_reason(man, variant)
@@ -386,7 +468,7 @@ class ImageBuilder:
                            f"{scenario} scenario needs {'an encrypted' if secure else 'a clear'} image; rebuild it",
                            self.jobs.active("image"))
         prov = self.cfg.provisioning
-        origin = f"droneos {man.get('set', set_dir.name)}"
+        origin = f"image {man.get('set', set_dir.name)}"
         msim: dict = man.get("simages") or {}
         order = [s for s in imagejson.simages(ij) if s in msim] + [s for s in msim if s not in imagejson.simages(ij)]
         missing = [s for s in imagejson.simages(ij) if s not in msim]

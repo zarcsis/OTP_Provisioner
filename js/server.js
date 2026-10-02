@@ -103,6 +103,10 @@
             /** Hand over the OTP device key the gadget exported: {key_der_b64, device_key_pem}. */
             deviceKey(serial, body) { return request('POST', `/api/modules/${enc(serial)}/device-key`, body); },
             googleLogout() { return request('POST', '/api/google/logout', {}); },
+            /** The image.* settings of the OS image: {settings, warnings} (no password or hash, only *_set flags). */
+            imageSettings() { return request('GET', '/api/image'); },
+            /** Save changed image settings; password/wifi_password: "" removes, a string sets. */
+            saveImageSettings(body) { return request('POST', '/api/image', body); },
             identify(body) { return request('POST', '/api/fastboot/identify', body); },
             builds() { return request('GET', '/api/builds'); },
             startBuild(target, force) { return request('POST', `/api/builds/${enc(target)}`, { force: !!force }); },

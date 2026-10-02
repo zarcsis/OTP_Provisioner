@@ -2,7 +2,7 @@
 
 Two sources, merged over :data:`DEFAULTS`:
 
-* **Settings** -- everything under ``provisioning``, ``builds``, ``docker`` and ``paths.droneos`` -- live in
+* **Settings** -- everything under ``provisioning``, ``image``, ``builds`` and ``docker`` -- live in
   the ``settings`` worksheet of the station spreadsheet (:mod:`otp_server.settings`); the server reads them
   after the operator has signed in to Google and re-reads them while it runs, so a change in the sheet
   needs no restart.
@@ -13,11 +13,11 @@ Two sources, merged over :data:`DEFAULTS`:
 :func:`load_config` merges defaults, ``settings`` (a nested dict, as decoded from the sheet), the
 environment and finally ``overrides`` (CLI flags, tests). Retired keys are dropped with a warning:
 ``provisioning.secure_boot``/``mode`` (the scenario is chosen per board; see
-``provisioning.default_mode``), ``storage.*`` (Google Sheets is the only store, configured by signing in)
-and ``builds.gadget.source`` (the gadget is always built here).
+``provisioning.default_mode``), ``storage.*`` (Google Sheets is the only store, configured by signing in),
+``builds.gadget.source`` (the gadget is always built here) and ``paths.droneos`` / ``builds.image.config``
+(the image is built from the station's own ``image/`` sources with a config written from ``image.*``).
 
-Relative paths are resolved against the repository root; ``builds.image.config`` is resolved against the
-droneos checkout (see :attr:`ImageBuildCfg.config`). ``~`` and environment variables are expanded.
+Relative paths are resolved against the repository root. ``~`` and environment variables are expanded.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
+from . import imageconfig
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ DEFAULT_BOOT_CONF = "[all]\nBOOT_UART=1\nPOWER_OFF_ON_HALT=1\nBOOT_ORDER=0xf2461
 #: The complete default configuration tree (the YAML schema).
 DEFAULTS: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8765, "open_browser": True, "browser": None},
-    "paths": {"work": None, "droneos": "external/droneos"},
+    "paths": {"work": None},
     "provisioning": {
         "default_mode": "open",
         "jtag_lock": False,
@@ -60,6 +61,21 @@ DEFAULTS: dict[str, Any] = {
         "max_piece_size": 268435456,
         "boot_conf": DEFAULT_BOOT_CONF,
     },
+    #: What goes into the OS image (rendered into an rpi-image-gen config by :mod:`otp_server.imageconfig`).
+    "image": {
+        "name": "deb13-arm64-min",
+        "hostname": "pi5",
+        "timezone": "Europe/Kyiv",
+        "user": "pi",
+        "password_hash": "",
+        "ssh": False,
+        "ssh_password_login": True,
+        "ssh_authorized_keys": [],
+        "wifi_ssid": "",
+        "wifi_password": "",
+        "wifi_country": "UA",
+        "wifi_hidden": False,
+    },
     "builds": {
         "auto": True,
         "tools": {"image_tag": "otp-tools:latest"},
@@ -69,10 +85,9 @@ DEFAULTS: dict[str, Any] = {
             "volume": "otp-pgm-work",
         },
         "image": {
-            "config": "droneos.yaml",
             "overrides": [],
-            "builder_tag": "droneos-builder:trixie",
-            "volume": "otp-droneos-work",
+            "builder_tag": "otp-image-builder:trixie",
+            "volume": "otp-image-work",
             "keep_raw_image": False,
         },
     },
@@ -117,16 +132,30 @@ class GadgetBuildCfg:
 
 
 @dataclass
+class ImageCfg:
+    """What goes into the OS image (``image.*``). Secrets: ``password_hash`` (crypt hash of user1's
+    password, empty = the account has no password) and ``wifi_password``; :mod:`otp_server.imageconfig`
+    passes them to the build as files, never as config values."""
+
+    name: str
+    hostname: str
+    timezone: str
+    user: str
+    password_hash: str
+    ssh: bool
+    ssh_password_login: bool
+    ssh_authorized_keys: list[str]
+    wifi_ssid: str
+    wifi_password: str
+    wifi_country: str
+    wifi_hidden: bool
+
+
+@dataclass
 class ImageBuildCfg:
-    """droneos image build settings.
+    """How the image is built: rpi-image-gen from ``<repo>/image`` in the builder image (``overrides`` are
+    extra ``IGconf_*=value`` words for rpi-image-gen)."""
 
-    ``config`` is the rpi-image-gen config file. When it lies inside the droneos checkout it is kept
-    *relative to the checkout* in POSIX form (e.g. ``"droneos.yaml"`` or ``"configs/x.yaml"``), so
-    both ``cfg.droneos_dir / config`` and ``"/src/" + config`` work. When it lies outside the checkout
-    it is an absolute path string. :attr:`Config.image_config_path` always gives the absolute path.
-    """
-
-    config: str
     overrides: list[str]
     builder_tag: str
     volume: str
@@ -160,9 +189,9 @@ class Config:
 
     repo_root: Path
     work_dir: Path
-    droneos_dir: Path
     server: ServerCfg
     provisioning: ProvisioningCfg
+    image: ImageCfg
     builds: BuildsCfg
     docker: DockerCfg
     #: Keys found in the settings/overrides that the schema does not know (typos); reported, not fatal.
@@ -172,27 +201,26 @@ class Config:
 
     def apply_settings(self, other: "Config") -> None:
         """Take over the sheet-backed parts of ``other`` in place (the services keep this object)."""
-        self.droneos_dir = other.droneos_dir
         self.provisioning = other.provisioning
+        self.image = other.image
         self.builds = other.builds
         self.docker = other.docker
         self.unknown_keys = list(other.unknown_keys)
 
     @property
     def external_dir(self) -> Path:
-        """``<repo>/external`` (the usbboot / pi-gen-micro / droneos submodules)."""
+        """``<repo>/external`` (the usbboot / pi-gen-micro submodules)."""
         return self.repo_root / "external"
+
+    @property
+    def image_dir(self) -> Path:
+        """``<repo>/image``: build.sh, the builder Dockerfile, the station layers and rpi-image-gen."""
+        return self.repo_root / "image"
 
     @property
     def web_dir(self) -> Path:
         """Directory holding ``index.html``, ``css/`` and ``js/`` (the repository root)."""
         return self.repo_root
-
-    @property
-    def image_config_path(self) -> Path:
-        """Absolute path of the droneos image config (``builds.image.config``)."""
-        p = Path(self.builds.image.config)
-        return p if p.is_absolute() else (self.droneos_dir / p)
 
     def ensure_dirs(self) -> None:
         """Create the runtime directory tree under ``work_dir`` (idempotent)."""
@@ -223,15 +251,16 @@ class Config:
             "version": __version__,
             "repo_root": str(self.repo_root),
             "work_dir": str(self.work_dir),
-            "droneos_dir": str(self.droneos_dir),
+            "image_dir": str(self.image_dir),
             "settings": "Google Sheets (worksheet settings)",
             "server": {**asdict(self.server), "browser": _pstr(self.server.browser)},
             "provisioning": {**asdict(self.provisioning), "modes": list(PROVISIONING_MODES)},
+            "image": imageconfig.public_view(self.image),
             "builds": {
                 "auto": self.builds.auto,
                 "tools": asdict(self.builds.tools),
                 "gadget": asdict(self.builds.gadget),
-                "image": {**asdict(self.builds.image), "config_path": str(self.image_config_path)},
+                "image": asdict(self.builds.image),
             },
             "docker": {
                 "binary": self.docker.binary,
@@ -357,7 +386,9 @@ def _retired_keys(tree: Any, where: str) -> None:
     * ``provisioning.secure_boot`` / ``provisioning.mode`` -> ``provisioning.default_mode`` (the scenario
       is chosen per board now; the flag only says which one the page preselects);
     * the whole ``storage`` section: the registry is the station's Google spreadsheet, set up by signing in;
-    * ``builds.gadget.source``: the fastboot gadget is always built by this server.
+    * ``builds.gadget.source``: the fastboot gadget is always built by this server;
+    * ``paths.droneos`` and ``builds.image.config``: the image is built from ``<repo>/image`` with a config
+      written from the ``image.*`` settings.
     """
     if not isinstance(tree, dict):
         return
@@ -389,6 +420,15 @@ def _retired_keys(tree: Any, where: str) -> None:
     if isinstance(gadget, dict) and "source" in gadget:
         gadget.pop("source")
         log.warning("config %s: builds.gadget.source is retired: the gadget is always built here", where)
+    paths = tree.get("paths")
+    if isinstance(paths, dict) and "droneos" in paths:
+        paths.pop("droneos")
+        log.warning("config %s: paths.droneos is retired: the image is built from the station's image/ directory", where)
+    image = (tree.get("builds") or {}).get("image") if isinstance(tree.get("builds"), dict) else None
+    if isinstance(image, dict) and "config" in image:
+        image.pop("config")
+        log.warning("config %s: builds.image.config is retired: the config is written from the image.* settings",
+                    where)
 
 
 def _deep_merge(dst: dict, src: Mapping) -> dict:
@@ -465,15 +505,48 @@ def _enum(v: Any, key: str, allowed: tuple[str, ...]) -> str:
     return s
 
 
-def _image_config(value: Any, droneos: Path) -> str:
-    s = _str(value, "builds.image.config")
-    if not s:
-        raise ValueError("config builds.image.config: a value is required")
-    p = _resolve_path(s, droneos)
+def _str_list(v: Any, key: str, what: str) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = v.replace("\r\n", "\n").split("\n")
+    if not isinstance(v, list) or not all(isinstance(o, (str, int, float)) for o in v):
+        raise ValueError(f"config {key}: expected a list of {what}")
+    return [str(o).strip() for o in v if str(o).strip()]
+
+
+def _checked(key: str, check: Any, value: Any) -> Any:
     try:
-        return p.relative_to(droneos).as_posix()
-    except ValueError:
-        return str(p)
+        return check(value)
+    except ValueError as exc:
+        raise ValueError(f"config {key}: {exc}") from None
+
+
+def parse_image(img: Mapping) -> ImageCfg:
+    """Validated :class:`ImageCfg` from an ``image`` settings mapping (ValueError names the bad key)."""
+    def text(key: str) -> str:
+        return _str(img.get(key), f"image.{key}", allow_none=True) or ""
+
+    keys = [_checked("image.ssh_authorized_keys", imageconfig.check_authorized_key, k)
+            for k in _str_list(img.get("ssh_authorized_keys"), "image.ssh_authorized_keys", "public key lines")]
+    wifi_password = img.get("wifi_password")
+    wifi_password = "" if wifi_password is None else str(wifi_password)   # spaces are part of a passphrase
+    ssid = img.get("wifi_ssid")
+    ssid = "" if ssid is None else str(ssid)
+    return ImageCfg(
+        name=_checked("image.name", imageconfig.check_image_name, text("name")),
+        hostname=_checked("image.hostname", imageconfig.check_hostname, text("hostname")),
+        timezone=_checked("image.timezone", imageconfig.check_timezone, text("timezone")),
+        user=_checked("image.user", imageconfig.check_user, text("user")),
+        password_hash=_checked("image.password_hash", imageconfig.check_password_hash, text("password_hash")),
+        ssh=_bool(img.get("ssh"), "image.ssh"),
+        ssh_password_login=_bool(img.get("ssh_password_login"), "image.ssh_password_login"),
+        ssh_authorized_keys=keys,
+        wifi_ssid=_checked("image.wifi_ssid", imageconfig.check_ssid, ssid),
+        wifi_password=_checked("image.wifi_password", imageconfig.check_wifi_password, wifi_password),
+        wifi_country=_checked("image.wifi_country", imageconfig.check_country, text("wifi_country")),
+        wifi_hidden=_bool(img.get("wifi_hidden"), "image.wifi_hidden"),
+    )
 
 
 def _default_desktop_path() -> Path | None:
@@ -488,9 +561,6 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
     prov, bld, dck = tree["provisioning"], tree["builds"], tree["docker"]
 
     work = _opt_path(pth.get("work"), root, "paths.work") or default_work_dir()
-    droneos = _opt_path(pth.get("droneos"), root, "paths.droneos")
-    if droneos is None:
-        raise ValueError("config paths.droneos: a value is required")
 
     server = ServerCfg(
         host=_str(srv.get("host"), "server.host") or "127.0.0.1",
@@ -519,15 +589,9 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
     tools = bld.get("tools") or {}
     gadget = bld.get("gadget") or {}
     image = bld.get("image") or {}
-    ovr = image.get("overrides")
-    if ovr is None:
-        ovr = []
-    if isinstance(ovr, str):
-        ovr = [ovr]
-    if not isinstance(ovr, list) or not all(isinstance(o, (str, int, float)) for o in ovr):
-        raise ValueError("config builds.image.overrides: expected a list of KEY=VALUE strings")
+    ovr = _str_list(image.get("overrides"), "builds.image.overrides", "KEY=VALUE strings")
     for o in ovr:
-        if str(o).strip().startswith("IGconf_image_pmap="):
+        if o.startswith("IGconf_image_pmap="):
             raise ValueError("config builds.image.overrides: IGconf_image_pmap is set per scenario "
                              "(open = clear, secure = crypt; both images are built); remove it")
     builds = BuildsCfg(
@@ -539,8 +603,7 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
             volume=_str(gadget.get("volume"), "builds.gadget.volume") or "",
         ),
         image=ImageBuildCfg(
-            config=_image_config(image.get("config"), droneos),
-            overrides=[str(o).strip() for o in ovr if str(o).strip()],
+            overrides=ovr,
             builder_tag=_str(image.get("builder_tag"), "builds.image.builder_tag") or "",
             volume=_str(image.get("volume"), "builds.image.volume") or "",
             keep_raw_image=_bool(image.get("keep_raw_image"), "builds.image.keep_raw_image"),
@@ -557,9 +620,9 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
     return Config(
         repo_root=root,
         work_dir=work,
-        droneos_dir=droneos,
         server=server,
         provisioning=provisioning,
+        image=parse_image(tree.get("image") or {}),
         builds=builds,
         docker=docker,
         unknown_keys=unknown,

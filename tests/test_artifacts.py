@@ -1,7 +1,7 @@
 """Artifacts facade with a FakeDockerRunner: stage 1/2/3 manifests, gadget + image builds, scenarios.
 
 The fake records every docker call and simulates the docker/scripts contract (SPEC §11) by writing
-files into the directory mounted at /out. The droneos builder honours ``IGconf_image_pmap`` the way
+files into the directory mounted at /out. The image builder honours ``IGconf_image_pmap`` the way
 rpi-image-gen does: it leaves a ``clear`` or ``crypt`` build in the work volume, and the fake
 image-collect.sh copies an image.json with (crypt) or without (clear) the encrypted provisionmap
 section out of it.
@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ SERIAL = "a7eb274c"
 SERIAL2 = "0badc0de"
 BLK = 4096
 TOOLS_TAG = "otp-tools:latest"
-BUILDER_TAG = "droneos-builder:trixie"
+BUILDER_TAG = "otp-image-builder:trixie"
 GADGET_TAG = "otp-gadget-builder:trixie"
 REAL_REPO = Path(__file__).resolve().parent.parent
 
@@ -128,19 +129,23 @@ def make_repo(base: Path) -> tuple[Path, Path]:
     (repo / "external" / "usbboot" / "firmware" / "bootfiles.bin").write_bytes(b"bootfiles-tar" * 100)
     (repo / "external" / "pi-gen-micro").mkdir(parents=True)
     (repo / "external" / "pi-gen-micro" / "pi-gen-micro").write_text("#!/bin/bash\n", encoding="utf-8")
-    droneos = base / "droneos"
-    (droneos / "docker").mkdir(parents=True)
-    (droneos / "build.sh").write_text("#!/bin/bash\n", encoding="utf-8")
-    (droneos / "docker" / "Dockerfile").write_text("FROM debian:trixie-slim\n", encoding="utf-8")
-    (droneos / "droneos.yaml").write_text("device:\n  layer: rpi5\n", encoding="utf-8")
-    return repo, droneos
+    image = repo / "image"
+    for d in ("docker", "layer", "rpi-image-gen"):
+        (image / d).mkdir(parents=True)
+    (image / "build.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (image / "docker" / "Dockerfile").write_text("FROM debian:trixie-slim\n", encoding="utf-8")
+    (image / "docker" / "entrypoint.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (image / "layer" / "otp-minbase.yaml").write_text("# otp-minbase\n", encoding="utf-8")
+    (image / "layer" / "otp-image.yaml").write_text("# otp-image\n", encoding="utf-8")
+    (image / "rpi-image-gen" / "rpi-image-gen").write_text("#!/bin/bash\n", encoding="utf-8")
+    return repo, image
 
 
 # ---------------------------------------------------------------------- fake docker
 class FakeDocker:
     """Records calls; simulates scripts/builders by writing into the /out mount.
 
-    ``volumes`` stands for the named volumes: the droneos builder leaves ``{"pmap": <variant>}`` in its
+    ``volumes`` stands for the named volumes: the image builder leaves ``{"pmap": <variant>}`` in its
     work volume, the fake image-collect.sh reads it back.
     """
 
@@ -251,7 +256,7 @@ def h_gadget(call):
 
 
 def pmap_of(args: list[str]) -> str:
-    """The ``IGconf_image_pmap`` a droneos build was asked for (exactly one, the last override)."""
+    """The ``IGconf_image_pmap`` an image build was asked for (exactly one, the last override)."""
     pmaps = [a.split("=", 1)[1] for a in args if a.startswith("IGconf_image_pmap=")]
     assert len(pmaps) == 1 and args[-1] == f"IGconf_image_pmap={pmaps[0]}", args
     return pmaps[0]
@@ -259,6 +264,10 @@ def pmap_of(args: list[str]) -> str:
 
 def h_builder(call, *, forced_pmap: str | None = None):
     pmap = pmap_of(call["args"])
+    cfg_dir = Path(call["mounts"]["/cfg"].source)          # the config the station wrote, read while it exists
+    call["config"] = (cfg_dir / "otp-image.yaml").read_text(encoding="utf-8")
+    call["secret_files"] = {f.relative_to(cfg_dir).as_posix(): f.read_bytes()
+                            for f in sorted(cfg_dir.rglob("*")) if f.is_file() and f.name != "otp-image.yaml"}
     call["docker"].volumes[call["mounts"]["/work"].source] = {"pmap": forced_pmap or pmap}
     (out_dir(call) / "deb13-arm64-min.img").write_bytes(b"raw image " + pmap.encode())
 
@@ -266,7 +275,7 @@ def h_builder(call, *, forced_pmap: str | None = None):
 def h_collect(call, *, corrupt: str = ""):
     out = out_dir(call)
     built = call["docker"].volumes.get(call["mounts"]["/work"].source) or {}
-    assert built.get("pmap") in VARIANTS, "image-collect.sh ran without a droneos build in the work volume"
+    assert built.get("pmap") in VARIANTS, "image-collect.sh ran without an image build in the work volume"
     (out / "image.json").write_text(json.dumps(image_json_doc(encrypted=built["pmap"] == "crypt")),
                                     encoding="utf-8")
     make_sparse(out / "boot.vfat.sparse", [("raw", 2), ("dc", 30)])
@@ -341,9 +350,8 @@ class Env:
 @pytest.fixture
 def make_env(make_cfg, tmp_path):
     def _make(tools_ready: bool = True, **overrides) -> Env:
-        repo, droneos = make_repo(tmp_path)
+        repo, _image = make_repo(tmp_path)
         paths = overrides.pop("paths", {})
-        paths.setdefault("droneos", str(droneos))
         cfg = make_cfg(tmp_path, repo_root=repo, paths=paths, **overrides)
         docker = FakeDocker()
         docker.handlers.update({"stage1.sh": h_stage1, "stage2-sign.sh": h_stage2, "image-collect.sh": h_collect,
@@ -770,7 +778,7 @@ def test_secure_board_needs_stage1_before_stages_2_and_3(make_env, how):
 # ---------------------------------------------------------------------- image / stage 3
 def build_image(env) -> None:
     job = env.arts.start_build("image")
-    assert job.title == "Build droneos images (clear + crypt)"
+    assert job.title == "Build OS images (clear + crypt)"
     assert job.wait(20), "image job hangs"
     assert job.status == "succeeded", "\n".join(job.lines)
 
@@ -782,7 +790,8 @@ def test_image_variant_helpers(make_env):
     assert img.overrides("clear") == ["IGconf_extra=1", "IGconf_image_pmap=clear"]
     assert img.overrides("crypt") == ["IGconf_extra=1", "IGconf_image_pmap=crypt"]
     assert img.config_hash("clear") != img.config_hash("crypt")
-    assert img.build_args("/src/droneos.yaml", "crypt")[-3:] == ["--", "IGconf_extra=1", "IGconf_image_pmap=crypt"]
+    assert img.build_args("crypt") == ["--in-container", "-B", "/work", "-o", "/out", "-c", "/cfg/otp-image.yaml",
+                                       "--", "IGconf_extra=1", "IGconf_image_pmap=crypt"]
     assert img.current_json("clear") == env.image_root / "current-clear.json"
     for bad in ("open", "secure", "", "CRYPT"):
         with pytest.raises(ValueError):
@@ -799,15 +808,22 @@ def test_image_build_argv_and_collect(make_env):
     runs = env.docker.runs_of(BUILDER_TAG)
     assert len(runs) == 2                                  # one build per variant, clear first
     for r, v in zip(runs, VARIANTS):
-        assert r["args"] == ["--in-container", "-B", "/work", "-o", "/out", "-c", "/src/droneos.yaml",
+        assert r["args"] == ["--in-container", "-B", "/work", "-o", "/out", "-c", "/cfg/otp-image.yaml",
                              "--", f"IGconf_image_pmap={v}"]
-        assert r["privileged"] and r["interactive"] and r["hostname"] == "droneos-builder"
-        assert r["env"] == {"DRONEOS_IN_CONTAINER": "1", "DRONEOS_ROOT": "/src", "DRONEOS_VERSION": "unknown"}
-        assert Path(r["mounts"]["/src"].source) == env.cfg.droneos_dir and r["mounts"]["/src"].readonly
-        assert r["mounts"]["/work"].type == "volume" and r["mounts"]["/work"].source == "otp-droneos-work"
-        assert Path(r["mounts"]["/out"].source) == env.image_root / "staging" and "/cfg" not in r["mounts"]
+        assert r["privileged"] and r["interactive"] and r["hostname"] == "otp-image-builder"
+        assert r["env"] == {"OTP_IMAGE_IN_CONTAINER": "1", "OTP_IMAGE_ROOT": "/src", "OTP_IMAGE_VERSION": "unknown",
+                            "OTP_IMAGE_CONFIG_ID": "otp-image.yaml"}
+        assert Path(r["mounts"]["/src"].source) == env.cfg.image_dir and r["mounts"]["/src"].readonly
+        assert r["mounts"]["/work"].type == "volume" and r["mounts"]["/work"].source == "otp-image-work"
+        assert Path(r["mounts"]["/out"].source) == env.image_root / "staging"
+        cfg_dir = Path(r["mounts"]["/cfg"].source)
+        assert r["mounts"]["/cfg"].readonly and cfg_dir.parent == env.image_root / "cfg"
+        assert not cfg_dir.exists()                          # the config dir (secrets) is gone after the build
+        assert "  base: otp-minbase\n  station: otp-image\n" in r["config"] and "openssh-server" not in r["config"]
+        assert r["secret_files"] == {}                       # defaults: no password, no Wi-Fi, no SSH
     b = [x for x in env.docker.builds if x["tag"] == BUILDER_TAG]
-    assert b and all(x["context"] == env.cfg.droneos_dir / "docker" for x in b)
+    assert b and all(x["context"] == env.cfg.image_dir / "docker" for x in b)
+    assert all(x["dockerfile"] == env.cfg.image_dir / "docker" / "Dockerfile" for x in b)
     collects = env.docker.runs_of("image-collect.sh")
     assert len(collects) == 2
     for c in collects:
@@ -828,6 +844,9 @@ def test_image_build_argv_and_collect(make_env):
         assert man["device_class"] == "pi5" and man["storage_type"] == "sd"
         assert man["overrides"] == [f"IGconf_image_pmap={v}"]
         assert man["config_hash"] == env.arts.image.config_hash(v)
+        assert man["sources_hash"] == env.arts.image.sources_hash() and "rpi_image_gen_commit" in man
+        assert man["image_settings"]["hostname"] == "pi5" and man["image_settings"]["password_set"] is False
+        assert "droneos_commit" not in man and "config" not in man
         assert [p["name"] for p in man["simages"]["root.ext4.sparse"]] == ["root.ext4.sparse.0", "root.ext4.sparse.1"]
         assert man["simages"]["root.ext4.sparse"][1]["sha256"] == sha(set_dir / "root.ext4.sparse.1")
         assert env.arts.image.current_set(v) == (set_dir, man)
@@ -851,17 +870,12 @@ def test_image_build_argv_and_collect(make_env):
     assert len(env.docker.runs) == n
 
 
-def test_image_config_outside_checkout_and_keep_raw(make_env, tmp_path):
-    ext = tmp_path / "cfgs" / "other.yaml"
-    ext.parent.mkdir()
-    ext.write_text("image: {}\n", encoding="utf-8")
-    env = make_env(builds={"image": {"config": str(ext), "keep_raw_image": True, "overrides": ["IGconf_x=1"]}})
+def test_image_keep_raw_and_overrides(make_env):
+    env = make_env(builds={"image": {"keep_raw_image": True, "overrides": ["IGconf_x=1"]}})
     build_image(env)
     runs = env.docker.runs_of(BUILDER_TAG)
-    assert [r["args"] for r in runs] == [["--in-container", "-B", "/work", "-o", "/out", "-c", "/cfg/other.yaml",
+    assert [r["args"] for r in runs] == [["--in-container", "-B", "/work", "-o", "/out", "-c", "/cfg/otp-image.yaml",
                                           "--", "IGconf_x=1", f"IGconf_image_pmap={v}"] for v in VARIANTS]
-    for r in runs:
-        assert Path(r["mounts"]["/cfg"].source) == ext.parent and r["mounts"]["/cfg"].readonly
     assert list((env.image_root / "staging").glob("*.img"))
     for v in VARIANTS:
         assert env.arts.image.current_set(v)[1]["overrides"] == ["IGconf_x=1", f"IGconf_image_pmap={v}"]
@@ -1430,8 +1444,8 @@ def test_image_set_split_larger_than_max_piece_needs_rebuild(make_env):
 
 
 @pytest.fixture
-def droneos_git(monkeypatch):
-    """Fake ``git describe`` / ``rev-parse`` of the droneos checkout; mutate ``["describe"]`` to move it."""
+def rig_git(monkeypatch):
+    """Fake ``git describe`` / ``rev-parse`` of the rpi-image-gen submodule; mutate ``["describe"]`` to move it."""
     from otp_server.artifacts import image as image_mod
 
     state = {"describe": "368e8f0", "rev-parse": "368e8f0" + "0" * 33, "calls": 0}
@@ -1445,7 +1459,7 @@ def droneos_git(monkeypatch):
     return state
 
 
-def test_image_new_droneos_commit_needs_rebuild(make_env, droneos_git):
+def test_image_new_rpi_image_gen_commit_needs_rebuild(make_env, rig_git):
     env = make_env()
     build_image(env)
     env.board()
@@ -1454,14 +1468,14 @@ def test_image_new_droneos_commit_needs_rebuild(make_env, droneos_git):
     for v in VARIANTS:
         cur = env.arts.image.current_set(v)
         assert cur is not None and cur[1]["version"] == "368e8f0" and f"-{v}-368e8f0-" in cur[1]["set"]
-        assert cur[1]["droneos_commit"].startswith("368e8f0")
+        assert cur[1]["rpi_image_gen_commit"].startswith("368e8f0")
         old[v] = cur[0]
     assert env.arts.status()["image"]["ready"] is True
 
-    droneos_git["describe"] = "v1.2-3-gabcdef1"          # the submodule pointer moved
+    rig_git["describe"] = "v1.2-3-gabcdef1"              # the submodule pointer moved
     assert env.arts.image.missing_variants() == list(VARIANTS)
     for serial in (SERIAL, SERIAL2):
-        with pytest.raises(NotReady, match="droneos is at v1.2-3-gabcdef1, image set .* was built from 368e8f0"):
+        with pytest.raises(NotReady, match="rpi-image-gen is at v1.2-3-gabcdef1, image set .* was built from 368e8f0"):
             env.arts.stage_manifest(serial, 3)
     st = env.arts.status()["image"]
     assert st["ready"] is False and "rebuild needed" in st["detail"]
@@ -1475,12 +1489,12 @@ def test_image_new_droneos_commit_needs_rebuild(make_env, droneos_git):
         assert env.arts.stage_manifest(serial, 3)["image"]["version"] == "v1.2-3-gabcdef1"
 
 
-def test_image_unknown_droneos_version_keeps_serving(make_env, droneos_git):
+def test_image_unknown_rpi_image_gen_version_keeps_serving(make_env, rig_git):
     env = make_env()
     build_image(env)
     env.board()
     env.board(SERIAL2, mode="secure", lock="ours")
-    droneos_git["describe"] = None                       # git failed: no reason to block stage 3
+    rig_git["describe"] = None                           # git failed: no reason to block stage 3
     assert env.arts.image.version() == "unknown"
     assert env.arts.image.missing_variants() == []
     for serial in (SERIAL, SERIAL2):
@@ -1493,21 +1507,94 @@ def test_image_config_change_needs_rebuild(make_env):
     env.board()
     env.board(SERIAL2, mode="secure", lock="ours")
     assert env.arts.image.missing_variants() == []
-    (env.cfg.droneos_dir / "droneos.yaml").write_text("device:\n  layer: rpi5\nimage:\n  name: x\n",
-                                                      encoding="utf-8")
-    assert env.arts.image.missing_variants() == list(VARIANTS)
-    for serial in (SERIAL, SERIAL2):
-        with pytest.raises(NotReady, match="config or overrides changed"):
-            env.arts.stage_manifest(serial, 3)
-    (env.cfg.droneos_dir / "droneos.yaml").write_bytes(b"device:\r\n  layer: rpi5\r\n")   # back, CRLF
-    assert env.arts.image.missing_variants() == []
+    original = env.cfg.image
+    changed = "the image settings, builds.image.overrides or the station's image sources changed"
+    for edit in ({"hostname": "drone7"}, {"wifi_ssid": "Field", "wifi_password": "secret-pass"},
+                 {"password_hash": "$6$salt$" + "x" * 86}, {"ssh": True}):
+        env.cfg.image = replace(original, **edit)
+        assert env.arts.image.missing_variants() == list(VARIANTS), edit
+        for serial in (SERIAL, SERIAL2):
+            with pytest.raises(NotReady, match=re.escape(changed)):
+                env.arts.stage_manifest(serial, 3)
+        env.cfg.image = original
+        assert env.arts.image.missing_variants() == []
+    # a changed Wi-Fi password alone (same SSID) is a different image too: the secret files count
+    env.cfg.image = replace(original, wifi_ssid="Field", wifi_password="secret-pass")
+    h1 = env.arts.image.config_hash("clear")
+    env.cfg.image = replace(original, wifi_ssid="Field", wifi_password="other-pass")
+    assert env.arts.image.config_hash("clear") != h1
+    env.cfg.image = original
     env.cfg.builds.image.overrides = ["IGconf_x=1"]
     assert env.arts.image.missing_variants() == list(VARIANTS)
     for serial in (SERIAL, SERIAL2):
-        with pytest.raises(NotReady, match="config or overrides changed"):
+        with pytest.raises(NotReady, match=re.escape(changed)):
             env.arts.stage_manifest(serial, 3)
     env.cfg.builds.image.overrides = []
     assert env.arts.image.missing_variants() == []
+
+
+def test_image_sources_change_needs_rebuild(make_env, monkeypatch):
+    from otp_server.artifacts import image as image_mod
+
+    monkeypatch.setattr(image_mod.ImageBuilder, "SOURCES_TTL", 0.0)
+    env = make_env()
+    build_image(env)
+    assert env.arts.image.missing_variants() == []
+    layer = env.cfg.image_dir / "layer" / "otp-image.yaml"
+    layer.write_text("# otp-image v2\n", encoding="utf-8")
+    assert env.arts.image.missing_variants() == list(VARIANTS)
+    layer.write_bytes(b"# otp-image\r\n")                   # back, with CRLF (a Windows checkout): same
+    assert env.arts.image.missing_variants() == []
+    (env.cfg.image_dir / "layer" / "extra.yaml").write_text("# new layer\n", encoding="utf-8")
+    assert env.arts.image.missing_variants() == list(VARIANTS)
+    (env.cfg.image_dir / "layer" / "extra.yaml").unlink()
+    (env.cfg.image_dir / "rpi-image-gen" / "README").write_text("not hashed: versioned by its commit\n",
+                                                               encoding="utf-8")
+    assert env.arts.image.missing_variants() == []
+
+
+def test_image_build_writes_the_settings_as_files(make_env):
+    from otp_server.passhash import sha512_crypt
+
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD op@station"
+    env = make_env(image={"hostname": "drone7", "password_hash": sha512_crypt("pw", "salt"), "ssh": True,
+                          "ssh_password_login": False, "ssh_authorized_keys": [key],
+                          "wifi_ssid": "Field Net", "wifi_password": "p$ss \\w0rd", "wifi_country": "pl"})
+    build_image(env)
+    for r in env.docker.runs_of(BUILDER_TAG):
+        text = r["config"]
+        assert '  hostname: "drone7"' in text and '  regdom: "PL"' in text and "  ssh: openssh-server" in text
+        assert '  secrets: "/cfg/secrets"' in text and '  pubkey_only: "y"' in text
+        assert '  pubkey_user1: "/cfg/secrets/authorized_keys"' in text
+        assert "$" not in text.replace("rpi-image-gen expands $ in values", "")   # no secret is a config value
+        files = r["secret_files"]
+        assert files["secrets/user1.passhash"] == (sha512_crypt("pw", "salt") + "\n").encode()
+        assert files["secrets/authorized_keys"] == (key + "\n").encode()
+        profile = files["secrets/iwd/Field Net.psk"].decode()
+        assert "Passphrase=p$ss\\s\\\\w0rd\n" in profile and "PreSharedKey=" in profile
+    for v in VARIANTS:
+        man = env.arts.image.current_set(v)[1]
+        assert man["image_settings"]["wifi_ssid"] == "Field Net" and man["image_settings"]["password_set"] is True
+        assert "p$ss" not in json.dumps(man) and "$6$" not in json.dumps(man)   # no secret in the manifest
+    assert not list((env.image_root / "cfg").iterdir())
+
+
+def test_image_build_follows_settings_changed_meanwhile(make_env):
+    env = make_env()
+    seen = []
+
+    def builder(call):
+        h_builder(call)
+        seen.append(call["config"])
+        if len(seen) == 1:                       # the operator saves new settings while clear builds
+            env.cfg.image = replace(env.cfg.image, hostname="drone8")
+
+    env.docker.handlers[BUILDER_TAG] = builder
+    build_image(env)
+    assert [c.count('hostname: "drone8"') for c in seen] == [0, 1, 1]   # clear, crypt, clear again
+    assert env.arts.image.missing_variants() == []
+    job = env.jobs.list()[0]
+    assert any("the image settings changed during the build" in ln for ln in job.lines)
 
 
 def test_image_variant_mismatch_needs_rebuild(make_env):
@@ -1529,15 +1616,15 @@ def test_image_variant_mismatch_needs_rebuild(make_env):
     assert env.arts.status()["image"]["ready"] is False
 
 
-def test_image_version_is_cached_briefly(make_env, droneos_git, monkeypatch):
+def test_image_version_is_cached_briefly(make_env, rig_git, monkeypatch):
     from otp_server.artifacts import image as image_mod
 
     env = make_env()
     monkeypatch.setattr(image_mod.ImageBuilder, "VERSION_TTL", 3600.0)
-    n = droneos_git["calls"]
+    n = rig_git["calls"]
     assert env.arts.image.version() == "368e8f0"
-    droneos_git["describe"] = "abcdef1"
-    assert env.arts.image.version() == "368e8f0" and droneos_git["calls"] == n + 1
+    rig_git["describe"] = "abcdef1"
+    assert env.arts.image.version() == "368e8f0" and rig_git["calls"] == n + 1
     assert env.arts.image.version(max_age=0) == "abcdef1"
 
 
@@ -1610,3 +1697,15 @@ def test_artifacts_init_sweeps_stale_keys(make_env, tmp_path):
     os.utime(stale, (1, 1))
     Artifacts(env.cfg, env.docker, env.jobs, env.modules)
     assert not stale.exists()
+
+
+def test_image_build_sweeps_config_dirs_of_interrupted_builds(make_env):
+    env = make_env()
+    left = env.image_root / "cfg" / "deadbeef-clear" / "secrets"
+    left.mkdir(parents=True)
+    (left / "user1.passhash").write_text("$6$old$hash\n", encoding="utf-8")
+    build_image(env)
+    assert not (env.image_root / "cfg" / "deadbeef-clear").exists()
+    job = env.jobs.list()[0]
+    assert any("removed the config dir of an interrupted build: deadbeef-clear" in ln for ln in job.lines)
+    assert list((env.image_root / "cfg").iterdir()) == []

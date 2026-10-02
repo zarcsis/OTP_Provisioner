@@ -1,0 +1,23 @@
+# rpi-image-gen config written by OTP_Provisioner from the station settings (image.*).
+# Secrets are files in secrets/ next to this config, never values: rpi-image-gen expands $ in values.
+device:
+  layer: rpi5
+  hostname: "pi5"
+  user1: "pi"
+  user1sudo: "none"
+
+image:
+  layer: image-rpios
+  boot_part_size: "200%"
+  root_part_size: "300%"
+  name: "deb13-arm64-min"
+
+layer:
+  base: otp-minbase
+  station: otp-image
+
+locale:
+  timezone: "Europe/Kyiv"
+
+ieee80211:
+  regdom: "UA"

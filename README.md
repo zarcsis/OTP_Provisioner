@@ -19,7 +19,7 @@ is provisioned in one of two **scenarios**, picked on the page per board (both a
 | --- | --- | --- |
 | Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`) |
 | Stage 2 · Fastboot gadget | the gadget built by this server | the same gadget, `boot.sig` once the board is locked |
-| Stage 3 · Image | clear droneos image (`IGconf_image_pmap=clear`), nothing written to OTP | the OTP device key is generated (if blank) and **exported to the server**, then the LUKS2-encrypted droneos image (`IGconf_image_pmap=crypt`); the boot partition is re-signed per board |
+| Stage 3 · Image | clear OS image (`IGconf_image_pmap=clear`), nothing written to OTP | the OTP device key is generated (if blank) and **exported to the server**, then the LUKS2-encrypted OS image (`IGconf_image_pmap=crypt`); the boot partition is re-signed per board |
 
 In every scenario a board goes through the same three stages:
 
@@ -27,11 +27,12 @@ In every scenario a board goes through the same three stages:
 | --- | --- | --- | --- |
 | 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, …) and reboots straight back into RPIBOOT (`set_reboot_order=0x3`, `recovery_reboot=1`). | `external/usbboot/rpi-eeprom` firmware, packed by `docker/scripts/stage1.sh` | `eeprom` |
 | 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` | `gadget` |
-| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / `idpdone`) → `reboot`. | droneos image (`external/droneos` submodule, rpi-image-gen), built in Docker in both variants | `flashed` |
+| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / `idpdone`) → `reboot`. | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants | `flashed` |
 
-Status: the Python and page test suites pass, and the gadget and both image variants build for real.
-**Nothing has been run on a real board yet** (stage 3, the self-built gadget and the device key export
-in particular).
+Status: the open scenario has provisioned a real Pi 5 end to end (stages 1-3). **The secure scenario has not
+been run on a real board yet** (the signed boot chain, the device key export, the encrypted image), and
+neither has an image with Wi-Fi, account and SSH settings: those are checked in the built root filesystem,
+not on a board.
 
 ## Requirements
 
@@ -49,7 +50,7 @@ in particular).
      in the repository root. Google does not treat the secret of a desktop client as confidential, so the
      file can be committed for the team.
 * **Docker** with arm64 emulation: Docker Desktop on Windows (Linux engine), or Docker Engine on Linux. The
-  gadget and droneos builds run in `linux/arm64` containers. The server registers the arm64 binfmt handler
+  gadget and image builds run in `linux/arm64` containers. The server registers the arm64 binfmt handler
   when it is missing (see Troubleshooting). The builds need internet access.
 * **USB driver on Windows:** Chrome can only open devices bound to WinUSB. Install the official
   `rpiboot_setup.exe` (from the [usbboot releases](https://github.com/raspberrypi/usbboot/releases)).
@@ -64,8 +65,7 @@ in particular).
 
   then `sudo udevadm control --reload && sudo udevadm trigger`.
 * **Submodules** of this repo: `git submodule update --init --recursive` (usbboot with its nested
-  rpi-eeprom, pi-gen-micro, droneos with its nested rpi-image-gen). droneos is cloned
-  over SSH (`git@github.com:zarcsis/droneos.git`), so the clone needs a GitHub key with access to it.
+  rpi-eeprom, pi-gen-micro, rpi-image-gen).
 
 ## Quick start
 
@@ -103,10 +103,11 @@ meanwhile and its **Server builds** card shows each job with a live log:
 2. **gadget**: the pi-gen-micro fastboot ramdisk plus our helper packages, built in an arm64 container
    (about 3 minutes). Stage 2 answers "not ready" until it exists — there is no prebuilt fallback, because
    only this gadget carries the device key export.
-3. **image**: the droneos image in both variants, `clear` (open scenario) and `crypt` (secure scenario),
-   several minutes each. The builder image comes from `<droneos>/docker`; each result is collected into an
-   IDP set of sparse pieces ≤ `max_piece_size` with SHA-256 for each piece. Stage 3 answers "not ready" until
-   the variant the board needs is there.
+3. **image**: the OS image in both variants, `clear` (open scenario) and `crypt` (secure scenario),
+   about six minutes each (the first build in a new work volume takes longer). rpi-image-gen runs in the
+   builder image from `image/docker` with a config written from the **OS image** settings (see below); each
+   result is collected into an IDP set of sparse pieces ≤ `max_piece_size` with SHA-256 for each piece.
+   Stage 3 answers "not ready" until the variant the board needs is there.
 
 On Windows, if the Docker engine is not running, the server starts Docker Desktop and waits for it (up to 180 s).
 
@@ -115,9 +116,12 @@ Build rules worth knowing:
 * **Rebuild triggers.** The gadget key is `<pi-gen-micro commit>-<hash of docker/gadget.Dockerfile,
   gadget-entrypoint.sh and every file under docker/gadget-helpers>-<targets>`, so editing any of them makes
   the gadget "not built". An image set is reported as `rebuild needed: …` (status not ready, stage 3 409)
-  when it was built from another droneos commit than the one checked out now (`git describe --tags --always
-  --dirty`), from another `builds.image.config` file content or `overrides`, as another variant, or split
-  with a larger `max_piece_size` than the current setting. The stage-1 identity includes the sha256 of the
+  when it was built from another rpi-image-gen revision than the one checked out now (`git describe --tags
+  --always --dirty` of `image/rpi-image-gen`), from other OS image settings (`image.*`, passwords included),
+  `builds.image.overrides` or station image sources (`image/build.sh`, `image/docker/`, `image/layer/`), as
+  another variant, or split with a larger `max_piece_size` than the current setting. Saving the OS image
+  form starts the rebuild at once (with `builds.auto`); settings saved while a build runs are picked up by
+  the same job, which builds the stale variant again. The stage-1 identity includes the sha256 of the
   selected `pieeprom-*.bin` and `recovery.bin` and the content of `rpi-eeprom-config`, `rpi-eeprom-digest`,
   `rpi-sign-bootcode` and `update-pieeprom.sh`, so a firmware or usbboot submodule update rebuilds stage 1
   (a quick build, about a minute) even when names and sizes stay the same. `builds.auto` rebuilds all of these.
@@ -151,7 +155,46 @@ Build artifacts live **outside the repo**, in the work directory. The default is
 <work>/tmp/heavy.lock                  cross-process lock for gadget/image builds
 ```
 
-Docker volumes `otp-pgm-work` and `otp-droneos-work` keep the build trees and apt caches between runs.
+Docker volumes `otp-pgm-work` and `otp-image-work` keep the build trees and apt caches between runs
+(`otp-droneos-work`, left by earlier versions, is no longer used: `docker volume rm otp-droneos-work`).
+
+## The OS image
+
+What goes into the image is set in the **OS image** panel of the page and kept in the `image.*` rows of the
+`settings` worksheet. Both variants (open and secure) get the same settings.
+
+| Field | Setting | In the image |
+| --- | --- | --- |
+| Hostname | `image.hostname` (`pi5`) | `/etc/hostname` |
+| Time zone (a list) | `image.timezone` (`Europe/Kyiv`) | `/etc/localtime` |
+| User, password | `image.user` (`pi`), `image.password_hash` | the login account; with a password it may `sudo` (with the password) |
+| SSH server, password login, authorized keys | `image.ssh` (off), `image.ssh_password_login` (on), `image.ssh_authorized_keys` | openssh-server and `~/.ssh/authorized_keys`; password login off = keys only |
+| Wi-Fi network, password, country (a list), hidden | `image.wifi_ssid`, `image.wifi_password`, `image.wifi_country` (`UA`), `image.wifi_hidden` | an iwd profile in `/var/lib/iwd/` (DHCP by systemd-networkd), the cfg80211 regulatory domain |
+| Image name | `image.name` (`deb13-arm64-min`) | the name of the image sets |
+
+* **Lists.** Time zone and Wi-Fi country are picked from lists taken from the Debian trixie packages the
+  image installs (`otp_server/image_choices.json`): the zones of `tzdata` (grouped by region, with the
+  current UTC offset; legacy names such as `Europe/Kiev` live in `tzdata-legacy`, which the image does not
+  have) and the countries of `wireless-regdb` (`00` = world), named from `iso-codes`. The server accepts
+  only values from these lists; `python -m otp_server.image_choices` regenerates the file (its docstring
+  has the commands).
+* **Passwords.** The account password is stored only as a SHA-512 crypt hash (`$6$…`, made by the server
+  when you save it). No password and no SSH key means nobody can log in: the page says so. An account with
+  SSH keys but no password gets password-less `sudo`. The Wi-Fi password is stored as typed (it has to
+  reach the board): 8-63 characters, or a 64-digit hex key; empty = an open network. Both passwords are
+  write-only on the page: it shows whether one is set, **remove** clears it.
+* **Saving rebuilds both images** (about 12 minutes); stage 3 waits for the new image. Boards provisioned
+  earlier keep what they got.
+* **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: layers and plain values)
+  and, next to it, the secret files (`secrets/user1.passhash`, `secrets/iwd/<network>.psk`,
+  `secrets/authorized_keys`), mounts them read-only at `/cfg` for the build and deletes them afterwards.
+  Secrets are never config values: rpi-image-gen expands `$` in values. The station layers in `image/layer`
+  are `otp-minbase` (rpi-image-gen's `trixie-minbase` without openssh-server, with the account) and
+  `otp-image` (applies the secret files); `openssh-server` is added only with SSH on.
+  `image/example.yaml` is the config of the default settings (a test keeps it in sync).
+* **Building by hand** (Linux with Docker): `image/build.sh --docker -c image/example.yaml` or your own
+  config; `image/build.sh --help` lists the options. `IGconf_*=value` words after the options are passed to
+  rpi-image-gen; `builds.image.overrides` does the same for the station.
 
 ## Operator procedure
 
@@ -195,7 +238,7 @@ exact bytes confirmed in the irreversible dialog are pinned and served even if t
 
 ## The secure scenario and the device key export
 
-The BCM2712 has one device-unique OTP key slot (`rpi-fw-crypto` key-id 1, ECDSA P-256). The droneos
+The BCM2712 has one device-unique OTP key slot (`rpi-fw-crypto` key-id 1, ECDSA P-256). The crypt
 image unlocks its LUKS root with `HMAC-SHA256(that key, the storage device id)` computed by the firmware
 (keyslot 0, created on the board by rpi-fastbootd during IDP). In the secure scenario the station keeps
 **a copy of that key**, so it can derive the LUKS key of any card used in the board:
@@ -270,14 +313,14 @@ has a 10 s connect / 60 s read timeout.
 
 There is no configuration file. The settings live in the `settings` worksheet of the station spreadsheet:
 `key | value | description`, one row per setting. The server adds a row (with the default value and a
-description) for every setting the sheet lacks and never changes a value you wrote. An empty value means the
-default; switches are `true`/`false`, lists one item per line. The server re-reads the sheet while it runs
+description) for every setting the sheet lacks and removes the rows of retired settings (`paths.droneos`,
+`builds.image.config`); it changes a value only when the OS image panel on the page saves it. An empty value
+means the default; switches are `true`/`false`, lists one item per line. The server re-reads the sheet while it runs
 (at most every 15 s), so **changes need no restart**. A value it cannot use keeps the previous settings and
 is shown on the page; unknown keys produce a warning.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `paths.droneos` | `external/droneos` | droneos checkout the image is built from (relative to the repository root) |
 | `provisioning.default_mode` | `open` | scenario the page preselects for a new board: `open` or `secure` |
 | `provisioning.jtag_lock` | `false` | secure scenario: also burn `program_jtag_lock=1` (IRREVERSIBLE) |
 | `provisioning.recovery_passphrase` | `false` | secure scenario: add a server-derived LUKS passphrase as keyslot 1 |
@@ -286,15 +329,26 @@ is shown on the page; unknown keys produce a warning.
 | `provisioning.firmware_channel` | `default` | rpi-eeprom firmware channel for stage 1: `default` or `latest` |
 | `provisioning.max_piece_size` | `268435456` | largest sparse piece sent to the board (bytes, rpi-fastbootd max-download-size) |
 | `provisioning.boot_conf` | `[all]`, `BOOT_UART=1`, `POWER_OFF_ON_HALT=1`, `BOOT_ORDER=0xf2461` | EEPROM `boot.conf` written in stage 1 (multi-line) |
+| `image.name` | `deb13-arm64-min` | image name (part of the image set names) |
+| `image.hostname` | `pi5` | hostname of the boards |
+| `image.timezone` | `Europe/Kyiv` | time zone of the image's tzdata (the page offers the list) |
+| `image.user` | `pi` | login account created on the boards |
+| `image.password_hash` | (none) | crypt hash of the account password (set it on the page; empty = no password) |
+| `image.ssh` | `false` | SSH server on the boards |
+| `image.ssh_password_login` | `true` | SSH accepts the account password (`false` = keys only) |
+| `image.ssh_authorized_keys` | (none) | SSH public keys of the account, one per line |
+| `image.wifi_ssid` | (none) | Wi-Fi network the boards join (empty = no Wi-Fi profile) |
+| `image.wifi_password` | (none) | Wi-Fi passphrase (8-63 characters or a 64-digit hex key; empty = open network) |
+| `image.wifi_country` | `UA` | Wi-Fi country known to wireless-regdb, two letters (`00` = world; the page offers the list) |
+| `image.wifi_hidden` | `false` | the Wi-Fi network does not broadcast its name |
 | `builds.auto` | `true` | build what is missing (tools, gadget, both images) once the station is signed in |
 | `builds.tools.image_tag` | `otp-tools:latest` | Docker tag of the tools image |
 | `builds.gadget.targets` | `pi5-family` | pi-gen-micro device list of the fastboot gadget |
 | `builds.gadget.image_tag` | `otp-gadget-builder:trixie` | Docker tag of the gadget builder image |
 | `builds.gadget.volume` | `otp-pgm-work` | Docker volume with the gadget build tree |
-| `builds.image.config` | `droneos.yaml` | rpi-image-gen config inside the droneos checkout |
-| `builds.image.overrides` | (none) | extra `KEY=VALUE` overrides for the droneos build, one per line (`IGconf_image_pmap` is set per scenario) |
-| `builds.image.builder_tag` | `droneos-builder:trixie` | Docker tag of the droneos builder image |
-| `builds.image.volume` | `otp-droneos-work` | Docker volume with the droneos build tree |
+| `builds.image.overrides` | (none) | extra `IGconf_KEY=VALUE` overrides for rpi-image-gen, one per line (`IGconf_image_pmap` is set per scenario) |
+| `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
+| `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
 | `builds.image.keep_raw_image` | `false` | keep the raw `.img` next to the sparse pieces |
 | `docker.binary` | `docker` | docker CLI to run |
 | `docker.start_desktop` | `true` | Windows: start Docker Desktop when the engine is down |
@@ -367,6 +421,8 @@ docs are at `/api/docs`.
 | GET | `/api/status` | version, Google login + settings state, effective config, storage, Docker, Windows USB driver, artifact status, current jobs |
 | GET | `/api/google/login` | redirect to Google's consent screen (Google redirects back to `/?state=…&code=…`) |
 | POST | `/api/google/logout` | forget the Google token on this station (the spreadsheet id is kept) |
+| GET | `/api/image` | the OS image settings `{settings, warnings, choices}`: no password or hash, only `password_set` / `wifi_password_set`; `choices` = the time zone and Wi-Fi country lists |
+| POST | `/api/image` | save changed OS image fields (`hostname`, `user`, `ssh`, …; `password` / `wifi_password`: `""` removes, a string sets) → the same view + `saved`; starts the rebuild with `builds.auto` |
 | GET | `/api/modules` | registry, newest first (public view, no secrets) |
 | POST | `/api/modules/hello` | `{serial, chip?, board?, usb?, rom_stage?}` → get or create a board and its secrets |
 | GET | `/api/modules/{serial}` | one board |
@@ -411,13 +467,16 @@ google-oauth-client.json   the Desktop-app OAuth client (you add it)
 otp_server/
   __main__.py              CLI; app.py (services, FastAPI app); api.py (routes)
   config.py                defaults, validation, merging (no config file)
-  settings.py              the settings worksheet
+  settings.py              the settings worksheet (read, complete with defaults, write)
+  imageconfig.py           OS image settings -> rpi-image-gen config + secret files
+  image_choices.py/.json   time zones and Wi-Fi countries of the image (from Debian tzdata, wireless-regdb, iso-codes)
+  passhash.py              SHA-512 crypt ($6$) for the account password
   google_account.py        Google OAuth login, token, the station spreadsheet
   secrets_gen.py           RSA key, customer key hash, device secret, device key parsing, LUKS key
   modules.py               board registry logic, scenarios, device key, stage verdicts
   storage/                 base.py (record schema), gsheets.py (the modules worksheet)
   docker.py, jobs.py       Docker CLI runner; background jobs with logs and SSE
-  artifacts/               tools image, stage 1, gadget + stage 2, droneos images + stage 3
+  artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3
   imagejson.py, sparse.py  rpi-image-gen image.json helpers; Android sparse validation
   winusb.py                Windows WinUSB driver-package check (read-only)
 docker/
@@ -425,12 +484,18 @@ docker/
   scripts/stage1.sh, stage2-sign.sh, boot-resign.sh, image-collect.sh
   gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder
   gadget-helpers/otp-keyexport/             pi-gen-micro helper package: OTP device key export
+image/
+  build.sh                 rpi-image-gen front end (the station runs it with --in-container)
+  docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
+  layer/                   station layers: otp-minbase, otp-image
+  example.yaml             the config of the default OS image settings
+  rpi-image-gen/           submodule
 index.html, css/app.css
 js/server.js               API client; flow.js provisioning state machine; app.js UI
 js/rpiboot.js              rpiboot protocol (port of usbboot main.c); bootdir.js, tar.js, duid.js
 js/fastboot.js             WebUSB fastboot client + IDP + device key export
 tests/                     pytest suites; tests/web/ page self-test and end-to-end test (headless Chrome)
-external/                  submodules
+external/                  submodules (usbboot, pi-gen-micro)
 ```
 
 ## Submodules
@@ -439,16 +504,15 @@ external/                  submodules
 | --- | --- | --- |
 | `external/usbboot` (+ nested `rpi-eeprom`) | raspberrypi/usbboot | `firmware/bootfiles.bin`, EEPROM images and recovery, `update-pieeprom.sh`, `rpi-eeprom-digest`, `rpi-sign-bootcode`, `rpi-make-boot-image` |
 | `external/pi-gen-micro` | raspberrypi/pi-gen-micro | source of the fastboot gadget |
-| `external/droneos` (+ nested `rpi-image-gen`) | zarcsis/droneos | the stage-3 image: `droneos.yaml`, `build.sh`, the builder `docker/Dockerfile` |
+| `image/rpi-image-gen` | raspberrypi/rpi-image-gen (`v2.8.0`) | the image generator of stage 3 (mmdebstrap + genimage + IDP) |
 
-The droneos submodule pins the commit the image is built from: to build newer droneos work, commit and push
-it in droneos, then move the pointer here (`git submodule update --remote external/droneos` for the tip of
-the default branch, or `git -C external/droneos fetch` + `checkout <commit>`; then
-`git submodule update --init --recursive external/droneos` for its nested rpi-image-gen) and commit
-`external/droneos`. The image set's version is `git describe` of that checkout: once the pointer moves (or
+The rpi-image-gen submodule pins the generator: to move to a newer release run
+`git -C image/rpi-image-gen fetch --tags` and `git -C image/rpi-image-gen checkout <tag>`, then commit
+`image/rpi-image-gen`. The image set's version is `git describe` of that checkout: once the pointer moves (or
 the checkout gets uncommitted changes, `-dirty`), the published sets are `rebuild needed` and stage 3 waits
 until the images are rebuilt — automatically with `builds.auto`, or with Build on the page /
-`python -m otp_server build image`.
+`python -m otp_server build image`. The image build tooling (`image/build.sh`, `image/docker/`) came from the
+droneos repository, which the station no longer uses.
 
 **rpi-fastbootd is deliberately not a submodule.** Its repository contains the systemd unit
 `dev-usb\x2dffs-fastboot.mount`, a file name Windows cannot check out, and building it needs Raspberry Pi
@@ -464,13 +528,13 @@ hashes, so apt would otherwise never notice a new or changed helper package).
 
 ```
 python -m pip install -r requirements.txt
-python -B -m pytest -q                        # server: config, settings, Google account, secrets, storage, modules, jobs, docker, artifacts, API, CLI, the key export script
+python -B -m pytest -q                        # server: config, settings, Google account, secrets, storage, modules, jobs, docker, artifacts, OS image config, password hash, API, CLI, the key export script
 python -B tests/web/run_selftest.py           # page: headless Chrome against a fake API (-v for every line)
 python -B tests/web/run_e2e.py                # page + real server on the real artifacts + a mock board, both scenarios
 ```
 
-The Google code is tested against fakes; there is no network access and it has not been run against real
-Google yet. `OTP_DOCKER_TESTS=1` enables a smoke test against the real Docker engine. The page runners find
+The suites test the Google code against fakes (no network access); the station itself has run against real
+Google (sign-in, spreadsheet, settings, registry). `OTP_DOCKER_TESTS=1` enables a smoke test against the real Docker engine. The page runners find
 Chrome via `--chrome`, `$OTP_CHROME`, the default Windows path or `PATH`. The repository has no `.gitignore`
 on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycache__` directories appear.
 

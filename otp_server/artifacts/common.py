@@ -24,7 +24,7 @@ COMPLETE = ".complete"
 PARTIAL_SUFFIX = ".partial"
 OLD_MARK = ".old-"              # <final>.old-<id>: a replaced dir moved aside by commit_partial
 QUICK_BUILD_TIMEOUT = 300.0     # the manifest call waits this long for a per-board quick build
-HEAVY_LOCK = threading.Lock()   # gadget and droneos image builds are CPU-heavy: one at a time
+HEAVY_LOCK = threading.Lock()   # gadget and OS image builds are CPU-heavy: one at a time
 HEAVY_LOCK_FILE = "heavy.lock"  # <work>/tmp/heavy.lock: the same rule across processes (server + CLI)
 STALE_KEYS_AGE = 60.0           # a keys-* dir without its lock file is swept only when older than this
 
@@ -372,7 +372,7 @@ class FileLock:
 
 @contextmanager
 def heavy_lock(work_dir: Path, log_fn: Callable[[str], None] | None = None, poll: float = 2.0) -> Iterator[None]:
-    """One heavy (gadget / droneos image) build at a time, in this process and across processes.
+    """One heavy (gadget / OS image) build at a time, in this process and across processes.
 
     The in-process :data:`HEAVY_LOCK` is backed by an OS lock on ``<work>/tmp/heavy.lock``, so
     ``python -m otp_server build ...`` and a running server never build on the same Docker work volume

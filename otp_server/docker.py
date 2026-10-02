@@ -28,7 +28,7 @@ LogFn = Callable[[str], None]
 # Small multi-arch image used for the arm64 emulation probe (also the tools image base).
 PROBE_IMAGE = "debian:trixie-slim"
 BINFMT_IMAGE = "tonistiigi/binfmt"
-# Same test droneos build.sh runs inside its builder container (binfmt_arm64_present).
+# Same test image/build.sh runs inside its builder container (binfmt_arm64_present).
 BINFMT_CHECK = ("mountpoint -q /proc/sys/fs/binfmt_misc "
                 "|| mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc; "
                 "test -e /proc/sys/fs/binfmt_misc/qemu-aarch64")
@@ -315,10 +315,10 @@ class DockerRunner:
         """True when linux/arm64 containers run AND the kernel has a ``qemu-aarch64`` binfmt entry.
 
         ``uname -m`` alone is not enough: Docker Desktop 29.x registers its own handler under the
-        name ``aarch64``, which runs arm64 containers, but droneos ``build.sh`` (rpi-image-gen runs
+        name ``aarch64``, which runs arm64 containers, but ``image/build.sh`` (rpi-image-gen runs
         arm64 chroots) checks for ``/proc/sys/fs/binfmt_misc/qemu-aarch64`` by name and refuses to
         build without it. ``tonistiigi/binfmt --install arm64`` adds that entry (flags POCF), which is
-        what droneos ``build.ps1`` / ``build.sh --docker`` do on the host.
+        what ``image/build.sh --docker`` does on the host.
         """
         rc, out = self._capture(["run", "--rm", "--platform", "linux/arm64", PROBE_IMAGE, "uname", "-m"],
                                 timeout=600)
@@ -328,7 +328,7 @@ class DockerRunner:
         rc, out = self._capture(["run", "--rm", "--privileged", "--entrypoint", "sh", PROBE_IMAGE, "-c",
                                  BINFMT_CHECK], timeout=120)
         if rc != 0:
-            return False, "no qemu-aarch64 binfmt entry in the Docker VM (droneos build.sh requires it)"
+            return False, "no qemu-aarch64 binfmt entry in the Docker VM (image/build.sh requires it)"
         return True, "aarch64"
 
     def ensure_arm64(self, log: LogFn | None = None) -> None:

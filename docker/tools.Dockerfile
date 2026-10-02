@@ -10,7 +10,7 @@
 #   binutils (strings)               usbboot tools/update-pieeprom.sh version gate
 #   dosfstools, mtools, file         usbboot tools/rpi-make-boot-image, boot-slot FAT32 rebuild
 #   android-sdk-libsparse-utils      simg2img, img2simg, simg2simg, simg_dump
-#   jq, zstd, tar, gawk, sed, grep   JSON manifests, droneos deploy artefacts, bootfiles.bin
+#   jq, zstd, tar, gawk, sed, grep   JSON manifests, rpi-image-gen deploy artefacts, bootfiles.bin
 #
 # Build (context = docker/):
 #   docker build -t otp-tools:latest -f docker/tools.Dockerfile docker/

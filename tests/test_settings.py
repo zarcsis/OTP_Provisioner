@@ -63,7 +63,12 @@ class FakeWorksheet:
             raise self.fail[name]
 
     def writes(self) -> list[tuple]:
-        return [c for c in self.calls if c[0] in ("update", "append_rows")]
+        return [c for c in self.calls if c[0] in ("update", "append_rows", "delete_rows")]
+
+    def delete_rows(self, start_index, end_index=None):
+        self._call("delete_rows", start_index, end_index)
+        end = start_index if end_index is None else end_index
+        del self.rows[start_index - 1:end]
 
     def get_all_values(self) -> list[list[str]]:
         """Like the Sheets API + gspread: trailing empty rows are not returned, rows are padded."""
@@ -181,12 +186,17 @@ def test_setting_defaults_are_defaults_without_bootstrap():
     assert len(keys) == len(set(keys))
     assert not [k for k in keys if k == "server" or k.startswith("server.")]
     assert "paths.work" not in keys
-    assert "paths.droneos" in keys
+    assert "paths.droneos" not in keys and "builds.image.config" not in keys     # retired
+    assert [k for k in keys if k.startswith("image.")] == [
+        "image.name", "image.hostname", "image.timezone", "image.user", "image.password_hash", "image.ssh",
+        "image.ssh_password_login", "image.ssh_authorized_keys", "image.wifi_ssid", "image.wifi_password",
+        "image.wifi_country", "image.wifi_hidden"]
     # exactly the leaves of DEFAULTS, in DEFAULTS order, with the DEFAULTS values
     expected = [(k, v) for k, v in flatten(DEFAULTS) if not k.startswith("server.") and k != "paths.work"]
     assert items == expected
-    assert keys[0] == "paths.droneos"
-    assert keys.index("provisioning.default_mode") < keys.index("builds.auto") < keys.index("docker.binary")
+    assert keys[0] == "provisioning.default_mode"
+    assert (keys.index("provisioning.default_mode") < keys.index("image.hostname") < keys.index("builds.auto")
+            < keys.index("docker.binary"))
     d = dict(items)
     assert d["provisioning.default_mode"] == "open"
     assert d["provisioning.boot_conf"] == DEFAULT_BOOT_CONF
@@ -237,17 +247,19 @@ def test_decode_builds_a_nested_text_tree():
     tree, unknown = decode_rows({
         "provisioning.default_mode": " secure ",
         "provisioning.jtag_lock": "TRUE",
-        "builds.image.config": "configs/x.yaml",
+        "builds.image.config": "configs/x.yaml",        # retired: neither a value nor an unknown key
         "builds.image.keep_raw_image": "yes",
         "docker.idle_timeout": " 60 ",
-        "paths.droneos": "../dos",
+        "paths.droneos": "../dos",                       # retired
+        "image.hostname": " drone7 ",
+        "image.wifi_password": "  spaced pass ",         # kept exactly
     })
     assert unknown == []
     assert tree == {
         "provisioning": {"default_mode": "secure", "jtag_lock": "TRUE"},
-        "builds": {"image": {"config": "configs/x.yaml", "keep_raw_image": "yes"}},
+        "builds": {"image": {"keep_raw_image": "yes"}},
         "docker": {"idle_timeout": "60"},     # stays text: load_config validates it
-        "paths": {"droneos": "../dos"},
+        "image": {"hostname": "drone7", "wifi_password": "  spaced pass "},
     }
 
 
@@ -297,7 +309,6 @@ def test_decode_reports_unknown_keys():
 
 def test_decoded_values_are_validated_end_to_end(tmp_path):
     rows = {
-        "paths.droneos": str(tmp_path / "dos"),
         "provisioning.default_mode": "SECURE",
         "provisioning.jtag_lock": "true",
         "provisioning.recovery_passphrase": "yes",
@@ -306,8 +317,13 @@ def test_decoded_values_are_validated_end_to_end(tmp_path):
         "provisioning.firmware_channel": "latest",
         "provisioning.max_piece_size": "0x8000000",
         "builds.auto": "no",
-        "builds.image.config": "configs/x.yaml",
         "builds.image.overrides": "A=1\nB=2",
+        "image.hostname": "Drone7",
+        "image.ssh": "yes",
+        "image.ssh_authorized_keys": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD a@b",
+        "image.wifi_ssid": "Field",
+        "image.wifi_password": "pass word!",
+        "image.wifi_country": "de",
         "builds.image.keep_raw_image": "on",
         "docker.binary": "podman",
         "docker.start_desktop": "off",
@@ -321,7 +337,9 @@ def test_decoded_values_are_validated_end_to_end(tmp_path):
     assert (p.jtag_lock, p.recovery_passphrase, p.confirm_irreversible, p.erase_storage) == (True, True, False, False)
     assert cfg.builds.auto is False and cfg.builds.image.keep_raw_image is True
     assert cfg.builds.image.overrides == ["A=1", "B=2"]
-    assert cfg.image_config_path == tmp_path / "dos" / "configs" / "x.yaml"
+    i = cfg.image
+    assert i.hostname == "drone7" and i.ssh is True and len(i.ssh_authorized_keys) == 1
+    assert (i.wifi_ssid, i.wifi_password, i.wifi_country) == ("Field", "pass word!", "DE")
     assert cfg.docker.binary == "podman" and cfg.docker.start_desktop is False and cfg.docker.idle_timeout == 0
     assert cfg.unknown_keys == []
 
@@ -451,12 +469,64 @@ def test_operator_values_are_never_overwritten(tmp_path):
 
 def test_complete_sheet_is_left_alone():
     full = [list(HEADER)] + default_rows()
-    full[1][1] = "elsewhere/droneos"
+    full[1][1] = "secure"
     account, ws = sheet_with([list(r) for r in full])
     rows = SettingsSheet(account).read()
     assert ws.writes() == []
     assert ws.rows == full
-    assert rows["paths.droneos"] == "elsewhere/droneos"
+    assert rows["provisioning.default_mode"] == "secure"
+
+
+def test_retired_rows_are_removed_from_the_sheet(caplog):
+    caplog.set_level(logging.INFO, logger="otp_server.settings")
+    full = [list(HEADER)] + default_rows()
+    full.insert(1, ["paths.droneos", "external/droneos", "droneos checkout"])
+    full.insert(9, ["builds.image.config", "droneos.yaml", "rpi-image-gen config inside the droneos checkout"])
+    full.append(["paths.droneos", "again", "a duplicate further down"])
+    account, ws = sheet_with([list(r) for r in full])
+    rows = SettingsSheet(account).read()
+    assert "paths.droneos" not in rows and "builds.image.config" not in rows
+    deletes = [c for c in ws.calls if c[0] == "delete_rows"]
+    assert [c[1] for c in deletes] == [len(full), 10, 2]           # bottom up: the row numbers stay valid
+    assert ws.rows == [list(HEADER)] + default_rows()
+    assert any("removed the retired setting paths.droneos" in r.getMessage() for r in caplog.records)
+    assert SettingsSheet(account).read() == rows                     # nothing left to remove
+    assert [c for c in ws.calls if c[0] == "delete_rows"] == deletes
+
+
+def test_write_updates_value_cells_and_appends_missing_rows():
+    full = [list(HEADER)] + [r for r in default_rows() if r[0] != "image.wifi_ssid"]
+    account, ws = sheet_with([list(r) for r in full])
+    sheet = SettingsSheet(account)
+    written = sheet.write({"image.hostname": "drone7", "image.ssh": True, "image.wifi_country": "00",
+                           "image.ssh_authorized_keys": ["k1", "k2"], "image.wifi_ssid": "=SUM(A1)",
+                           "image.wifi_password": "  spaced  "})
+    assert written == {"image.hostname": "drone7", "image.ssh": "true", "image.wifi_country": "00",
+                       "image.ssh_authorized_keys": "k1\nk2", "image.wifi_ssid": "=SUM(A1)",
+                       "image.wifi_password": "  spaced  "}
+    updates = [c for c in ws.calls if c[0] == "update"]
+    assert all(c[3] == "RAW" for c in updates)                        # 00 stays text, =... is no formula
+    row_of = {r[0]: n for n, r in enumerate(ws.rows, start=1)}
+    assert ("update", [["drone7"]], f"B{row_of['image.hostname']}", "RAW") in ws.calls
+    appended = [c for c in ws.calls if c[0] == "append_rows"]
+    assert appended == [("append_rows", [["image.wifi_ssid", "=SUM(A1)", DESCRIPTIONS["image.wifi_ssid"]]], "RAW", "A1")]
+    rows = sheet.read()
+    assert rows["image.hostname"] == "drone7" and rows["image.wifi_country"] == "00"
+    assert rows["image.ssh_authorized_keys"] == "k1\nk2" and rows["image.wifi_password"] == "  spaced  "
+    tree, unknown = decode_rows(rows)
+    assert unknown == [] and tree["image"]["wifi_password"] == "  spaced  "
+
+
+def test_write_refuses_unknown_keys_and_maps_google_errors():
+    account, ws = sheet_with([list(HEADER)] + default_rows())
+    sheet = SettingsSheet(account)
+    with pytest.raises(ValueError, match="not a setting: image.nope, paths.droneos"):
+        sheet.write({"image.nope": 1, "paths.droneos": "x", "image.user": "pi"})
+    assert ws.writes() == []
+    assert sheet.write({}) == {}
+    ws.fail["update"] = ConnectionError("reset")
+    with pytest.raises(StoreError):
+        sheet.write({"image.user": "op"})
 
 
 def test_comments_blank_rows_and_duplicates_ignored(caplog):

@@ -851,8 +851,8 @@
 
         {
             const { files, m1, m2, m3 } = await buildServerFiles();
-            const job = { id: 'job3', target: 'image', title: 'Build droneos image', status: 'running' };
-            const api = new T.FakeApi({ files, manifests: { 1: m1, 2: m2, 3: (k) => (k <= 2 ? { ready: false, reason: 'the droneos image is being built', job } : m3) } });
+            const job = { id: 'job3', target: 'image', title: 'Build OS images (clear + crypt)', status: 'running' };
+            const api = new T.FakeApi({ files, manifests: { 1: m1, 2: m2, 3: (k) => (k <= 2 ? { ready: false, reason: 'the OS image is being built', job } : m3) } });
             const hub = new T.MockHub();
             const board = new T.MockBoard(hub, { serial: 'a7eb274c', keyHash: KEYHASH, stage1Timeouts: { 6: 3 }, fastboot: { keyGenDelayMs: 30 } });
             board.powerOnRom();
@@ -1505,6 +1505,158 @@
             eq((await a.deviceKey('0c4f88d1', { key_der_b64: T.b64(KEY_A.der), device_key_pem: KEY_A.pem })).device_key.already, true, 'deviceKey: the same key again → already');
             await throwsLike(() => a.deviceKey('0c4f88d1', { key_der_b64: '%%%', device_key_pem: KEY_A.pem }), /not valid base64/, 'deviceKey: bad base64 → 400');
             await fakeReset();
+        }
+
+        // ================================================================ T15 OS image panel (image.* settings)
+        section = 'page-image';
+        {
+            const form = document.getElementById('image-form');
+            const f = (n) => form.elements.namedItem(n);
+            const save = document.getElementById('btn-image-save');
+            const revert = document.getElementById('btn-image-revert');
+            const status = document.getElementById('image-status');
+            const warn = () => [...document.querySelectorAll('#image-warnings li')].map((li) => li.textContent);
+            await fakeReset();
+            app.img.loaded = null;
+            await app.loadImageSettings();
+            eq(f('hostname').value, 'pi5', 'loaded from GET /api/image');
+            eq(`${f('user').value}:${f('timezone').value}:${f('wifi_country').value}:${f('name').value}`,
+                'pi:Europe/Kyiv:UA:deb13-arm64-min', 'the other fields');
+            eq(`${f('ssh').checked}:${f('ssh_password_login').checked}`, 'false:true', 'SSH off, password login on');
+            eq(`${f('ssh_password_login').disabled}:${f('ssh_authorized_keys').disabled}`, 'true:true', 'SSH off: its options are disabled');
+            eq(`${save.disabled}:${revert.disabled}`, 'true:true', 'nothing changed: Save and Revert disabled');
+            eq(f('password').placeholder, 'none: password login is off', 'no password: the placeholder says so');
+            eq(form.querySelector('button[data-remove="password"]').disabled, true, 'no password: "remove" is disabled');
+            deq(warn(), ['no password and no SSH key: nobody can log in as pi (console or SSH)'], 'server warnings are listed');
+
+            // time zone and Wi-Fi country are lists (the image's tzdata and wireless-regdb, from the server)
+            const tzSel = f('timezone');
+            const ccSel = f('wifi_country');
+            eq(`${tzSel.tagName}:${ccSel.tagName}`, 'SELECT:SELECT', 'time zone and country are lists');
+            eq(tzSel.options.length, 313, 'time zone list: the 312 canonical zones of zone1970.tab + UTC');
+            eq(tzSel.options[0].value + '|' + tzSel.options[0].textContent, 'UTC|UTC', 'UTC comes first, outside the regions');
+            deq([...tzSel.querySelectorAll('optgroup')].map((g) => g.label),
+                ['Africa', 'America', 'Antarctica', 'Asia', 'Atlantic', 'Australia', 'Europe', 'Indian', 'Pacific'], 'zones are grouped by region');
+            const kyiv = [...tzSel.options].find((o) => o.value === 'Europe/Kyiv');
+            assert(kyiv && /^Kyiv \(UTC\+0[23]:00\)$/.test(kyiv.textContent) && kyiv.parentElement.label === 'Europe',
+                'an option shows the city and its current UTC offset', kyiv && kyiv.textContent);
+            const ba = [...tzSel.options].find((o) => o.value === 'America/Argentina/Buenos_Aires');
+            eq(ba && ba.textContent.replace(/ \(.*\)$/, ''), 'Argentina/Buenos Aires', 'deeper names keep their path, underscores become spaces');
+            eq(tzSel.value, 'Europe/Kyiv', 'the saved time zone is selected');
+            eq([...tzSel.options].some((o) => o.value === 'Europe/Kiev'), false, 'legacy names (tzdata-legacy) are not offered');
+            eq(ccSel.options.length, 182, 'country list: every country of wireless-regdb');
+            eq(ccSel.options[0].value + '|' + ccSel.options[0].textContent, '00|World (most restrictive) (00)', 'the world domain comes first');
+            const names = [...ccSel.options].slice(1).map((o) => o.textContent);
+            deq(names, names.slice().sort((a, b) => a.localeCompare(b)), 'the countries are sorted by name');
+            assert(names.includes('Ukraine (UA)') && names.includes('Poland (PL)'), 'options read "Name (code)"');
+            eq(ccSel.value, 'UA', 'the saved country is selected');
+            // a value typed into the sheet by hand that the list lacks stays visible and selected
+            app.img.loaded = Object.assign({}, app.img.loaded, { timezone: 'Etc/GMT-3' });
+            const loadedBefore = app.img.loaded;
+            document.getElementById('btn-image-revert').disabled = false;
+            document.getElementById('btn-image-revert').click();
+            const extra = tzSel.querySelector('option[data-extra]');
+            assert(extra && extra.value === 'Etc/GMT-3' && tzSel.value === 'Etc/GMT-3' && /not in the list/.test(extra.textContent),
+                'a value outside the list is kept as an extra option', extra && extra.textContent);
+            eq(save.disabled, true, 'that is no change');
+            app.img.loaded = Object.assign({}, loadedBefore, { timezone: 'Europe/Kyiv' });
+            document.getElementById('btn-image-revert').disabled = false;
+            document.getElementById('btn-image-revert').click();
+            eq(`${tzSel.querySelectorAll('option[data-extra]').length}:${tzSel.value}`, '0:Europe/Kyiv', 'the extra option goes away again');
+
+            const sent = [];
+            const realSave = OTP.api.saveImageSettings;
+            OTP.api.saveImageSettings = (body) => { sent.push(JSON.parse(JSON.stringify(body))); return realSave.call(OTP.api, body); };
+            const type = (name, value) => { f(name).value = value; f(name).dispatchEvent(new Event('input', { bubbles: true })); };
+            const tick = (name, on) => { f(name).checked = on; f(name).dispatchEvent(new Event('change', { bubbles: true })); };
+            try {
+                type('hostname', 'Drone-7');
+                eq(`${save.disabled}:${revert.disabled}`, 'false:false', 'an edit enables Save and Revert');
+                revert.click();
+                eq(`${f('hostname').value}:${save.disabled}`, 'pi5:true', 'Revert restores the loaded values');
+
+                type('hostname', 'Drone-7');
+                type('password', 'pw 1$');
+                tick('ssh', true);
+                eq(f('ssh_authorized_keys').disabled, false, 'SSH on: the keys are editable');
+                type('ssh_authorized_keys', 'ssh-ed25519 AAAA key1\n\n  ssh-ed25519 BBBB key2  ');
+                type('wifi_ssid', 'Field Net');
+                type('wifi_password', 'password1');
+                type('wifi_country', 'PL');
+                type('timezone', 'Europe/Warsaw');
+                save.click();
+                await until(() => sent.length === 1 && !app.img.saving, 3000, 'save 1');
+                deq(sent[0], { hostname: 'Drone-7', timezone: 'Europe/Warsaw', wifi_ssid: 'Field Net', wifi_country: 'PL', ssh: true,
+                    ssh_authorized_keys: ['ssh-ed25519 AAAA key1', 'ssh-ed25519 BBBB key2'], password: 'pw 1$', wifi_password: 'password1' },
+                    'Save sends only what changed (picked list values, keys one per line, passwords as typed)');
+                eq(`${tzSel.value}:${ccSel.value}`, 'Europe/Warsaw:PL', 'after the save the lists show the saved values');
+                await until(() => /^Saved: /.test(status.textContent), 3000, 'saved message');
+                assert(/hostname/.test(status.textContent) && /rebuilds both images/.test(status.textContent) && !status.classList.contains('bad'),
+                    'the status names what was saved and the rebuild', status.textContent);
+                eq(f('hostname').value, 'drone-7', 'the form shows the server\'s normalised value');
+                eq(`${f('password').value}|${f('wifi_password').value}`, '|', 'the password fields are emptied after a save');
+                eq(f('password').placeholder, 'set: type to change', 'a saved password: placeholder');
+                eq(f('wifi_password').placeholder, 'saved: type to change', 'a saved Wi-Fi password: placeholder');
+                eq(save.disabled, true, 'saved: nothing left to save');
+                deq(warn(), [], 'no warnings once a password is set');
+
+                const rmWifi = form.querySelector('button[data-remove="wifi_password"]');
+                eq(rmWifi.disabled, false, 'a saved Wi-Fi password can be removed');
+                rmWifi.click();
+                eq(`${rmWifi.textContent}:${save.disabled}`, 'keep:false', 'remove: the button offers "keep", Save is enabled');
+                eq(f('wifi_password').placeholder, 'will be removed (open network)', 'remove: the placeholder says what happens');
+                rmWifi.click();
+                eq(`${rmWifi.textContent}:${save.disabled}`, 'remove:true', 'keep: no change any more');
+                rmWifi.click();
+                save.click();
+                await until(() => sent.length === 2 && !app.img.saving, 3000, 'save 2');
+                deq(sent[1], { wifi_password: '' }, 'removing the Wi-Fi password sends ""');
+                await until(() => app.img.loaded && app.img.loaded.wifi_password_set === false, 3000, 'reloaded');
+                assert(warn().some((w) => /the board joins it as an open network/.test(w)), 'warning: an open network', warn().join(' | '));
+
+                type('wifi_password', 'password2');
+                eq(rmWifi.disabled, true, 'nothing saved to remove: "remove" is disabled again');
+
+                const showPw = form.querySelector('button[data-show="password"]');
+                showPw.click();
+                eq(`${f('password').type}:${showPw.textContent}`, 'text:hide', 'show: the password is visible');
+                showPw.click();
+                eq(`${f('password').type}:${showPw.textContent}`, 'password:show', 'hide: masked again');
+                type('wifi_password', '');
+
+                type('hostname', 'bad_host');
+                save.click();
+                await until(() => sent.length === 3 && !app.img.saving, 3000, 'save 3');
+                assert(/^Not saved: .*image\.hostname/.test(status.textContent) && status.classList.contains('bad'),
+                    'a rejected save is shown as an error', status.textContent);
+                eq(f('hostname').value, 'bad_host', 'the rejected edit stays in the form');
+                type('hostname', 'drone-7');
+                eq(save.disabled, true, 'back to the saved value: nothing to save');
+            } finally {
+                OTP.api.saveImageSettings = realSave;
+            }
+
+            await fakeStatus({ google_ready: false, google: { signed_in: false } });
+            eq(`${f('hostname').disabled}:${save.disabled}`, 'true:true', 'signed out: the form is disabled');
+            eq(app.img.loaded, null, 'signed out: the loaded settings are dropped (the next account has its own)');
+            await fakeReset();
+            await until(() => !f('hostname').disabled, 3000, 'reloaded after the sign-in');
+            eq(f('hostname').value, 'pi5', 'signed in again: the settings are loaded afresh');
+
+            // a failed load is shown and stays shown
+            const realGet = OTP.api.imageSettings;
+            OTP.api.imageSettings = async () => { throw Object.assign(new Error('boom'), { detail: 'settings sheet unreachable' }); };
+            try {
+                app.img.loaded = null;
+                await app.loadImageSettings();
+                app.renderImagePanel();
+                assert(/^Image settings: settings sheet unreachable/.test(status.textContent) && status.classList.contains('bad'),
+                    'a failed load is reported (and not wiped by the next render)', status.textContent);
+            } finally {
+                OTP.api.imageSettings = realGet;
+            }
+            await app.loadImageSettings();
+            eq(status.textContent, '', 'a successful load clears the error');
         }
     } catch (e) {
         results.push('EXCEPTION: ' + ((e && e.stack) || e));

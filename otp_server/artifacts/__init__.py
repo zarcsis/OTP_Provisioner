@@ -33,7 +33,7 @@ from .tools import TITLE as TOOLS_TITLE, ToolsImage
 __all__ = ["Artifacts", "NotReady", "StageFile", "TARGETS"]
 
 TARGETS = ("tools", "gadget", "image")
-TITLES = {"tools": TOOLS_TITLE, "gadget": "Build fastboot gadget", "image": "Build droneos images (clear + crypt)"}
+TITLES = {"tools": TOOLS_TITLE, "gadget": "Build fastboot gadget", "image": "Build OS images (clear + crypt)"}
 MAX_PINNED = 1024       # (board, stage) manifests remembered for downloads
 
 log = logging.getLogger(__name__)
@@ -96,7 +96,7 @@ class Artifacts:
         return self.jobs.submit(target, TITLES[target], fn, dedupe=True)
 
     def auto_build(self) -> list:
-        """Start what is missing: tools image, gadget, the droneos images (both variants)."""
+        """Start what is missing: tools image, gadget, the OS images (both variants)."""
         started = []
         if not self.tools.ready():
             started.append(self.start_build("tools"))

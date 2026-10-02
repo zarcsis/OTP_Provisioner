@@ -6,7 +6,7 @@
 For every scenario the runner
   1. starts ITS OWN server: python -B tests/web/e2e_server.py --port <free> --registry <temp dir> -- the real app
      without Google (nothing gated) and with an in-memory registry that is also dumped to <temp dir>/<serial>.json.
-     The work dir stays the default one, so the real tools image, gadget and both droneos images (clear + crypt)
+     The work dir stays the default one, so the real tools image, gadget and both OS images (clear + crypt)
      are reused. Before the first run it waits (GET /api/builds every 20 s, up to 40 min) until tools, gadget and
      image (both variants) are ready (and the builds of a live server on :8765, if any, are finished); it never
      starts a build itself;
