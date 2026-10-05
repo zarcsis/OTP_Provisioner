@@ -28,6 +28,7 @@ from otp_server import imagejson
 from otp_server.artifacts import Artifacts, NotReady
 from otp_server.artifacts.image import KEY_EXPORT, VARIANTS
 from otp_server.artifacts.stage1 import config_txt, signed_boot_conf
+from otp_server.firstboot import wifi_psk
 from otp_server.jobs import JobManager
 from otp_server.modules import ModuleService
 from otp_server.secrets_gen import luks_passphrase
@@ -111,7 +112,7 @@ def make_repo(base: Path) -> tuple[Path, Path]:
     (repo / "docker" / "scripts").mkdir(parents=True)
     for name in ("tools.Dockerfile", "tools-entrypoint.sh", "gadget.Dockerfile", "gadget-entrypoint.sh"):
         (repo / "docker" / name).write_text(f"# {name}\n", encoding="utf-8")
-    for name in ("stage1.sh", "stage2-sign.sh", "boot-resign.sh", "image-collect.sh"):
+    for name in ("stage1.sh", "stage2-sign.sh", "boot-slot.sh", "image-collect.sh"):
         (repo / "docker" / "scripts" / name).write_text(f"#!/bin/bash\n# {name}\n", encoding="utf-8")
     helpers = repo / "docker" / "gadget-helpers" / "otp-keyexport"
     helpers.mkdir(parents=True)
@@ -300,13 +301,21 @@ def h_collect(call, *, corrupt: str = ""):
     (out / "collect.json").write_text(json.dumps(collect), encoding="utf-8")
 
 
-def h_resign(call):
+def h_boot_slot(call):
+    """boot-slot.sh: records the first-boot files it was given (``call["seed"]``) and the cmdline additions."""
     out = out_dir(call)
     s = call["env"]["SIMAGE"]
+    signed = call["env"]["SIGN"] == "1"
     assert (Path(call["mounts"]["/in"].source) / s).is_file()
+    assert ("/keys" in call["mounts"]) == signed
+    seed = Path(call["mounts"]["/seed"].source)
+    call["seed"] = {f.name: f.read_bytes() for f in (seed / "files").iterdir()}
+    call["cmdline"] = (seed / "cmdline.append").read_text(encoding="utf-8").strip()
     make_sparse(out / s, [("raw", 1), ("dc", 31)])
-    (out / "resign.json").write_text(json.dumps({"simage": s, "pieces": [{"file": s, "size": (out / s).stat().st_size}]}),
-                                     encoding="utf-8")
+    (out / "slot.json").write_text(json.dumps({"simage": s, "signed": signed, "cmdline": "console=tty1 " + call["cmdline"],
+                                               "seed": sorted(call["seed"]),
+                                               "pieces": [{"file": s, "size": (out / s).stat().st_size}]}),
+                                   encoding="utf-8")
 
 
 # ---------------------------------------------------------------------- environment
@@ -355,7 +364,7 @@ def make_env(make_cfg, tmp_path):
         cfg = make_cfg(tmp_path, repo_root=repo, paths=paths, **overrides)
         docker = FakeDocker()
         docker.handlers.update({"stage1.sh": h_stage1, "stage2-sign.sh": h_stage2, "image-collect.sh": h_collect,
-                                "boot-resign.sh": h_resign, cfg.builds.gadget.image_tag: h_gadget,
+                                "boot-slot.sh": h_boot_slot, cfg.builds.gadget.image_tag: h_gadget,
                                 cfg.builds.image.builder_tag: h_builder})
         jobs = JobManager(cfg.work_dir)
         store = MemoryStore()
@@ -768,7 +777,7 @@ def test_secure_board_needs_stage1_before_stages_2_and_3(make_env, how):
     m3 = env.arts.stage_manifest(SERIAL, 3)
     assert m3["mode"] == "signed" and m3["scenario"] == "secure" and m3["image"]["variant"] == "crypt"
     assert m3["fwcrypto_init"] is True and m3["key_export"] == KEY_EXPORT
-    assert len(env.docker.runs_of("boot-resign.sh")) == 1
+    assert [r["env"]["SIGN"] for r in env.docker.runs_of("boot-slot.sh")] == ["1"]
     # an open board is not held back by the rule
     env.board(SERIAL2, mode="open")
     assert env.arts.stage_manifest(SERIAL2, 2)["mode"] == "unsigned"
@@ -819,8 +828,9 @@ def test_image_build_argv_and_collect(make_env):
         cfg_dir = Path(r["mounts"]["/cfg"].source)
         assert r["mounts"]["/cfg"].readonly and cfg_dir.parent == env.image_root / "cfg"
         assert not cfg_dir.exists()                          # the config dir (secrets) is gone after the build
-        assert "  base: otp-minbase\n  station: otp-image\n" in r["config"] and "openssh-server" not in r["config"]
-        assert r["secret_files"] == {}                       # defaults: no password, no Wi-Fi, no SSH
+        assert "  base: otp-rpios-lite\n  station: otp-rpios-setup\n" in r["config"]
+        assert '  hostname: "raspberrypi"\n  user1: "pi"\n' in r["config"]   # board settings are not in it
+        assert r["secret_files"] == {}
     b = [x for x in env.docker.builds if x["tag"] == BUILDER_TAG]
     assert b and all(x["context"] == env.cfg.image_dir / "docker" for x in b)
     assert all(x["dockerfile"] == env.cfg.image_dir / "docker" / "Dockerfile" for x in b)
@@ -845,7 +855,7 @@ def test_image_build_argv_and_collect(make_env):
         assert man["overrides"] == [f"IGconf_image_pmap={v}"]
         assert man["config_hash"] == env.arts.image.config_hash(v)
         assert man["sources_hash"] == env.arts.image.sources_hash() and "rpi_image_gen_commit" in man
-        assert man["image_settings"]["hostname"] == "pi5" and man["image_settings"]["password_set"] is False
+        assert man["image_settings"] == {"name": "rpios-trixie-arm64-lite", "base": "Raspberry Pi OS Lite"}
         assert "droneos_commit" not in man and "config" not in man
         assert [p["name"] for p in man["simages"]["root.ext4.sparse"]] == ["root.ext4.sparse.0", "root.ext4.sparse.1"]
         assert man["simages"]["root.ext4.sparse"][1]["sha256"] == sha(set_dir / "root.ext4.sparse.1")
@@ -982,7 +992,7 @@ def test_stage3_open_manifest(make_env):
     assert m["stage"] == 3 and m["kind"] == "fastboot-idp" and m["title"] == "Image" and m["mode"] == "unsigned"
     assert m["scenario"] == "open"
     assert m["image"]["variant"] == "clear" and m["image"]["encrypted"] is False
-    assert m["image"]["set"] == clear_man["set"] and m["image"]["name"] == "deb13-arm64-min"
+    assert m["image"]["set"] == clear_man["set"] and m["image"]["name"] == "deb13-arm64-min"   # h_collect's
     assert m["image"]["storage_type"] == "sd" and m["image"]["device_class"] == "pi5"
     # nothing touches OTP: no fwcrypto init, no key export, no LUKS passphrase
     assert m["fwcrypto_init"] is False and m["key_export"] is None and m["crypt"] == []
@@ -1003,7 +1013,26 @@ def test_stage3_open_manifest(make_env):
     assert ij.parent == clear_dir and imagejson.is_encrypted(imagejson.load(ij)) is False
     with pytest.raises(FileNotFoundError):
         env.arts.stage_file(SERIAL, 3, "manifest.json")
-    assert len(env.docker.runs) == n_runs                        # unsigned stage 3 needs no docker
+    # the boot partition is the board's own: the image's, with its first-boot files (not re-signed)
+    runs = env.docker.runs[n_runs:]
+    assert [r["args"][:1] for r in runs] == [["boot-slot.sh"]]
+    r = runs[0]
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "0", "MAX_PIECE": "268435456"}
+    assert Path(r["mounts"]["/in"].source) == clear_dir and "/keys" not in r["mounts"]
+    assert r["mounts"]["/seed"].readonly and not Path(r["mounts"]["/seed"].source).exists()   # removed after the run
+    assert sorted(r["seed"]) == ["meta-data", "user-data"]                 # no Wi-Fi network: no network-config
+    assert r["seed"]["user-data"].startswith(b"#cloud-config\n")
+    assert f'hostname: "pi5-{SERIAL}"'.encode() in r["seed"]["user-data"]
+    iid = m["firstboot"]["instance_id"]
+    assert r["seed"]["meta-data"] == f"instance-id: {iid}\n".encode() and iid.startswith(f"otp-{SERIAL}-")
+    assert r["cmdline"] == f"cfg80211.ieee80211_regdom=UA ds=nocloud;i={iid}"
+    assert m["firstboot"]["hostname"] == f"pi5-{SERIAL}" and m["firstboot"]["account"] == "first-boot wizard"
+    assert any(n.startswith("first boot (cloud-init") for n in m["notes"])
+    boot = env.arts.stage_file(SERIAL, 3, "boot.vfat.sparse")
+    assert boot.parent.parent == env.cfg.work_dir / "modules" / SERIAL / "stage3"
+    assert sha(boot) == m["parts"]["boot.vfat.sparse"][0]["sha256"]
+    env.arts.stage_manifest(SERIAL, 3)                           # made once per board and settings
+    assert len(env.docker.runs_of("boot-slot.sh")) == 1
 
 
 def test_stage3_open_scenario_ignores_recovery_passphrase(make_env):
@@ -1044,7 +1073,7 @@ def test_stage3_secure_manifest(make_env):
             assert sha(path) == p["sha256"]
     ij = env.arts.stage_file(SERIAL, 3, "image.json")
     assert ij.parent == crypt_dir and imagejson.is_encrypted(imagejson.load(ij)) is True
-    assert [r["args"][:1] for r in env.docker.runs[n_runs:]] == [["boot-resign.sh"]]   # the only docker run
+    assert [r["args"][:1] for r in env.docker.runs[n_runs:]] == [["boot-slot.sh"]]   # the only docker run
 
 
 def test_stage3_secure_with_recovery_passphrase(make_env):
@@ -1066,8 +1095,9 @@ def test_stage3_signed_resigns_boot_slot(make_env, chosen):
     m = env.arts.stage_manifest(SERIAL, 3)
     assert m["mode"] == "signed" and m["scenario"] == "secure" and m["image"]["variant"] == "crypt"
     assert m["fwcrypto_init"] is True and m["key_export"] == KEY_EXPORT
-    r = env.docker.runs_of("boot-resign.sh")[0]
-    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "MAX_PIECE": "268435456"}
+    r = env.docker.runs_of("boot-slot.sh")[0]
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "1", "MAX_PIECE": "268435456"}
+    assert sorted(r["seed"]) == ["meta-data", "user-data"]               # first-boot files on signed boards too
     crypt_set = env.current("crypt")["set"]
     assert Path(r["mounts"]["/in"].source) == env.image_root / crypt_set
     assert r["mounts"]["/in"].readonly and r["keys_files"] == ["private.pem", "public.pem"]
@@ -1079,7 +1109,7 @@ def test_stage3_signed_resigns_boot_slot(make_env, chosen):
     # root pieces still come from the shared crypt set
     assert env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0").parent.name == crypt_set
     env.arts.stage_manifest(SERIAL, 3)
-    assert len(env.docker.runs_of("boot-resign.sh")) == 1
+    assert len(env.docker.runs_of("boot-slot.sh")) == 1
 
 
 def test_stage3_follows_the_board_scenario(make_env):
@@ -1501,36 +1531,42 @@ def test_image_unknown_rpi_image_gen_version_keeps_serving(make_env, rig_git):
         assert env.arts.stage_manifest(serial, 3)["image"]["version"] == "368e8f0"
 
 
-def test_image_config_change_needs_rebuild(make_env):
+def test_board_settings_need_no_rebuild_but_the_image_name_does(make_env):
     env = make_env()
     build_image(env)
     env.board()
     env.board(SERIAL2, mode="secure", lock="ours")
     assert env.arts.image.missing_variants() == []
     original = env.cfg.image
-    changed = "the image settings, builds.image.overrides or the station's image sources changed"
+    hashes = {v: env.arts.image.config_hash(v) for v in VARIANTS}
+    boots = {s: env.arts.stage_manifest(s, 3)["parts"]["boot.vfat.sparse"][0]["sha256"] for s in (SERIAL, SERIAL2)}
+    n_slots = len(env.docker.runs_of("boot-slot.sh"))
+    # the board settings go to the boot partition: no rebuild, a new boot slot for every board
     for edit in ({"hostname": "drone7"}, {"wifi_ssid": "Field", "wifi_password": "secret-pass"},
-                 {"password_hash": "$6$salt$" + "x" * 86}, {"ssh": True}):
+                 {"password_hash": "$6$salt$" + "x" * 86}, {"ssh": True}, {"timezone": "UTC"}):
         env.cfg.image = replace(original, **edit)
-        assert env.arts.image.missing_variants() == list(VARIANTS), edit
+        assert env.arts.image.missing_variants() == [] and env.arts.image.config_hash("clear") == hashes["clear"]
+        for serial in (SERIAL, SERIAL2):
+            m = env.arts.stage_manifest(serial, 3)
+            assert m["image"]["set"] == env.current(m["image"]["variant"])["set"], edit
+        n_slots += 2
+        assert len(env.docker.runs_of("boot-slot.sh")) == n_slots, edit
+    env.cfg.image = original
+    for serial in (SERIAL, SERIAL2):                     # back to the first settings: the slots made then
+        assert env.arts.stage_manifest(serial, 3)["parts"]["boot.vfat.sparse"][0]["sha256"] == boots[serial]
+    assert len(env.docker.runs_of("boot-slot.sh")) == n_slots
+    # the image name and the overrides are the image
+    changed = "the image name, builds.image.overrides or the station's image sources changed"
+    for edit in (lambda: setattr(env.cfg, "image", replace(original, name="rpios-other")),
+                 lambda: setattr(env.cfg.builds.image, "overrides", ["IGconf_x=1"])):
+        edit()
+        assert env.arts.image.missing_variants() == list(VARIANTS)
         for serial in (SERIAL, SERIAL2):
             with pytest.raises(NotReady, match=re.escape(changed)):
                 env.arts.stage_manifest(serial, 3)
         env.cfg.image = original
+        env.cfg.builds.image.overrides = []
         assert env.arts.image.missing_variants() == []
-    # a changed Wi-Fi password alone (same SSID) is a different image too: the secret files count
-    env.cfg.image = replace(original, wifi_ssid="Field", wifi_password="secret-pass")
-    h1 = env.arts.image.config_hash("clear")
-    env.cfg.image = replace(original, wifi_ssid="Field", wifi_password="other-pass")
-    assert env.arts.image.config_hash("clear") != h1
-    env.cfg.image = original
-    env.cfg.builds.image.overrides = ["IGconf_x=1"]
-    assert env.arts.image.missing_variants() == list(VARIANTS)
-    for serial in (SERIAL, SERIAL2):
-        with pytest.raises(NotReady, match=re.escape(changed)):
-            env.arts.stage_manifest(serial, 3)
-    env.cfg.builds.image.overrides = []
-    assert env.arts.image.missing_variants() == []
 
 
 def test_image_sources_change_needs_rebuild(make_env, monkeypatch):
@@ -1553,45 +1589,50 @@ def test_image_sources_change_needs_rebuild(make_env, monkeypatch):
     assert env.arts.image.missing_variants() == []
 
 
-def test_image_build_writes_the_settings_as_files(make_env):
+def test_stage3_writes_the_settings_as_first_boot_files(make_env):
     from otp_server.passhash import sha512_crypt
 
     key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD op@station"
-    env = make_env(image={"hostname": "drone7", "password_hash": sha512_crypt("pw", "salt"), "ssh": True,
+    pw_hash = sha512_crypt("pw", "salt")
+    env = make_env(image={"hostname": "drone-{serial}", "password_hash": pw_hash, "ssh": True,
                           "ssh_password_login": False, "ssh_authorized_keys": [key],
                           "wifi_ssid": "Field Net", "wifi_password": "p$ss \\w0rd", "wifi_country": "pl"})
     build_image(env)
-    for r in env.docker.runs_of(BUILDER_TAG):
-        text = r["config"]
-        assert '  hostname: "drone7"' in text and '  regdom: "PL"' in text and "  ssh: openssh-server" in text
-        assert '  secrets: "/cfg/secrets"' in text and '  pubkey_only: "y"' in text
-        assert '  pubkey_user1: "/cfg/secrets/authorized_keys"' in text
-        assert "$" not in text.replace("rpi-image-gen expands $ in values", "")   # no secret is a config value
-        files = r["secret_files"]
-        assert files["secrets/user1.passhash"] == (sha512_crypt("pw", "salt") + "\n").encode()
-        assert files["secrets/authorized_keys"] == (key + "\n").encode()
-        profile = files["secrets/iwd/Field Net.psk"].decode()
-        assert "Passphrase=p$ss\\s\\\\w0rd\n" in profile and "PreSharedKey=" in profile
+    for r in env.docker.runs_of(BUILDER_TAG):            # none of it is in the image
+        assert "drone" not in r["config"] and "Field" not in r["config"] and r["secret_files"] == {}
     for v in VARIANTS:
-        man = env.arts.image.current_set(v)[1]
-        assert man["image_settings"]["wifi_ssid"] == "Field Net" and man["image_settings"]["password_set"] is True
-        assert "p$ss" not in json.dumps(man) and "$6$" not in json.dumps(man)   # no secret in the manifest
-    assert not list((env.image_root / "cfg").iterdir())
+        assert env.arts.image.current_set(v)[1]["image_settings"] == {"name": "rpios-trixie-arm64-lite",
+                                                                      "base": "Raspberry Pi OS Lite"}
+    env.board()
+    m = env.arts.stage_manifest(SERIAL, 3)
+    r = env.docker.runs_of("boot-slot.sh")[-1]
+    assert sorted(r["seed"]) == ["meta-data", "network-config", "user-data"]
+    ud = r["seed"]["user-data"].decode()
+    assert f'hostname: "drone-{SERIAL}"' in ud and f'passwd: "{pw_hash}"' in ud and "lock_passwd: false" in ud
+    assert f'    - "{key}"' in ud and "ssh_pwauth: false" in ud and "  sudo: null" in ud
+    assert "  - [ systemctl, enable, --now, ssh ]" in ud and '  - [ raspi-config, nonint, do_wifi_country, "PL" ]' in ud
+    nc = r["seed"]["network-config"].decode()
+    assert '        "Field Net":' in nc and 'regulatory-domain: "PL"' in nc
+    assert "p$ss" not in nc and wifi_psk("Field Net", "p$ss \\w0rd") in nc   # the PMK, as Imager writes it
+    assert r["cmdline"].startswith("cfg80211.ieee80211_regdom=PL ds=nocloud;i=otp-")
+    assert m["firstboot"]["user"] == "pi" and m["firstboot"]["sudo"] == "passwd"
+    assert m["firstboot"]["wifi_ssid"] == "Field Net"
+    assert "p$ss" not in json.dumps(m) and "$6$" not in json.dumps(m)       # no secret in the manifest
 
 
-def test_image_build_follows_settings_changed_meanwhile(make_env):
+def test_image_build_follows_a_name_changed_meanwhile(make_env):
     env = make_env()
     seen = []
 
     def builder(call):
         h_builder(call)
         seen.append(call["config"])
-        if len(seen) == 1:                       # the operator saves new settings while clear builds
-            env.cfg.image = replace(env.cfg.image, hostname="drone8")
+        if len(seen) == 1:                       # the operator renames the image while clear builds
+            env.cfg.image = replace(env.cfg.image, name="rpios-renamed")
 
     env.docker.handlers[BUILDER_TAG] = builder
     build_image(env)
-    assert [c.count('hostname: "drone8"') for c in seen] == [0, 1, 1]   # clear, crypt, clear again
+    assert [c.count('name: "rpios-renamed"') for c in seen] == [0, 1, 1]   # clear, crypt, clear again
     assert env.arts.image.missing_variants() == []
     job = env.jobs.list()[0]
     assert any("the image settings changed during the build" in ln for ln in job.lines)

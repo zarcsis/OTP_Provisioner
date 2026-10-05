@@ -37,6 +37,26 @@ RETIRED: dict[str, str] = {
     "paths.droneos": "the image is built from the station's image/ directory",
     "builds.image.config": "the rpi-image-gen config is written from the image.* settings",
 }
+#: Defaults of earlier versions that an older server wrote into the sheet; read as the current default (the
+#: cell is rewritten). Any other value is the operator's and stays.
+REPLACED_DEFAULTS: dict[str, frozenset[str]] = {
+    "builds.image.builder_tag": frozenset({"droneos-builder:trixie"}),
+    "builds.image.volume": frozenset({"otp-droneos-work"}),
+    "image.name": frozenset({"deb13-arm64-min"}),
+}
+#: Descriptions earlier versions wrote; such a cell is rewritten with the current text (any other text in the
+#: description column is the operator's note and stays).
+OLD_DESCRIPTIONS: dict[str, frozenset[str]] = {
+    "builds.image.overrides": frozenset({"extra KEY=VALUE overrides for the droneos build, one per line "
+                                         "(IGconf_image_pmap is set per scenario)"}),
+    "builds.image.builder_tag": frozenset({"Docker tag of the droneos builder image"}),
+    "builds.image.volume": frozenset({"Docker volume with the droneos build tree"}),
+    "image.timezone": frozenset({"time zone (IANA name, e.g. Europe/Kyiv)"}),
+    "image.wifi_country": frozenset({"Wi-Fi regulatory country, two letters (UA; 00 = world)"}),
+    "image.name": frozenset({"image name (part of the image set names)"}),
+    "image.hostname": frozenset({"hostname of the boards"}),
+    "image.user": frozenset({"login account created on the boards"}),
+}
 #: Values kept exactly as typed (never trimmed).
 RAW_VALUES = frozenset({"image.wifi_password"})
 
@@ -49,10 +69,13 @@ DESCRIPTIONS: dict[str, str] = {
     "provisioning.firmware_channel": "rpi-eeprom firmware channel for stage 1: default or latest",
     "provisioning.max_piece_size": "largest sparse piece sent to the board (bytes, rpi-fastbootd max-download-size)",
     "provisioning.boot_conf": "EEPROM boot.conf written in stage 1 (multi-line)",
-    "image.name": "image name (part of the image set names)",
-    "image.hostname": "hostname of the boards",
+    "image.name": "name of the OS image (Raspberry Pi OS Lite; part of the image set names; a new name rebuilds it). "
+                  "The other image.* settings are written to each board at stage 3 and rebuild nothing",
+    "image.hostname": "host name of the boards; {serial} = the board's 8-hex serial (pi5-{serial})",
     "image.timezone": "time zone of the image's tzdata (Europe/Kyiv, UTC, ...; the page offers the list)",
-    "image.user": "login account created on the boards",
+    "image.keyboard": "keyboard layout of the boards' console (xkb: us, gb, ua, ...; the page offers the list). "
+                      "Raspberry Pi OS itself defaults to gb, where Shift+2 is \" and Shift+' is @",
+    "image.user": "the boards' login account (Raspberry Pi OS renames its first user pi to it at first boot)",
     "image.password_hash": "crypt hash of the account password (set it on the page; empty = no password)",
     "image.ssh": "SSH server on the boards",
     "image.ssh_password_login": "SSH accepts the account password (false = keys only)",
@@ -185,7 +208,8 @@ class SettingsSheet:
 
     def read(self) -> dict[str, str]:
         """``{key: cell text}``; missing settings are appended with their defaults first, rows of retired
-        settings are deleted.
+        settings are deleted, defaults and descriptions written by earlier versions (:data:`REPLACED_DEFAULTS`,
+        :data:`OLD_DESCRIPTIONS`) are replaced; everything else the operator wrote stays.
 
         :raises StoreError: Google is not reachable / not signed in (the operator text says why).
         """
@@ -194,6 +218,8 @@ class SettingsSheet:
                 ws = self._open()
                 values = self._values(ws)
                 rows: dict[str, str] = {}
+                where: dict[str, int] = {}
+                descs: dict[str, str] = {}
                 retired: list[tuple[int, str]] = []
                 for n, row in enumerate(values[1:], start=2):
                     key = str(row[0]).strip() if row else ""
@@ -206,6 +232,18 @@ class SettingsSheet:
                         log.warning("settings sheet: duplicate key %s ignored", key)
                         continue
                     rows[key] = str(row[1]) if len(row) > 1 else ""
+                    where[key] = n
+                    descs[key] = str(row[2]) if len(row) > 2 else ""
+                defaults = dict(setting_defaults())
+                for key, n in where.items():      # before any row is deleted: the row numbers are still valid
+                    if rows[key].strip() in REPLACED_DEFAULTS.get(key, ()):
+                        new = encode_value(defaults[key])
+                        ws.update([[new]], f"B{n}", value_input_option="RAW")
+                        log.info("settings sheet: %s %r was the default of an earlier version, now %r",
+                                 key, rows[key], new)
+                        rows[key] = new
+                    if descs[key].strip() in OLD_DESCRIPTIONS.get(key, ()):
+                        ws.update([[DESCRIPTIONS[key]]], f"C{n}", value_input_option="RAW")
                 for n, key in sorted(retired, reverse=True):      # bottom up: the row numbers stay valid
                     ws.delete_rows(n)
                     log.info("settings sheet: removed the retired setting %s (%s)", key, RETIRED[key])

@@ -61,11 +61,13 @@ DEFAULTS: dict[str, Any] = {
         "max_piece_size": 268435456,
         "boot_conf": DEFAULT_BOOT_CONF,
     },
-    #: What goes into the OS image (rendered into an rpi-image-gen config by :mod:`otp_server.imageconfig`).
+    #: The OS image (``name``; :mod:`otp_server.imageconfig`) and what stage 3 writes to every board's boot
+    #: partition for its first boot (everything else; :mod:`otp_server.firstboot`).
     "image": {
-        "name": "deb13-arm64-min",
-        "hostname": "pi5",
+        "name": "rpios-trixie-arm64-lite",
+        "hostname": "pi5-{serial}",
         "timezone": "Europe/Kyiv",
+        "keyboard": "us",
         "user": "pi",
         "password_hash": "",
         "ssh": False,
@@ -133,13 +135,14 @@ class GadgetBuildCfg:
 
 @dataclass
 class ImageCfg:
-    """What goes into the OS image (``image.*``). Secrets: ``password_hash`` (crypt hash of user1's
-    password, empty = the account has no password) and ``wifi_password``; :mod:`otp_server.imageconfig`
-    passes them to the build as files, never as config values."""
+    """``image.*``: the image name (the only build setting) and each board's first-boot settings, written
+    to its boot partition at stage 3 (:mod:`otp_server.firstboot`). Secrets: ``password_hash`` (crypt hash
+    of the first user's password, empty = no password) and ``wifi_password``."""
 
     name: str
     hostname: str
     timezone: str
+    keyboard: str
     user: str
     password_hash: str
     ssh: bool
@@ -537,6 +540,7 @@ def parse_image(img: Mapping) -> ImageCfg:
         name=_checked("image.name", imageconfig.check_image_name, text("name")),
         hostname=_checked("image.hostname", imageconfig.check_hostname, text("hostname")),
         timezone=_checked("image.timezone", imageconfig.check_timezone, text("timezone")),
+        keyboard=_checked("image.keyboard", imageconfig.check_keyboard, text("keyboard")),
         user=_checked("image.user", imageconfig.check_user, text("user")),
         password_hash=_checked("image.password_hash", imageconfig.check_password_hash, text("password_hash")),
         ssh=_bool(img.get("ssh"), "image.ssh"),

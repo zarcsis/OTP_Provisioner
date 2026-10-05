@@ -188,7 +188,8 @@ def test_setting_defaults_are_defaults_without_bootstrap():
     assert "paths.work" not in keys
     assert "paths.droneos" not in keys and "builds.image.config" not in keys     # retired
     assert [k for k in keys if k.startswith("image.")] == [
-        "image.name", "image.hostname", "image.timezone", "image.user", "image.password_hash", "image.ssh",
+        "image.name", "image.hostname", "image.timezone", "image.keyboard", "image.user", "image.password_hash",
+        "image.ssh",
         "image.ssh_password_login", "image.ssh_authorized_keys", "image.wifi_ssid", "image.wifi_password",
         "image.wifi_country", "image.wifi_hidden"]
     # exactly the leaves of DEFAULTS, in DEFAULTS order, with the DEFAULTS values
@@ -667,3 +668,33 @@ def test_with_a_real_google_account(tmp_path):
     assert sheet.read() == rows
     assert client.opened == ["SID-1"]            # reopened by the saved id after the dropped connection
     assert client.created == ["OTP_Provisioner"]
+
+
+def test_defaults_of_earlier_versions_are_replaced_and_descriptions_refreshed(caplog):
+    caplog.set_level(logging.INFO, logger="otp_server.settings")
+    full = [list(HEADER)] + default_rows()
+    full.insert(1, ["paths.droneos", "external/droneos", "droneos checkout"])     # retired row above them
+    row = {r[0]: i for i, r in enumerate(full)}
+    full[row["builds.image.builder_tag"]][1:] = ["droneos-builder:trixie", "Docker tag of the droneos builder image"]
+    full[row["builds.image.volume"]][1:] = ["otp-droneos-work", "Docker volume with the droneos build tree"]
+    full[row["builds.image.overrides"]][1:] = ["IGconf_x=1", "extra KEY=VALUE overrides for the droneos build, one per "
+                                               "line (IGconf_image_pmap is set per scenario)"]
+    full[row["image.timezone"]][1:] = ["UTC", "time zone (IANA name, e.g. Europe/Kyiv)"]
+    full[row["image.user"]][2] = "my own note"                                      # an operator's note stays
+    full[row["builds.gadget.volume"]][1] = "my-own-volume"                         # the operator's value stays
+    account, ws = sheet_with([list(r) for r in full])
+    rows = SettingsSheet(account).read()
+    assert rows["builds.image.builder_tag"] == "otp-image-builder:trixie"
+    assert rows["builds.image.volume"] == "otp-image-work"
+    assert rows["builds.image.overrides"] == "IGconf_x=1" and rows["builds.gadget.volume"] == "my-own-volume"
+    by_key = {r[0]: r for r in ws.rows[1:]}
+    assert by_key["builds.image.builder_tag"] == ["builds.image.builder_tag", "otp-image-builder:trixie",
+                                                  DESCRIPTIONS["builds.image.builder_tag"]]
+    assert by_key["builds.image.volume"][1:] == ["otp-image-work", DESCRIPTIONS["builds.image.volume"]]
+    assert by_key["builds.image.overrides"][1:] == ["IGconf_x=1", DESCRIPTIONS["builds.image.overrides"]]
+    assert by_key["image.timezone"][1:] == ["UTC", DESCRIPTIONS["image.timezone"]]
+    assert by_key["image.user"][2] == "my own note"
+    assert "paths.droneos" not in by_key                                            # deleted after the updates
+    assert any("was the default of an earlier version" in r.getMessage() for r in caplog.records)
+    n = len(ws.writes())
+    assert SettingsSheet(account).read() == rows and len(ws.writes()) == n          # nothing left to do

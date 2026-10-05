@@ -1,0 +1,229 @@
+# METABEGIN
+# X-Env-Layer-Name: otp-rpios-setup
+# X-Env-Layer-Category: device
+# X-Env-Layer-Desc: What pi-gen (stage1 + stage2) configures in Raspberry Pi OS
+#  Lite beyond its packages: the first user (user1, normally pi) exists but is
+#  locked with no login shell, so cloud-init or the first-boot wizard sets it up;
+#  SSH is off; Wi-Fi stays off until a country is set; classic interface names
+#  (eth0, wlan0); en_GB locale, gb keyboard, Europe/London; pi-gen's shell and
+#  PATH tweaks; avahi announces the board; the NoCloud templates in
+#  /boot/firmware. The station writes the real user-data, network-config and
+#  meta-data per board at stage 3. On the crypt variant (secure boards) the
+#  automatic bootloader EEPROM update is off: such a bootloader is signed for
+#  the board and only the station updates it.
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Requires: device-user-admin,otp-rpios-lite
+# METAEND
+---
+mmdebstrap:
+  skip:
+    # mmdebstrap empties /etc/machine-id; Raspberry Pi OS ships "uninitialized" (systemd's first boot:
+    # rpi-resize and the other ConditionFirstBoot units run). Written by the last cleanup hook.
+    - cleanup/reproducible/machine-id
+  customize-hooks:
+    - |-
+      # The first user (pi-gen stage1: adduser --disabled-login; stage2: groups). cloud-init renames it
+      # and gives it a shell and password (userconf); without user-data the first-boot wizard does.
+      set -eu
+      u=$IGconf_device_user1
+      rm -f "$1/etc/sudoers.d/010_rpi-passwd" "$1/etc/sudoers.d/010_rpi-nopasswd" "$1/etc/profile.d/01local.sh"
+      chroot "$1" usermod --shell /usr/sbin/nologin --password '!' "$u"
+    - |-
+      # pi-gen stage1 01-bashrc.diff: colour prompt and grep aliases, in the skeleton and the first user's home.
+      set -eu
+      cat > "$1/tmp/otp-bashrc.sed" <<'EOF'
+      s/^#force_color_prompt=yes/force_color_prompt=yes/
+      s/\\w\\\[\\033\[00m\\]\\\$ '$/\\w \\$\\[\\033[00m\\] '/
+      s/^    #alias \(grep\|fgrep\|egrep\)=/    alias \1=/
+      EOF
+      for f in "$1/etc/skel/.bashrc" "$1/home/$IGconf_device_user1/.bashrc"; do
+         if [ -f "$f" ]; then sed -i -f "$1/tmp/otp-bashrc.sed" "$f"; fi
+      done
+      rm -f "$1/tmp/otp-bashrc.sed"
+      grep -q '^force_color_prompt=yes' "$1/etc/skel/.bashrc" || echo "otp-rpios-setup: .bashrc not patched" >&2
+    - |-
+      # pi-gen stage2 patches: useradd defaults, history search hint in inputrc, sbin in every PATH.
+      set -eu
+      sed -i -e 's|^SHELL=/bin/sh$|SHELL=/bin/bash|' -e 's|^# SKEL=/etc/skel$|SKEL=/etc/skel|' "$1/etc/default/useradd"
+      if ! grep -q '^# mappings for up and down arrows search history' "$1/etc/inputrc"; then
+         printf '\n# mappings for up and down arrows search history\n# "\\e[B": history-search-forward\n# "\\e[A": history-search-backward\n' >> "$1/etc/inputrc"
+      fi
+      sed -i 's|^ENV_PATH\s.*|ENV_PATH        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games|' "$1/etc/login.defs"
+      sed -i 's|^  PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"$|  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games"|' "$1/etc/profile"
+    - |-
+      # pi-gen stage2 01-sys-tweaks: SSH off (sshswitch or cloud-init turn it on), host keys made at
+      # first boot (regenerate_ssh_host_keys), root filesystem grown at first boot.
+      set -eu
+      chroot "$1" systemctl disable ssh.service
+      rm -f "$1"/etc/ssh/ssh_host_*_key*
+      chroot "$1" systemctl enable rpi-resize.service
+    - |-
+      # pi-gen stage2 01-sys-tweaks: console font and keyboard as the locale layer chose them.
+      set -eu
+      sed -i 's/^FONTFACE=.*/FONTFACE=""/;s/^FONTSIZE=.*/FONTSIZE=""/' "$1/etc/default/console-setup"
+      sed -i "s/PLACEHOLDER//" "$1/etc/default/keyboard"
+      chroot "$1" sh -c 'DEBIAN_FRONTEND=noninteractive dpkg-reconfigure keyboard-configuration console-setup'
+      chroot "$1" setupcon --force --save-only -v
+    - |-
+      # avahi announces the board as <hostname>.local (pi-gen stage2).
+      set -eu
+      f=$1/etc/avahi/avahi-daemon.conf
+      if [ -e "$f" ]; then sed -i 's/^#\?publish-workstation=.*/publish-workstation=yes/' "$f"; fi
+    - |-
+      # pi-gen stage1/stage2 net-tweaks: hostname, classic interface names (eth0, wlan0), Bluetooth not
+      # blocked, Wi-Fi off until a country is set (cloud-init's user-data from the station sets it).
+      set -eu
+      h=$IGconf_device_hostname
+      echo "$h" > "$1/etc/hostname"
+      cat > "$1/etc/hosts" <<EOF
+      127.0.0.1	localhost
+      ::1		localhost ip6-localhost ip6-loopback
+      ff02::1		ip6-allnodes
+      ff02::2		ip6-allrouters
+
+      127.0.1.1		$h
+      EOF
+      mkdir -p "$1/etc/systemd/network"
+      ln -sf /dev/null "$1/etc/systemd/network/99-default.link"
+      ln -sf /dev/null "$1/etc/systemd/network/73-usb-net-by-mac.link"
+      # rpi-image-gen's systemd-networkd files; NetworkManager runs the network here.
+      rm -f "$1/etc/systemd/network/01-eth0.network" "$1/etc/systemd/network/02-wlan0.network"
+      mkdir -p "$1/var/lib/systemd/rfkill"
+      for addr in 107d50c000.serial 3f215040.serial 20215040.serial fe215040.serial soc; do
+         echo 0 > "$1/var/lib/systemd/rfkill/platform-${addr}:bluetooth"
+      done
+      mkdir -p "$1/var/lib/NetworkManager"
+      printf '[main]\nWirelessEnabled=false\n' > "$1/var/lib/NetworkManager/NetworkManager.state"
+    - |-
+      # Locale and time zone the way pi-gen leaves them (rpi-image-gen's locale layer writes C.UTF-8).
+      set -eu
+      printf '#  File generated by update-locale\nLANG=%s\n' "$IGconf_locale_default" > "$1/etc/locale.conf"
+      ln -sfn ../locale.conf "$1/etc/default/locale"
+      echo "$IGconf_locale_timezone" > "$1/etc/timezone"
+      ln -sfn "/usr/share/zoneinfo/$IGconf_locale_timezone" "$1/etc/localtime"
+      [ -f "$1/etc/kernel-img.conf" ] || echo "do_symlinks=0" > "$1/etc/kernel-img.conf"
+      rm -f "$1/etc/systemd/system/getty@tty1.service.d/noclear.conf"
+      rmdir "$1/etc/systemd/system/getty@tty1.service.d" 2>/dev/null || true
+    - |-
+      # A secure board's bootloader is signed for that board: Raspberry Pi's automatic EEPROM update
+      # does not know that, so it stays off there and the station updates the bootloader.
+      set -eu
+      if [ "${IGconf_image_pmap:-clear}" = crypt ]; then
+         chroot "$1" systemctl disable rpi-eeprom-update.service
+      fi
+    - |-
+      # pi-gen stage2 04-cloud-init: NoCloud templates in /boot/firmware (no effect until edited). The
+      # station replaces them on every board it flashes.
+      set -eu
+      mkdir -p "$1/boot/firmware"
+      cat > "$1/boot/firmware/meta-data" <<'EOF'
+      # This is the meta-data configuration file for cloud-init. Please refer to the
+      # cloud-init documentation for more information:
+      #
+      # https://cloudinit.readthedocs.io/
+
+      # Set the datasource mode to "local". This ensures that user-data is acted upon
+      # prior to bringing up the network (because everything about the datasource is
+      # assumed to be local). If you wish to use an HTTP datasource instead, you can
+      # change this to "net" or override it on the kernel cmdline (see README).
+      dsmode: local
+
+      # Specifies the "unique" identifier of the instance. Typically in cloud-init
+      # this is generated by the owning cloud and is actually unique (to some
+      # degree). Here our data-source is local, so this is just a fixed string.
+      # Warning: changing this will cause cloud-init to assume it is running on a
+      # "new" instance, and to go through first time setup again (the value is
+      # compared to a cached copy).
+      instance_id: rpios-image
+      EOF
+      cat > "$1/boot/firmware/network-config" <<'EOF'
+      # This file contains a netplan-compatible configuration which cloud-init will
+      # apply on first-boot (note: it will *not* update the config after the first
+      # boot). Please refer to the cloud-init documentation and the netplan reference
+      # for full details:
+      #
+      # https://netplan.io/reference
+      # https://cloudinit.readthedocs.io/en/latest/topics/network-config.html
+      # https://cloudinit.readthedocs.io/en/latest/topics/network-config-format-v2.html
+      #
+      # Please note that the YAML format employed by this file is sensitive to
+      # differences in whitespace; if you are editing this file in an editor (like
+      # Notepad) which uses literal tabs, take care to only use spaces for
+      # indentation. See the following link for more details:
+      #
+      # https://en.wikipedia.org/wiki/YAML
+      #
+      # Additionally, please be aware that if your boot sequence depends on active
+      # networking (e.g. if your cloud-init configuration pulls packages or SSH
+      # keys from the network), you *must* mark at least one interface as required
+      # ("optional: false") below. Otherwise, particularly on faster boards,
+      # cloud-init will start attempting to use the network before it is ready
+
+      # Some additional examples are commented out below
+
+      #network:
+      #  version: 2
+      #
+      #  ethernets:
+      #    eth0:
+      #      dhcp4: true
+      #      optional: true
+
+      #  wifis:
+      #    wlan0:
+      #      dhcp4: true
+      #      optional: true
+      #      access-points:
+      #        myhomewifi:
+      #          password: "S3kr1t"
+      #        myworkwifi:
+      #          password: "correct battery horse staple"
+      #        workssid:
+      #          auth:
+      #            key-management: eap
+      #            method: peap
+      #            identity: "me@example.com"
+      #            password: "passw0rd"
+      #            ca-certificate: /etc/my_ca.pem
+
+      #      regulatory-domain: GB
+      EOF
+      cat > "$1/boot/firmware/user-data" <<'EOF'
+      #cloud-config
+
+      # This is the user-data configuration file for cloud-init. Cloud-init on
+      # Raspberry Pi OS acts on it at first boot (see the meta-data file next to it).
+      # The provisioning station writes this file for every board it flashes, from
+      # the station's image settings; the cloud-init documentation lists everything
+      # else it can do:
+      #
+      # https://cloudinit.readthedocs.io/
+      #
+      # Please note that the YAML format employed by this file is sensitive to
+      # differences in whitespace; if you are editing this file in an editor (like
+      # Notepad) which uses literal tabs, take care to only use spaces for
+      # indentation.
+
+      ## Set the system's hostname; avahi-daemon makes it reachable as <name>.local
+      #hostname: raspberrypi
+
+      ## The first user: renames pi, sets its password (a crypt hash) and SSH keys
+      #user:
+      #  name: pi
+      #  lock_passwd: false
+      #  passwd: $6$...
+
+      ## Run commands at the end of the first boot
+      #runcmd:
+      #- [ systemctl, enable, --now, ssh ]
+      EOF
+      chmod 0644 "$1/boot/firmware/meta-data" "$1/boot/firmware/network-config" "$1/boot/firmware/user-data"
+  cleanup-hooks:
+    - |-
+      # rpi-image-gen's base installs without recommends, man pages and documentation through these
+      # files, which mmdebstrap leaves behind; Raspberry Pi OS has neither, so apt behaves the same.
+      rm -f "$1/etc/apt/apt.conf.d/99mmdebstrap" "$1/etc/dpkg/dpkg.cfg.d/99mmdebstrap"
+    - |-
+      # First boot as systemd defines it (machine-id(5)); the image is the same for every board.
+      printf 'uninitialized\n' > "$1/etc/machine-id"
+      rm -f "$1/var/lib/dbus/machine-id"

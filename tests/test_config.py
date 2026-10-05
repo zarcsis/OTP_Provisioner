@@ -82,7 +82,8 @@ def test_defaults(tmp_path):
         "otp-image-builder:trixie", "otp-image-work", False)
     i = cfg.image
     assert (i.name, i.hostname, i.timezone, i.user, i.password_hash) == (
-        "deb13-arm64-min", "pi5", "Europe/Kyiv", "pi", "")
+        "rpios-trixie-arm64-lite", "pi5-{serial}", "Europe/Kyiv", "pi", "")
+    assert i.keyboard == "us"
     assert (i.ssh, i.ssh_password_login, i.ssh_authorized_keys) == (False, True, [])
     assert (i.wifi_ssid, i.wifi_password, i.wifi_country, i.wifi_hidden) == ("", "", "UA", False)
     assert cfg.docker.binary == "docker" and cfg.docker.start_desktop is True
@@ -257,7 +258,7 @@ def test_empty_sections_keep_defaults(tmp_path):
     cfg = load(tmp_path, settings={"server": None, "builds": {"image": None}, "docker": {}, "image": None},
                provisioning=None)
     assert cfg.server.port == 8765
-    assert cfg.builds.image.builder_tag == "otp-image-builder:trixie" and cfg.image.hostname == "pi5"
+    assert cfg.builds.image.builder_tag == "otp-image-builder:trixie" and cfg.image.hostname == "pi5-{serial}"
     assert cfg.provisioning.default_mode == "open"
     assert cfg.docker.binary == "docker"
     assert cfg.unknown_keys == []
@@ -625,7 +626,7 @@ def test_summary(make_cfg, tmp_path):
     assert s["version"] == __version__
     assert s["repo_root"] == str(cfg.repo_root) and s["work_dir"] == str(cfg.work_dir)
     assert s["image_dir"] == str(cfg.image_dir)
-    assert s["image"]["hostname"] == "pi5" and s["image"]["password_set"] is False
+    assert s["image"]["hostname"] == "pi5-{serial}" and s["image"]["password_set"] is False
     assert "password_hash" not in s["image"] and "wifi_password" not in s["image"]
     assert s["settings"] == "Google Sheets (worksheet settings)"
     assert s["server"] == {"host": "127.0.0.1", "port": 8765, "open_browser": False,
@@ -687,7 +688,7 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     # a later clean sheet clears the reported unknown keys again
     cfg.apply_settings(load_config(repo_root=repo, overrides={"paths": {"work": str(tmp_path / "w")}}))
     assert cfg.unknown_keys == [] and cfg.provisioning.default_mode == "open"
-    assert cfg.image.hostname == "pi5"
+    assert cfg.image.hostname == "pi5-{serial}"
 
 
 def test_make_cfg_fixture_is_isolated(make_cfg, tmp_path):
@@ -708,11 +709,11 @@ def test_make_cfg_fixture_is_isolated(make_cfg, tmp_path):
 def test_image_settings_are_normalised(tmp_path):
     key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGabcdefghijklmnopqrstuvwxyz0123456789ABCD op@station"
     cfg = load(tmp_path, settings={"image": {
-        "hostname": " Drone-7 ", "user": "operator", "timezone": "UTC", "ssh": "yes", "ssh_password_login": "no",
+        "hostname": " Drone-7 ", "user": "ops", "timezone": "UTC", "ssh": "yes", "ssh_password_login": "no",
         "ssh_authorized_keys": f"{key}\r\n\n  ", "wifi_ssid": "Field Net", "wifi_password": "  spaced pass  ",
         "wifi_country": "pl", "wifi_hidden": "true", "password_hash": " $6$salt$abc ", "name": "fleet-img.v2"}})
     i = cfg.image
-    assert (i.hostname, i.user, i.timezone, i.name) == ("drone-7", "operator", "UTC", "fleet-img.v2")
+    assert (i.hostname, i.user, i.timezone, i.name) == ("drone-7", "ops", "UTC", "fleet-img.v2")
     assert i.ssh is True and i.ssh_password_login is False and i.ssh_authorized_keys == [key]
     assert i.wifi_ssid == "Field Net" and i.wifi_password == "  spaced pass  "    # spaces belong to a passphrase
     assert i.wifi_country == "PL" and i.wifi_hidden is True and i.password_hash == "$6$salt$abc"

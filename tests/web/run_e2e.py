@@ -806,24 +806,25 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
             all(secrets.values()) and not leaks, ", ".join(leaks))
     C.check("verbose page log was checked (debug lines present)", "DEBUG" in (rep.get("pageLog") or ""))
 
-    if secure:
-        C.eq("stage 3: mode", m3["mode"], "signed")
-        boot = blocks[0].split(":", 1)[1] if blocks else next(iter(parts))
-        unsigned_boot = [p["sha256"] for p in setman["simages"][boot]]
-        C.check(f"stage 3: boot slot {boot} re-signed per board (sha256 differs from the image set)",
-                [p["sha256"] for p in parts[boot]] != unsigned_boot and all(p["sha256"] not in unsigned_boot for p in parts[boot]),
-                f"served {[p['sha256'][:12] for p in parts[boot]]}, set {[h[:12] for h in unsigned_boot]}")
-        others = [s for s in parts if s != boot]
-        C.check("stage 3: root pieces are the image set's (not re-signed)",
-                all([p["sha256"] for p in parts[s]] == [p["sha256"] for p in setman["simages"][s]] for s in others))
-        per_board = []
-        for p in parts[boot]:
-            hits = list((work_dir() / "modules" / serial / "stage3").glob(f"*/{p['name']}"))
-            per_board.append(any(sha256_file(h) == p["sha256"] for h in hits))
-        C.check("stage 3: re-signed boot pieces are the files in <work>/modules/<serial>/stage3/<fp>/", per_board and all(per_board), str(per_board))
-    else:
-        C.eq("stage 3: mode", m3["mode"], "unsigned")
-        C.check("stage 3: every piece is the image set's", all([p["sha256"] for p in parts[s]] == [p["sha256"] for p in setman["simages"][s]] for s in parts))
+    # every board gets its own boot partition (its first-boot files; re-signed on a secure board)
+    C.eq("stage 3: mode", m3["mode"], "signed" if secure else "unsigned")
+    boot = blocks[0].split(":", 1)[1] if blocks else next(iter(parts))
+    set_boot = [p["sha256"] for p in setman["simages"][boot]]
+    C.check(f"stage 3: boot slot {boot} is the board's own (sha256 differs from the image set)",
+            [p["sha256"] for p in parts[boot]] != set_boot and all(p["sha256"] not in set_boot for p in parts[boot]),
+            f"served {[p['sha256'][:12] for p in parts[boot]]}, set {[h[:12] for h in set_boot]}")
+    others = [s for s in parts if s != boot]
+    C.check("stage 3: root pieces are the image set's",
+            all([p["sha256"] for p in parts[s]] == [p["sha256"] for p in setman["simages"][s]] for s in others))
+    per_board = []
+    for p in parts[boot]:
+        hits = list((work_dir() / "modules" / serial / "stage3").glob(f"*/{p['name']}"))
+        per_board.append(any(sha256_file(h) == p["sha256"] for h in hits))
+    C.check("stage 3: the boot pieces are the files in <work>/modules/<serial>/stage3/<fp>/", per_board and all(per_board), str(per_board))
+    first_boot = m3.get("firstboot") or {}
+    C.check("stage 3: the manifest names the board's first boot (host name with the serial, cloud-init files)",
+            serial in first_boot.get("hostname", "") and first_boot.get("files") == ["meta-data", "user-data"],
+            json.dumps(first_boot))
 
     # ---------------- final record + page
     code, mod = get_json(f"{base}/api/modules/{serial}")

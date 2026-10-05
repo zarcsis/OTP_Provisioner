@@ -1,4 +1,4 @@
-"""What the OS image settings choose from: time zones and Wi-Fi countries (``image_choices.json``).
+"""What the OS image settings choose from: time zones, Wi-Fi countries, keyboard layouts (``image_choices.json``).
 
 The lists come from the Debian trixie packages the image installs, so whatever the page offers, the board
 understands:
@@ -8,12 +8,14 @@ understands:
   ``US/Eastern``, ``UCT``) are in Debian's ``tzdata-legacy``, which the image does not install, so they are not
   valid here either (``tzdata.zi`` still lists them: it is not the list of installed files);
 * ``wireless-regdb`` -- the countries of ``regulatory.db`` (``00`` = the world domain) are the Wi-Fi countries;
-* ``iso-codes`` -- the country names.
+* ``iso-codes`` -- the country names;
+* ``xkb-data`` -- the keyboard layouts (``! layout`` of ``rules/base.lst``), which console-setup and
+  cloud-init's ``keyboard:`` take.
 
 Regenerate after a Debian update (from the repository root, with Docker)::
 
     docker run --rm -v "$PWD/build-choices:/out" debian:trixie-slim sh -c \\
-        'cd /tmp && apt-get update && apt-get download tzdata wireless-regdb iso-codes &&
+        'cd /tmp && apt-get update && apt-get download tzdata wireless-regdb iso-codes xkb-data &&
          for d in *.deb; do dpkg-deb -x $d /out/root; dpkg-deb -f $d Package Version >> /out/versions; done &&
          dpkg-deb -c tzdata_*.deb > /out/tzdata.list'
     python -m otp_server.image_choices build-choices > otp_server/image_choices.json
@@ -70,9 +72,23 @@ def is_country(code: str) -> bool:
     return code in _countries()
 
 
+@functools.lru_cache(maxsize=1)
+def _keyboards() -> dict:
+    return {code: name for code, name in data()["keyboards"]}
+
+
+def keyboards() -> list[list[str]]:
+    """``[[layout, description], ...]`` of the keyboard layouts, as base.lst lists them."""
+    return [list(k) for k in data()["keyboards"]]
+
+
+def is_keyboard(layout: str) -> bool:
+    return layout in _keyboards()
+
+
 def page_view() -> dict:
-    """What the page needs for its two lists."""
-    return {"timezones": timezones(), "countries": countries()}
+    """What the page needs for its lists."""
+    return {"timezones": timezones(), "countries": countries(), "keyboards": keyboards()}
 
 
 # ------------------------------------------------------------------ generation
@@ -113,6 +129,21 @@ def tzdata_zones(listing: str) -> set[str]:
     return names
 
 
+def xkb_layouts(base_lst: str) -> list[list[str]]:
+    """``[[layout, description], ...]`` of the ``! layout`` section of an xkb ``rules/base.lst``."""
+    out, section = [], ""
+    for line in base_lst.splitlines():
+        if line.startswith("!"):
+            section = line[1:].strip()
+            continue
+        if section == "layout" and line.strip():
+            code, _, desc = line.strip().partition(" ")
+            out.append([code, desc.strip()])
+    if not out:
+        raise ValueError("base.lst has no layouts")
+    return out
+
+
 def generate(root: Path, listing: str, versions: str = "") -> dict:
     """The data file from the extracted Debian packages under ``root`` (``dpkg-deb -x`` of each) and the
     ``dpkg-deb -c`` listing of tzdata."""
@@ -144,6 +175,7 @@ def generate(root: Path, listing: str, versions: str = "") -> dict:
         "timezones": sorted(canonical),
         "timezones_valid": sorted(names - canonical),
         "countries": countries,
+        "keyboards": xkb_layouts((root / "usr/share/X11/xkb/rules/base.lst").read_text(encoding="utf-8")),
     }
 
 

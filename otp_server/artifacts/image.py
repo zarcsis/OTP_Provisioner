@@ -1,18 +1,21 @@
 """OS image build (rpi-image-gen in Docker), IDP collect, and the stage-3 fastboot manifest.
 
 Build = ``image/build.sh --in-container`` in the builder image (``image/docker``): rpi-image-gen
-(``image/rpi-image-gen``, a submodule) with the station layers (``image/layer``) and a config written
-from the ``image.*`` settings (:mod:`otp_server.imageconfig`), mounted at ``/cfg`` together with the
-secret files it points at; the work volume keeps the image output. Then ``image-collect.sh`` in the
-tools image copies ``image.json`` + the sparse partition images (split to ``max_piece_size``) into
-``<work>/artifacts/image/<set>/``; Python validates them and writes ``manifest.json`` + ``.complete``
-and points ``current-<variant>.json`` at the set.
+(``image/rpi-image-gen``, a submodule) with the station layers (``image/layer``: Raspberry Pi OS Lite)
+and a config (:mod:`otp_server.imageconfig`) mounted at ``/cfg``; the work volume keeps the image
+output. Then ``image-collect.sh`` in the tools image copies ``image.json`` + the sparse partition images
+(split to ``max_piece_size``) into ``<work>/artifacts/image/<set>/``; Python validates them and writes
+``manifest.json`` + ``.complete`` and points ``current-<variant>.json`` at the set.
 
 Two variants, one per provisioning mode: ``clear`` (``open``: plain root filesystem) and ``crypt``
 (``secure``: LUKS2 root container), built with ``IGconf_image_pmap=<variant>``. Each has its own current
 set, so switching the mode back and forth does not rebuild what is already there. A set is served only
-while it matches the station: same rpi-image-gen revision, same image sources and the same image
-settings, overrides and partition map (``config_hash``).
+while it matches the station: same rpi-image-gen revision, same image sources, image name, overrides
+and partition map (``config_hash``).
+
+The image is the same for every board. Stage 3 serves each board its own boot partition
+(``boot-slot.sh``): the image's, with the board's first-boot files (:mod:`otp_server.firstboot`: account,
+SSH, Wi-Fi, host name, time zone as cloud-init files) and, on a board locked to our key, re-signed.
 """
 from __future__ import annotations
 
@@ -22,11 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import firstboot
 from .. import imageconfig
 from .. import imagejson
 from .. import sparse
 from ..docker import Mount
-from .common import (NotReady, StageFile, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
+from .common import (NotReady, StageFile, TempFiles, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
                      git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, rmtree,
                      write_json)
 
@@ -34,12 +38,14 @@ WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key
                 "a copy is exported to the station); it can never be changed or erased")
 WHY_ERASE = "wipes the whole storage device before the image is written"
 VARIANTS = ("clear", "crypt")
-#: Where the build container sees the config dir (config + secret files).
+#: Where the build container sees the config dir (the config and any files next to it).
 CFG_MOUNT = "/cfg"
 #: The parts of ``image/`` an image depends on (rpi-image-gen itself is versioned by its commit).
 SOURCES = ("build.sh", "docker", "layer")
 #: Builds of one job before it gives up on settings that keep changing under it.
 MAX_ROUNDS = 3
+#: docker/scripts: a board's boot slot (first-boot files, re-signed on signed boards).
+BOOT_SCRIPT = "boot-slot.sh"
 
 #: Where the gadget's otp-keyexport helper leaves its output (docker/gadget-helpers/otp-keyexport).
 KEY_EXPORT = {
@@ -87,7 +93,7 @@ class ImageBuilder:
         return self.source_dir / "rpi-image-gen"
 
     def rendered(self) -> imageconfig.RenderedConfig:
-        """The rpi-image-gen config and secret files of the current ``image.*`` settings."""
+        """The rpi-image-gen config of the station image (``image.name``)."""
         return imageconfig.render(self.cfg.image, mount=CFG_MOUNT)
 
     def overrides(self, variant: str) -> list[str]:
@@ -121,8 +127,8 @@ class ImageBuilder:
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
 
     def config_hash(self, variant: str) -> str:
-        """sha256(image settings incl. secret files + image sources + overrides of the variant)[:8] — part of
-        the set name. Changes whenever the image built now would differ."""
+        """sha256(image config + image sources + overrides of the variant)[:8] — part of the set name.
+        Changes whenever the image built now would differ."""
         return self._config_hash(self.rendered(), variant)
 
     VERSION_TTL = 10.0   # status is polled every few seconds; git describe --dirty is not free on Windows
@@ -144,7 +150,7 @@ class ImageBuilder:
                 "--", *self.overrides(variant)]
 
     def write_config_dir(self, rendered: imageconfig.RenderedConfig, where: Path) -> Path:
-        """``where`` (emptied) holding the config and its secret files, as the container sees them at /cfg."""
+        """``where`` (emptied) holding the config and its files, as the container sees them at /cfg."""
         rmtree(where)
         where.mkdir(parents=True)
         (where / imageconfig.CONFIG_NAME).write_text(rendered.text, encoding="utf-8", newline="\n")
@@ -173,10 +179,10 @@ class ImageBuilder:
         limit than the current one would hand the page pieces bigger than it was told to expect.
 
         The set must also come from the rpi-image-gen revision the submodule is at now and from the
-        current image settings, sources and overrides (``config_hash``): a board must never be flashed
-        with another OS than the one the station is set up to provision. A mismatch makes stage 3 wait
-        for a rebuild (the server rebuilds after a settings change and at start with ``builds.auto``, or
-        via Build).
+        current image name, sources and overrides (``config_hash``): a board must never be flashed with
+        another OS than the one the station is set up to provision. A mismatch makes stage 3 wait for a
+        rebuild (the server rebuilds after the name changes and at start with ``builds.auto``, or via
+        Build). The per-board settings (:mod:`otp_server.firstboot`) are not part of the image.
         """
         cur = int(self.cfg.provisioning.max_piece_size)
         built = int(man.get("max_piece_size") or 0)
@@ -195,7 +201,7 @@ class ImageBuilder:
                         f"built from {have_v}")
         have_c = str(man.get("config_hash") or "")
         if have_c and have_c != self.config_hash(variant):
-            return (f"rebuild needed: the image settings, builds.image.overrides or the station's image sources "
+            return (f"rebuild needed: the image name, builds.image.overrides or the station's image sources "
                     f"changed since image set {man.get('set', '')} was built")
         return None
 
@@ -256,7 +262,7 @@ class ImageBuilder:
                                f"{', '.join(stale)} is still out of date: build again")
 
     def _sweep_config_dirs(self, job: Any) -> None:
-        """Config dirs (with secret files) a killed build left behind; called under the heavy lock, when no
+        """Config dirs a killed build left behind; called under the heavy lock, when no
         other build can be using one."""
         base = self.root / "cfg"
         if not base.is_dir():
@@ -285,15 +291,16 @@ class ImageBuilder:
             env = {"OTP_IMAGE_IN_CONTAINER": "1", "OTP_IMAGE_ROOT": "/src", "OTP_IMAGE_VERSION": version,
                    "OTP_IMAGE_CONFIG_ID": imageconfig.CONFIG_NAME}
             job.log(f"==> rpi-image-gen {version} ({variant}): {' '.join(self.overrides(variant))}")
-            job.log(f"==> {imageconfig.CONFIG_NAME} (from the image.* settings):")
+            job.log(f"==> {imageconfig.CONFIG_NAME}:")
             for line in rendered.text.splitlines():
                 job.log(f"    {line}")
-            job.log("==> secret files: " + (", ".join(sorted(rendered.files)) or "none"))
+            if rendered.files:
+                job.log("==> files next to it: " + ", ".join(sorted(rendered.files)))
             self.docker.run(self.icfg.builder_tag, self.build_args(variant), mounts=mounts, env=env,
                             privileged=True, hostname="otp-image-builder", interactive=True, log=job.log,
                             check=True)
         finally:
-            rmtree(cfg_dir)          # the secret files only live as long as the build
+            rmtree(cfg_dir)          # the config dir only lives as long as the build
         set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash, variant=variant,
                                settings=rendered.summary)
         job.log(f"==> image set ready: {set_dir}")
@@ -396,38 +403,52 @@ class ImageBuilder:
         return base
 
     # ------------------------------------------------------------------ stage 3
-    def _resign(self, record: dict, set_dir: Path, set_name: str, simage: str, pieces: list[dict],
-                secrets_fn) -> list[StageFile]:
-        """Per-board re-signed boot slot pieces (boot-resign.sh), via a quick build."""
+    def _board_boot(self, record: dict, set_dir: Path, simage: str, pieces: list[dict], *, signed: bool,
+                    seed: firstboot.Seed, secrets_fn) -> list[StageFile]:
+        """The board's own boot slot pieces (boot-slot.sh), via a quick build: the image's boot partition
+        with the board's first-boot files and cmdline additions, re-signed with the board key when
+        ``signed``."""
         serial = str(record.get("serial") or "")
         if len(pieces) != 1:
             raise NotReady(f"boot partition image {simage} is split into {len(pieces)} pieces; "
-                           "re-signing a split boot image is not supported")
-        khash = str(record.get("customer_key_hash") or "")
+                           "a split boot image is not supported")
+        khash = str(record.get("customer_key_hash") or "") if signed else ""
         max_piece = int(self.cfg.provisioning.max_piece_size)
-        fp = fingerprint("stage3", set_name, simage, [p.get("sha256") for p in pieces], khash,
-                         self.tools.hash(), self.tools.script_hash("boot-resign.sh"), max_piece)
+        fp = fingerprint("stage3-boot", set_dir.name, simage, [p.get("sha256") for p in pieces], signed, khash,
+                         seed.digest(), self.tools.hash(), self.tools.script_hash(BOOT_SCRIPT), max_piece)
         out_dir = Path(self.cfg.work_dir) / "modules" / serial / "stage3" / fp
+        seed_files = {f"files/{name}": data for name, data in seed.files.items()}
+        seed_files["cmdline.append"] = (seed.cmdline + "\n").encode("utf-8")
 
         def build(job: Any) -> None:
             if is_complete(out_dir):
                 return
             self.tools.ensure(job.log)
-            secrets = secrets_fn()
             part = fresh_partial(out_dir)
-            with TempKeys(self.cfg.work_dir, secrets["rsa_private_pem"], secrets["rsa_public_pem"]) as kdir:
-                self.tools.run_script("boot-resign.sh",
-                                      mounts=[Mount.bind(set_dir, "/in", readonly=True),
-                                              Mount.bind(kdir, "/keys", readonly=True),
-                                              Mount.bind(part, "/out")],
-                                      env={"SIMAGE": simage, "MAX_PIECE": str(max_piece)}, log=job.log)
-            res = read_json(part / "resign.json")
+            env = {"SIMAGE": simage, "SIGN": "1" if signed else "0", "MAX_PIECE": str(max_piece)}
+            mounts = [Mount.bind(set_dir, "/in", readonly=True), Mount.bind(part, "/out")]
+            with TempFiles(self.cfg.work_dir, seed_files) as sdir:
+                mounts.append(Mount.bind(sdir, "/seed", readonly=True))
+                if signed:
+                    secrets = secrets_fn()
+                    with TempKeys(self.cfg.work_dir, secrets["rsa_private_pem"],
+                                  secrets["rsa_public_pem"]) as kdir:
+                        mounts.append(Mount.bind(kdir, "/keys", readonly=True))
+                        self.tools.run_script(BOOT_SCRIPT, mounts=mounts, env=env, log=job.log)
+                else:
+                    self.tools.run_script(BOOT_SCRIPT, mounts=mounts, env=env, log=job.log)
+            res = read_json(part / "slot.json")
             files = [part / str(p["file"]) for p in res.get("pieces") or []]
             if not files:
-                raise RuntimeError("boot-resign.sh reported no pieces")
+                raise RuntimeError(f"{BOOT_SCRIPT} reported no pieces")
+            if bool(res.get("signed")) != signed:
+                raise RuntimeError(f"{BOOT_SCRIPT} made a {'signed' if res.get('signed') else 'unsigned'} slot")
+            if sorted(res.get("seed") or []) != sorted(seed.files):
+                raise RuntimeError(f"{BOOT_SCRIPT} wrote first-boot files {res.get('seed')}, expected "
+                                   f"{sorted(seed.files)}")
             for p, f in zip(res["pieces"], files):
                 if not f.is_file() or f.stat().st_size != int(p.get("size", -1)):
-                    raise RuntimeError(f"boot-resign.sh piece {f.name} missing or size mismatch")
+                    raise RuntimeError(f"{BOOT_SCRIPT} piece {f.name} missing or size mismatch")
                 if f.stat().st_size > max_piece:
                     raise RuntimeError(f"{f.name} is larger than max_piece_size")
             sparse.check_pieces(files)
@@ -435,11 +456,12 @@ class ImageBuilder:
 
         if not is_complete(out_dir):
             self.tools.require(self.jobs)
-        require_quick_build(self.jobs, f"stage3:{serial}", f"Stage 3 boot re-sign for {serial}", build,
-                            lambda: is_complete(out_dir), f"re-signed {simage}")
-        res = read_json(out_dir / "resign.json")
-        return [self.hashes.stage_file(str(p["file"]), out_dir / str(p["file"]),
-                                       f"{simage} re-signed with the board key (boot.img + boot.sig)")
+        require_quick_build(self.jobs, f"stage3:{serial}", f"Stage 3 boot partition for {serial}", build,
+                            lambda: is_complete(out_dir), f"the boot partition of {serial} ({simage})")
+        res = read_json(out_dir / "slot.json")
+        what = (f"{simage} with this board's first-boot files"
+                + (", re-signed with the board key (boot.img + boot.sig)" if signed else ""))
+        return [self.hashes.stage_file(str(p["file"]), out_dir / str(p["file"]), what)
                 for p in res.get("pieces") or []]
 
     def stage3(self, record: dict, *, secure: bool, signed: bool, secrets_fn,
@@ -479,10 +501,20 @@ class ImageBuilder:
             parts[s] = [StageFile(str(p["name"]), set_dir / str(p["name"]), int(p["size"]), str(p["sha256"]), origin)
                         for p in msim[s]]
         notes: list[str] = []
+        boots = [b for b in imagejson.boot_simages(ij) if b in msim]
+        if not boots:
+            raise NotReady(f"image set {set_dir.name} has no boot partition image for the first-boot files; "
+                           "rebuild the image")
+        seed = firstboot.render(self.cfg.image, serial)
+        for b in boots:
+            parts[b] = self._board_boot(record, set_dir, b, msim[b], signed=signed, seed=seed, secrets_fn=secrets_fn)
+        fb = seed.summary
+        notes.append(f"first boot (cloud-init, files in the boot partition): host name {fb['hostname']}, "
+                     + (f"user {fb['user']}" if fb["user"] else "the Raspberry Pi OS wizard asks for a user")
+                     + f", SSH {'on' if fb['ssh'] else 'off'}, "
+                     + (f"Wi-Fi {fb['wifi_ssid']!r}" if fb["wifi_ssid"] else "no Wi-Fi network")
+                     + f" ({fb['wifi_country']}), {fb['timezone']}")
         if signed:
-            for b in imagejson.boot_simages(ij):
-                if b in msim:
-                    parts[b] = self._resign(record, set_dir, set_dir.name, b, msim[b], secrets_fn)
             notes.append("board OTP is locked to our key: boot partition re-signed for this board")
         ijm = man.get("image_json") or {}
         ij_path = set_dir / "image.json"
@@ -532,6 +564,7 @@ class ImageBuilder:
             "key_export": dict(KEY_EXPORT) if secure else None,
             "erase": bool(prov.erase_storage),
             "crypt": crypt,
+            "firstboot": seed.summary,
             "irreversible": irreversible,
             "notes": notes,
         }

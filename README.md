@@ -19,7 +19,7 @@ is provisioned in one of two **scenarios**, picked on the page per board (both a
 | --- | --- | --- |
 | Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`) |
 | Stage 2 · Fastboot gadget | the gadget built by this server | the same gadget, `boot.sig` once the board is locked |
-| Stage 3 · Image | clear OS image (`IGconf_image_pmap=clear`), nothing written to OTP | the OTP device key is generated (if blank) and **exported to the server**, then the LUKS2-encrypted OS image (`IGconf_image_pmap=crypt`); the boot partition is re-signed per board |
+| Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**, then Raspberry Pi OS Lite LUKS2-encrypted (`IGconf_image_pmap=crypt`); the boot partition carries the board's first-boot files and is re-signed per board |
 
 In every scenario a board goes through the same three stages:
 
@@ -104,8 +104,8 @@ meanwhile and its **Server builds** card shows each job with a live log:
    (about 3 minutes). Stage 2 answers "not ready" until it exists — there is no prebuilt fallback, because
    only this gadget carries the device key export.
 3. **image**: the OS image in both variants, `clear` (open scenario) and `crypt` (secure scenario),
-   about six minutes each (the first build in a new work volume takes longer). rpi-image-gen runs in the
-   builder image from `image/docker` with a config written from the **OS image** settings (see below); each
+   about twelve minutes each (the first build in a new work volume takes longer). rpi-image-gen runs in the
+   builder image from `image/docker` and builds Raspberry Pi OS Lite (see below); each
    result is collected into an IDP set of sparse pieces ≤ `max_piece_size` with SHA-256 for each piece.
    Stage 3 answers "not ready" until the variant the board needs is there.
 
@@ -117,11 +117,12 @@ Build rules worth knowing:
   gadget-entrypoint.sh and every file under docker/gadget-helpers>-<targets>`, so editing any of them makes
   the gadget "not built". An image set is reported as `rebuild needed: …` (status not ready, stage 3 409)
   when it was built from another rpi-image-gen revision than the one checked out now (`git describe --tags
-  --always --dirty` of `image/rpi-image-gen`), from other OS image settings (`image.*`, passwords included),
+  --always --dirty` of `image/rpi-image-gen`), with another image name (`image.name`),
   `builds.image.overrides` or station image sources (`image/build.sh`, `image/docker/`, `image/layer/`), as
-  another variant, or split with a larger `max_piece_size` than the current setting. Saving the OS image
-  form starts the rebuild at once (with `builds.auto`); settings saved while a build runs are picked up by
-  the same job, which builds the stale variant again. The stage-1 identity includes the sha256 of the
+  another variant, or split with a larger `max_piece_size` than the current setting. The other `image.*`
+  settings are not in the image (stage 3 writes them to each board), so saving them rebuilds nothing; a new
+  image name starts the rebuild at once (with `builds.auto`), and a name saved while a build runs is picked
+  up by the same job, which builds the stale variant again. The stage-1 identity includes the sha256 of the
   selected `pieeprom-*.bin` and `recovery.bin` and the content of `rpi-eeprom-config`, `rpi-eeprom-digest`,
   `rpi-sign-bootcode` and `update-pieeprom.sh`, so a firmware or usbboot submodule update rebuilds stage 1
   (a quick build, about a minute) even when names and sizes stay the same. `builds.auto` rebuilds all of these.
@@ -149,9 +150,10 @@ Build artifacts live **outside the repo**, in the work directory. The default is
 <work>/artifacts/gadget/<key>[-r<N>]/  built gadget + build-info.json (newest complete version served)
 <work>/artifacts/image/<set>/          IDP set: image.json, sparse pieces, manifest.json
 <work>/artifacts/image/current-clear.json, current-crypt.json   which set stage 3 serves per variant
-<work>/modules/<serial>/stage{1,2,3}/<fp>/    per-board signed files (secure scenario only)
+<work>/modules/<serial>/stage{1,2}/<fp>/    per-board signed files (secure scenario only)
+<work>/modules/<serial>/stage3/<fp>/   the board's boot partition (first-boot files; re-signed on secure boards)
 <work>/jobs/<id>.log                   build logs
-<work>/tmp/keys-<id>/ + keys-<id>.lock  short-lived key files for signing (deleted after use, swept at start)
+<work>/tmp/keys-<id>/ + keys-<id>.lock  short-lived key / first-boot files (deleted after use, swept at start)
 <work>/tmp/heavy.lock                  cross-process lock for gadget/image builds
 ```
 
@@ -160,38 +162,65 @@ Docker volumes `otp-pgm-work` and `otp-image-work` keep the build trees and apt 
 
 ## The OS image
 
-What goes into the image is set in the **OS image** panel of the page and kept in the `image.*` rows of the
-`settings` worksheet. Both variants (open and secure) get the same settings.
+The image is **Raspberry Pi OS Lite** (trixie, arm64) for the Raspberry Pi 5, built with rpi-image-gen, and
+it is the same for every board. Like the official image it comes up with the first user `pi` locked, SSH
+off and Wi-Fi off; what makes a board yours is written at stage 3 into **its own boot partition** as
+cloud-init files, the way Raspberry Pi Imager customises Raspberry Pi OS. So the settings below apply to
+every board flashed after they are saved, with no rebuild; boards provisioned earlier keep what they got.
 
-| Field | Setting | In the image |
+The settings are in the **OS image** panel of the page and in the `image.*` rows of the `settings`
+worksheet. Open and secure boards get the same settings.
+
+| Field | Setting | On the board |
 | --- | --- | --- |
-| Hostname | `image.hostname` (`pi5`) | `/etc/hostname` |
-| Time zone (a list) | `image.timezone` (`Europe/Kyiv`) | `/etc/localtime` |
-| User, password | `image.user` (`pi`), `image.password_hash` | the login account; with a password it may `sudo` (with the password) |
-| SSH server, password login, authorized keys | `image.ssh` (off), `image.ssh_password_login` (on), `image.ssh_authorized_keys` | openssh-server and `~/.ssh/authorized_keys`; password login off = keys only |
-| Wi-Fi network, password, country (a list), hidden | `image.wifi_ssid`, `image.wifi_password`, `image.wifi_country` (`UA`), `image.wifi_hidden` | an iwd profile in `/var/lib/iwd/` (DHCP by systemd-networkd), the cfg80211 regulatory domain |
-| Image name | `image.name` (`deb13-arm64-min`) | the name of the image sets |
+| Hostname | `image.hostname` (`pi5-{serial}`) | host name and `/etc/hosts`; `{serial}` is the board's 8-hex serial; avahi announces `<name>.local` |
+| Time zone (a list) | `image.timezone` (`Europe/Kyiv`) | `/etc/localtime`, `/etc/timezone` |
+| Keyboard (a list) | `image.keyboard` (`us`) | `/etc/default/keyboard`: the console layout the password is typed with. Raspberry Pi OS itself defaults to `gb`, where Shift+2 gives `"` and Shift+' gives `@` |
+| User, password | `image.user` (`pi`), `image.password_hash` | Raspberry Pi OS renames its first user `pi` to this name (userconf) and sets the password; it is in the `sudo` group and `sudo` asks for the password |
+| SSH server, password login, authorized keys | `image.ssh` (off), `image.ssh_password_login` (on), `image.ssh_authorized_keys` | `ssh` enabled at first boot, `~/.ssh/authorized_keys`; password login off = keys only |
+| Wi-Fi network, password, country (a list), hidden | `image.wifi_ssid`, `image.wifi_password`, `image.wifi_country` (`UA`), `image.wifi_hidden` | a netplan network that NetworkManager runs (WPA-PSK as a PMK, DHCP), the regulatory domain; the Wi-Fi radio is switched on at first boot (`raspi-config nonint do_wifi_country`) |
+| Image name | `image.name` (`rpios-trixie-arm64-lite`) | the name of the image sets; **the only setting that rebuilds the image** |
 
-* **Lists.** Time zone and Wi-Fi country are picked from lists taken from the Debian trixie packages the
-  image installs (`otp_server/image_choices.json`): the zones of `tzdata` (grouped by region, with the
-  current UTC offset; legacy names such as `Europe/Kiev` live in `tzdata-legacy`, which the image does not
-  have) and the countries of `wireless-regdb` (`00` = world), named from `iso-codes`. The server accepts
+* **The first-boot files** (`otp_server/firstboot.py`) are Imager's `cloudinit-rpi` files: `user-data`
+  (`#cloud-config`: host name, time zone, keyboard, the `user:` section, `ssh_pwauth`, `runcmd`), `network-config`
+  (netplan v2, only with a Wi-Fi network) and `meta-data` (`instance-id: otp-<serial>-<hash>`), plus
+  Imager's kernel parameters in `cmdline.txt`: `cfg80211.ieee80211_regdom=<country>` and
+  `ds=nocloud;i=<instance>`. On a secure board the boot partition holds the signed `boot.img`, so the
+  parameters go into that `boot.img` (re-signed for the board anyway) and the three files next to it, where
+  the OS reads them (`/boot/firmware`). They are plain files on a FAT partition on every board, so the
+  account hash and the Wi-Fi PMK on the boot partition are readable to whoever has the SD card (the root
+  file system of a secure board is encrypted; its boot partition is not).
+* **No account.** With no password and no SSH key there is no `user:` section: the first boot stops at the
+  Raspberry Pi OS wizard on the board's console (screen and keyboard), as on an image nobody customised.
+  The page warns about it. An account with SSH keys but no password gets password-less `sudo`.
+* **Lists.** Time zone, Wi-Fi country and keyboard are picked from lists taken from the Debian trixie
+  packages the image installs (`otp_server/image_choices.json`): the zones of `tzdata` (grouped by region,
+  with the current UTC offset; legacy names such as `Europe/Kiev` live in `tzdata-legacy`, which the image
+  does not have), the countries of `wireless-regdb` (`00` = world), named from `iso-codes`, and the layouts
+  of `xkb-data`. The server accepts
   only values from these lists; `python -m otp_server.image_choices` regenerates the file (its docstring
   has the commands).
 * **Passwords.** The account password is stored only as a SHA-512 crypt hash (`$6$…`, made by the server
-  when you save it). No password and no SSH key means nobody can log in: the page says so. An account with
-  SSH keys but no password gets password-less `sudo`. The Wi-Fi password is stored as typed (it has to
-  reach the board): 8-63 characters, or a 64-digit hex key; empty = an open network. Both passwords are
-  write-only on the page: it shows whether one is set, **remove** clears it.
-* **Saving rebuilds both images** (about 12 minutes); stage 3 waits for the new image. Boards provisioned
-  earlier keep what they got.
-* **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: layers and plain values)
-  and, next to it, the secret files (`secrets/user1.passhash`, `secrets/iwd/<network>.psk`,
-  `secrets/authorized_keys`), mounts them read-only at `/cfg` for the build and deletes them afterwards.
-  Secrets are never config values: rpi-image-gen expands `$` in values. The station layers in `image/layer`
-  are `otp-minbase` (rpi-image-gen's `trixie-minbase` without openssh-server, with the account) and
-  `otp-image` (applies the secret files); `openssh-server` is added only with SSH on.
-  `image/example.yaml` is the config of the default settings (a test keeps it in sync).
+  when you save it). The Wi-Fi password is stored as typed (8-63 characters, or a 64-digit hex key; empty =
+  an open network) and written to the board as the PMK. Both passwords are write-only on the page: it
+  shows whether one is set, **remove** clears it.
+* **What the image is.** `image/layer` holds three station layers. `otp-rpios-packages` is the package set
+  of an official Raspberry Pi OS Lite release, generated from the release's `.info` file by
+  `python image/rpios_packages.py <url or path of the .info>` (the Raspberry Pi 3/4 kernel is left out: a
+  Pi 5 image). `otp-rpios-lite` puts it on rpi-image-gen's Debian and Raspberry Pi base and keeps the
+  manual pages and documentation the official image has. `otp-rpios-setup` does what pi-gen configures
+  beyond packages: `pi` locked with no login shell (cloud-init or the wizard set it up), SSH off and host
+  keys made at first boot, Wi-Fi off until a country is set (`WirelessEnabled=false`), Bluetooth not
+  blocked, classic interface names (`eth0`, `wlan0`), en_GB / gb / Europe/London, `raspberrypi`, pi-gen's
+  shell and `PATH` tweaks, avahi, `/etc/machine-id` = `uninitialized`, the NoCloud templates in
+  `/boot/firmware`, and no `apt`/`dpkg` leftovers of the build (recommends are installed again, as on
+  Raspberry Pi OS). The differences from the official image: no Pi 3/4 kernel, `cryptsetup` added (the
+  secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, and on the
+  **secure** (crypt) image `rpi-eeprom-update.service` is off: that bootloader is signed for the board,
+  and only the station updates it.
+* **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: the Pi 5 device, the
+  `image-rpios` layout, the image name and the station layers) and mounts it read-only at `/cfg` for the
+  build. `image/example.yaml` is that config for the default name (a test keeps it in sync).
 * **Building by hand** (Linux with Docker): `image/build.sh --docker -c image/example.yaml` or your own
   config; `image/build.sh --help` lists the options. `IGconf_*=value` words after the options are passed to
   rpi-image-gen; `builds.image.overrides` does the same for the station.
@@ -329,10 +358,11 @@ is shown on the page; unknown keys produce a warning.
 | `provisioning.firmware_channel` | `default` | rpi-eeprom firmware channel for stage 1: `default` or `latest` |
 | `provisioning.max_piece_size` | `268435456` | largest sparse piece sent to the board (bytes, rpi-fastbootd max-download-size) |
 | `provisioning.boot_conf` | `[all]`, `BOOT_UART=1`, `POWER_OFF_ON_HALT=1`, `BOOT_ORDER=0xf2461` | EEPROM `boot.conf` written in stage 1 (multi-line) |
-| `image.name` | `deb13-arm64-min` | image name (part of the image set names) |
-| `image.hostname` | `pi5` | hostname of the boards |
+| `image.name` | `rpios-trixie-arm64-lite` | name of the OS image (part of the image set names; a new name rebuilds it). The other `image.*` settings are written to each board at stage 3 and rebuild nothing |
+| `image.hostname` | `pi5-{serial}` | host name of the boards; `{serial}` = the board's 8-hex serial |
 | `image.timezone` | `Europe/Kyiv` | time zone of the image's tzdata (the page offers the list) |
-| `image.user` | `pi` | login account created on the boards |
+| `image.keyboard` | `us` | keyboard layout of the boards' console (xkb `us`, `gb`, `ua`, …; the page offers the list) |
+| `image.user` | `pi` | the boards' login account (Raspberry Pi OS renames its first user `pi` to it at first boot) |
 | `image.password_hash` | (none) | crypt hash of the account password (set it on the page; empty = no password) |
 | `image.ssh` | `false` | SSH server on the boards |
 | `image.ssh_password_login` | `true` | SSH accepts the account password (`false` = keys only) |
@@ -481,13 +511,14 @@ otp_server/
   winusb.py                Windows WinUSB driver-package check (read-only)
 docker/
   tools.Dockerfile, tools-entrypoint.sh     otp-tools image ("otp-run <script>")
-  scripts/stage1.sh, stage2-sign.sh, boot-resign.sh, image-collect.sh
+  scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, image-collect.sh
   gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder
   gadget-helpers/otp-keyexport/             pi-gen-micro helper package: OTP device key export
 image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
-  layer/                   station layers: otp-minbase, otp-image
+  layer/                   station layers: otp-rpios-packages (generated), otp-rpios-lite, otp-rpios-setup
+  rpios_packages.py        writes otp-rpios-packages.yaml from a Raspberry Pi OS Lite release's .info file
   example.yaml             the config of the default OS image settings
   rpi-image-gen/           submodule
 index.html, css/app.css

@@ -1525,9 +1525,10 @@
             eq(`${f('ssh').checked}:${f('ssh_password_login').checked}`, 'false:true', 'SSH off, password login on');
             eq(`${f('ssh_password_login').disabled}:${f('ssh_authorized_keys').disabled}`, 'true:true', 'SSH off: its options are disabled');
             eq(`${save.disabled}:${revert.disabled}`, 'true:true', 'nothing changed: Save and Revert disabled');
-            eq(f('password').placeholder, 'none: password login is off', 'no password: the placeholder says so');
+            eq(f('password').placeholder, 'none', 'no password: the placeholder says so');
             eq(form.querySelector('button[data-remove="password"]').disabled, true, 'no password: "remove" is disabled');
-            deq(warn(), ['no password and no SSH key: nobody can log in as pi (console or SSH)'], 'server warnings are listed');
+            deq(warn(), ["no password and no SSH key: the board's first boot stops at the Raspberry Pi OS wizard on its console (screen and keyboard), which asks for a user name and password"],
+                'server warnings are listed');
 
             // time zone and Wi-Fi country are lists (the image's tzdata and wireless-regdb, from the server)
             const tzSel = f('timezone');
@@ -1544,6 +1545,9 @@
             eq(ba && ba.textContent.replace(/ \(.*\)$/, ''), 'Argentina/Buenos Aires', 'deeper names keep their path, underscores become spaces');
             eq(tzSel.value, 'Europe/Kyiv', 'the saved time zone is selected');
             eq([...tzSel.options].some((o) => o.value === 'Europe/Kiev'), false, 'legacy names (tzdata-legacy) are not offered');
+            const kbSel = f('keyboard');
+            eq(`${kbSel.tagName}:${kbSel.options.length}:${kbSel.value}`, 'SELECT:99:us', 'keyboard: a list of the xkb-data layouts, the saved one selected');
+            eq([...kbSel.options].find((o) => o.value === 'gb').textContent, 'English (UK) (gb)', 'a layout shows its name and code');
             eq(ccSel.options.length, 182, 'country list: every country of wireless-regdb');
             eq(ccSel.options[0].value + '|' + ccSel.options[0].textContent, '00|World (most restrictive) (00)', 'the world domain comes first');
             const names = [...ccSel.options].slice(1).map((o) => o.textContent);
@@ -1591,8 +1595,9 @@
                     'Save sends only what changed (picked list values, keys one per line, passwords as typed)');
                 eq(`${tzSel.value}:${ccSel.value}`, 'Europe/Warsaw:PL', 'after the save the lists show the saved values');
                 await until(() => /^Saved: /.test(status.textContent), 3000, 'saved message');
-                assert(/hostname/.test(status.textContent) && /rebuilds both images/.test(status.textContent) && !status.classList.contains('bad'),
-                    'the status names what was saved and the rebuild', status.textContent);
+                assert(/hostname/.test(status.textContent) && /flashed from now on/.test(status.textContent)
+                    && /\(no rebuild\)/.test(status.textContent) && !status.classList.contains('bad'),
+                    'the status names what was saved: board settings apply at stage 3, no rebuild', status.textContent);
                 eq(f('hostname').value, 'drone-7', 'the form shows the server\'s normalised value');
                 eq(`${f('password').value}|${f('wifi_password').value}`, '|', 'the password fields are emptied after a save');
                 eq(f('password').placeholder, 'set: type to change', 'a saved password: placeholder');

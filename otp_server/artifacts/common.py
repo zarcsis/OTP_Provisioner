@@ -396,21 +396,32 @@ def heavy_lock(work_dir: Path, log_fn: Callable[[str], None] | None = None, poll
         HEAVY_LOCK.release()
 
 
-class TempKeys:
-    """Context manager: a temp dir under ``<work>/tmp`` holding private.pem/public.pem, always deleted.
+class TempFiles:
+    """Context manager: a temp dir under ``<work>/tmp`` holding secret files, always deleted.
 
-    The directory is mounted read-only into the signing containers at /keys. A sibling
-    ``keys-<id>.lock`` is held while it is in use, so :func:`sweep_stale_temp` (run at start-up, possibly
-    by another process) never removes a live key directory. Removal is retried with back-off; a
-    directory that still cannot be removed is logged (path only) and swept at the next start.
+    The directory is mounted read-only into a container. A sibling ``keys-<id>.lock`` is held while it is
+    in use, so :func:`sweep_stale_temp` (run at start-up, possibly by another process) never removes a
+    live directory. Removal is retried with back-off; a directory that still cannot be removed is logged
+    (path only) and swept at the next start.
+
+    ``files``: relative path (``/``-separated, may name a sub-directory) -> bytes.
     """
 
-    def __init__(self, work_dir: Path, private_pem: str, public_pem: str):
+    def __init__(self, work_dir: Path, files: dict[str, bytes] | None = None):
         name = f"keys-{uuid.uuid4().hex}"
         self.dir = Path(work_dir) / "tmp" / name
         self._lock = FileLock(self.dir.with_name(name + ".lock"))
-        self._priv = private_pem
-        self._pub = public_pem
+        self._files = dict(files or {})
+
+    def _write(self) -> None:
+        for rel, data in self._files.items():
+            p = self.dir.joinpath(*rel.split("/"))
+            if not p.resolve().is_relative_to(self.dir.resolve()) or p == self.dir:
+                raise ValueError(f"temporary file name {rel!r} leaves its directory")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
 
     def __enter__(self) -> Path:
         self._lock.acquire(blocking=False)      # a fresh name: nobody else can hold it
@@ -420,11 +431,7 @@ class TempKeys:
                 os.chmod(self.dir, 0o700)
             except OSError:
                 pass
-            for name, text in (("private.pem", self._priv), ("public.pem", self._pub)):
-                p = self.dir / name
-                fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="ascii", newline="\n") as f:
-                    f.write(text if text.endswith("\n") else text + "\n")
+            self._write()
         except BaseException:
             self._cleanup()
             raise
@@ -444,6 +451,23 @@ class TempKeys:
         else:
             log.warning("temporary key directory %s could not be removed; it will be removed at the next start",
                         self.dir)
+
+
+class TempKeys(TempFiles):
+    """:class:`TempFiles` holding private.pem/public.pem, mounted read-only into the signing containers at
+    /keys."""
+
+    def __init__(self, work_dir: Path, private_pem: str, public_pem: str):
+        super().__init__(work_dir)
+        self._priv = private_pem
+        self._pub = public_pem
+
+    def _write(self) -> None:
+        for name, text in (("private.pem", self._priv), ("public.pem", self._pub)):
+            p = self.dir / name
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii", newline="\n") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
 
 
 def sweep_stale_temp(work_dir: Path, min_age: float = STALE_KEYS_AGE) -> list[Path]:

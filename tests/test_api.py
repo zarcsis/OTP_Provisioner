@@ -1518,9 +1518,11 @@ def test_image_settings_get_and_save_without_a_sheet(env):
     r = env.client.get("/api/image")
     assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
     view = r.json()
-    assert view["settings"]["hostname"] == "pi5" and view["settings"]["password_set"] is False
+    assert view["settings"]["hostname"] == "pi5-{serial}" and view["settings"]["password_set"] is False
     assert view["settings"]["ssh_authorized_keys"] == [] and view["settings"]["wifi_password_set"] is False
-    assert view["warnings"] == ["no password and no SSH key: nobody can log in as pi (console or SSH)"]
+    assert view["settings"]["sudo"] == "wizard"
+    assert view["warnings"] == ["no password and no SSH key: the board's first boot stops at the Raspberry Pi OS "
+                                "wizard on its console (screen and keyboard), which asks for a user name and password"]
     assert "Europe/Kyiv" in view["choices"]["timezones"] and ["UA", "Ukraine"] in view["choices"]["countries"]
 
     r = env.client.post("/api/image", json={
@@ -1534,7 +1536,9 @@ def test_image_settings_get_and_save_without_a_sheet(env):
                              "image.wifi_password", "image.wifi_ssid"]
     st = body["settings"]
     assert st["hostname"] == "drone-7" and st["wifi_country"] == "PL" and st["password_set"] is True
-    assert st["sudo"] == "passwd" and st["ssh_authorized_keys"] == [KEY] and body["warnings"] == []
+    assert st["sudo"] == "passwd" and st["ssh_authorized_keys"] == [KEY]
+    assert body["warnings"] == ["every board gets the host name 'drone-7'; put {serial} in it (e.g. pi5-{serial}) "
+                                "to tell them apart on the network"]
     img = env.cfg.image
     assert img.password_hash.startswith("$6$") and img.wifi_password == " pass phrase "
     from otp_server.passhash import verify
@@ -1574,7 +1578,7 @@ def test_image_settings_body_must_be_an_object(env):
     assert env.client.post("/api/image", json=[1, 2]).status_code == 400
 
 
-def test_image_settings_go_to_the_sheet_and_start_a_rebuild(genv):
+def test_image_settings_go_to_the_sheet_and_only_a_new_name_rebuilds(genv):
     genv.account.signed_in = True
     genv.svc.auto_build = True
     assert genv.client.get("/api/image").status_code == 200
@@ -1589,17 +1593,20 @@ def test_image_settings_go_to_the_sheet_and_start_a_rebuild(genv):
     assert written["image.wifi_password"] == "password1"           # stored as typed (it must reach the board)
     assert genv.cfg.image.hostname == "drone8"                      # read back from the sheet
     assert r.json()["settings"]["hostname"] == "drone8"
+    __import__("time").sleep(0.05)
+    assert genv.artifacts.auto_calls == calls                      # board settings: written at stage 3, no build
+    assert genv.client.post("/api/image", json={"name": "rpios-fleet"}).status_code == 200
     deadline = __import__("time").monotonic() + 5
     while genv.artifacts.auto_calls == calls and __import__("time").monotonic() < deadline:
         __import__("time").sleep(0.01)
-    assert genv.artifacts.auto_calls == calls + 1                  # the images are rebuilt
+    assert genv.artifacts.auto_calls == calls + 1                  # a new image name: the images are rebuilt
 
 
 def test_image_settings_without_auto_build_do_not_build(genv):
     genv.account.signed_in = True
     genv.svc.auto_build = False
     calls = genv.artifacts.auto_calls
-    assert genv.client.post("/api/image", json={"hostname": "drone9"}).status_code == 200
+    assert genv.client.post("/api/image", json={"name": "rpios-fleet"}).status_code == 200
     __import__("time").sleep(0.05)
     assert genv.artifacts.auto_calls == calls
 
@@ -1609,7 +1616,7 @@ def test_image_settings_sheet_failure_is_503(genv):
     genv.sheet.write_error = "Google unreachable (ConnectionError)"
     r = genv.client.post("/api/image", json={"hostname": "drone9"})
     assert r.status_code == 503 and "Google unreachable" in r.json()["detail"]
-    assert genv.cfg.image.hostname == "pi5"
+    assert genv.cfg.image.hostname == "pi5-{serial}"
 
 
 def test_image_settings_need_the_google_login(genv):

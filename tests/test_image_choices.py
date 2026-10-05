@@ -39,6 +39,22 @@ def test_page_view():
     v = ic.page_view()
     assert "UTC" in v["timezones"] and ["UA", "Ukraine"] in v["countries"] and ["00", "World (most restrictive)"] in v["countries"]
     assert "timezones_valid" not in v
+    assert ["us", "English (US)"] in v["keyboards"] and ["gb", "English (UK)"] in v["keyboards"]
+    assert ["ua", "Ukrainian"] in v["keyboards"] and len(v["keyboards"]) > 50
+
+
+@pytest.mark.parametrize("layout, ok", [("us", True), ("gb", True), ("ua", True), ("latam", True), ("US", False),
+                                        ("us(intl)", False), ("", False)])
+def test_is_keyboard(layout, ok):
+    assert ic.is_keyboard(layout) is ok
+
+
+def test_xkb_layouts():
+    lst = ("! model\n  pc105           Generic 105-key PC\n\n! layout\n  us              English (US)\n"
+           "  gb              English (UK)\n\n! variant\n  intl            us: English (US, intl., with dead keys)\n")
+    assert ic.xkb_layouts(lst) == [["us", "English (US)"], ["gb", "English (UK)"]]
+    with pytest.raises(ValueError, match="no layouts"):
+        ic.xkb_layouts("! model\n  pc105 Generic\n")
 
 
 def test_settings_are_checked_against_the_lists(tmp_path):
@@ -48,6 +64,9 @@ def test_settings_are_checked_against_the_lists(tmp_path):
         cfg(timezone="Europe/Kiev")
     with pytest.raises(ValueError, match="image.wifi_country: Wi-Fi country 'XX' is not in wireless-regdb"):
         cfg(wifi_country="XX")
+    assert cfg(keyboard=" ua ").image.keyboard == "ua"
+    with pytest.raises(ValueError, match="image.keyboard: keyboard layout 'xx' is not in the image's xkb-data"):
+        cfg(keyboard="xx")
 
 
 # ------------------------------------------------------------------ generation
@@ -99,7 +118,11 @@ def test_generate(tmp_path):
     (iso / "iso_3166-1.json").write_text(json.dumps({"3166-1": [
         {"alpha_2": "UA", "name": "Ukraine"}, {"alpha_2": "PL", "name": "Poland"},
         {"alpha_2": "TW", "name": "Taiwan, Province of China", "common_name": "Taiwan"}]}), encoding="utf-8")
+    xkb = root / "usr/share/X11/xkb/rules"
+    xkb.mkdir(parents=True)
+    (xkb / "base.lst").write_text("! layout\n  us   English (US)\n  ua   Ukrainian\n", encoding="utf-8")
     d = ic.generate(root, LISTING, "tzdata 2026c-0+deb13u1")
+    assert d["keyboards"] == [["us", "English (US)"], ["ua", "Ukrainian"]]
     assert d["timezones"] == ["Europe/Kyiv", "Europe/Warsaw", "UTC"]       # Europe/Kiev is only in tzdata.zi
     assert d["timezones_valid"] == ["Etc/UTC"]
     assert d["countries"] == [["00", "World (most restrictive)"], ["AN", "Netherlands Antilles"], ["PL", "Poland"],

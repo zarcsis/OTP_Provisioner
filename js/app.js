@@ -368,7 +368,7 @@
 
     // ---------- OS image settings (image.* in the settings sheet) ----------
     const imageForm = $('#image-form');
-    const IMAGE_TEXT = ['name', 'hostname', 'timezone', 'user', 'wifi_ssid', 'wifi_country'];
+    const IMAGE_TEXT = ['name', 'hostname', 'timezone', 'keyboard', 'user', 'wifi_ssid', 'wifi_country'];
     const IMAGE_BOOL = ['ssh', 'ssh_password_login', 'wifi_hidden'];
     const IMAGE_SECRETS = ['password', 'wifi_password'];
     const img = { loaded: null, warnings: [], remove: { password: false, wifi_password: false }, saving: false, loading: false, choicesKey: '' };
@@ -405,11 +405,12 @@
         } catch (e) { return ''; }
     }
 
-    /** The time zone and Wi-Fi country lists (the image's tzdata and wireless-regdb, from the server). */
+    /** The time zone, Wi-Fi country and keyboard lists (the image's tzdata, wireless-regdb, xkb-data, from the server). */
     function fillImageChoices(choices) {
         const tzs = (choices && choices.timezones) || [];
         const countries = (choices && choices.countries) || [];
-        const key = `${tzs.length}:${tzs[0] || ''}:${countries.length}`;
+        const keyboards = (choices && choices.keyboards) || [];
+        const key = `${tzs.length}:${tzs[0] || ''}:${countries.length}:${keyboards.length}`;
         if (key === img.choicesKey) return;
         img.choicesKey = key;
         const groups = new Map();
@@ -429,6 +430,8 @@
         const world = countries.filter(([code]) => code === '00');
         const named = countries.filter(([code]) => code !== '00').sort((a, b) => a[1].localeCompare(b[1]));
         imageInput('wifi_country').replaceChildren(...[...world, ...named].map(([code, name]) => el('option', { value: code }, `${name} (${code})`)));
+        imageInput('keyboard').replaceChildren(...[...keyboards].sort((a, b) => a[1].localeCompare(b[1]))
+            .map(([code, name]) => el('option', { value: code }, `${name} (${code})`)));
     }
 
     /** Select ``value``; a value the list lacks (typed into the sheet by hand) stays selectable, marked as such. */
@@ -457,7 +460,7 @@
         }
         const set = { password: !!(s && s.password_set), wifi_password: !!(s && s.wifi_password_set) };
         imageInput('password').placeholder = img.remove.password ? 'will be removed'
-            : set.password ? 'set: type to change' : 'none: password login is off';
+            : set.password ? 'set: type to change' : 'none';
         imageInput('wifi_password').placeholder = img.remove.wifi_password ? 'will be removed (open network)'
             : set.wifi_password ? 'saved: type to change' : 'none (open network)';
         for (const b of imageForm.querySelectorAll('button[data-remove]')) {
@@ -517,8 +520,10 @@
             const names = (r.saved || []).map((k) => k.replace(/^image\./, '')).join(', ');
             const builds = srv.status && srv.status.config && srv.status.config.builds;
             const auto = !builds || builds.auto !== false;
-            setImageStatus(`Saved: ${names}. ` + (auto ? 'The server rebuilds both images now; stage 3 waits for them.'
-                : 'Start the OS image build under Server builds (automatic builds are off).'));
+            const renamed = (r.saved || []).includes('image.name');
+            setImageStatus(`Saved: ${names}. ` + (!renamed ? 'Boards flashed from now on get them at stage 3 (no rebuild).'
+                : auto ? 'The image has a new name: the server rebuilds both images now; stage 3 waits for them.'
+                    : 'The image has a new name: start the OS image build under Server builds (automatic builds are off).'));
             log('ok', `OS image settings saved: ${names}`);
             refreshStatus();
         } catch (e) {

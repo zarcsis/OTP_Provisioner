@@ -104,12 +104,12 @@ _COUNTS: Counter = Counter()
 
 #: The image.* settings (otp_server.config.ImageCfg) behind GET/POST /api/image; secrets as the server keeps them.
 _INITIAL_IMAGE: dict[str, Any] = {
-    "name": "deb13-arm64-min", "hostname": "pi5", "timezone": "Europe/Kyiv", "user": "pi", "password_hash": "",
+    "name": "deb13-arm64-min", "hostname": "pi5", "timezone": "Europe/Kyiv", "keyboard": "us", "user": "pi", "password_hash": "",
     "ssh": False, "ssh_password_login": True, "ssh_authorized_keys": [], "wifi_ssid": "", "wifi_password": "",
     "wifi_country": "UA", "wifi_hidden": False,
 }
 IMAGE: dict[str, Any] = copy.deepcopy(_INITIAL_IMAGE)
-IMAGE_FIELDS = ("name", "hostname", "timezone", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
+IMAGE_FIELDS = ("name", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
                 "wifi_ssid", "wifi_country", "wifi_hidden")
 
 
@@ -128,23 +128,26 @@ _CHOICES_FILE = pathlib.Path(__file__).resolve().parents[2] / "otp_server" / "im
 def _choices() -> dict[str, Any]:
     """The real lists (otp_server/image_choices.json): what the page renders is what the server offers."""
     d = json.loads(_CHOICES_FILE.read_text(encoding="utf-8"))
-    return {"timezones": d["timezones"], "countries": d["countries"], "_valid": set(d["timezones"]) | set(d["timezones_valid"])}
+    return {"timezones": d["timezones"], "countries": d["countries"], "keyboards": d["keyboards"],
+            "_valid": set(d["timezones"]) | set(d["timezones_valid"])}
 
 
 def image_view() -> dict[str, Any]:
     """otp_server.app.Services.image_settings: no password or hash, only whether they are set."""
     i = IMAGE
-    sudo = "passwd" if i["password_hash"] else ("nopasswd" if i["ssh"] and i["ssh_authorized_keys"] else "none")
-    view = {k: copy.deepcopy(i[k]) for k in ("name", "hostname", "timezone", "user", "ssh", "ssh_password_login",
+    sudo = "passwd" if i["password_hash"] else ("nopasswd" if i["ssh"] and i["ssh_authorized_keys"] else "wizard")
+    view = {k: copy.deepcopy(i[k]) for k in ("name", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
                                              "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")}
     view.update(password_set=bool(i["password_hash"]), wifi_password_set=bool(i["wifi_password"]), sudo=sudo)
     warnings = []
     if not i["password_hash"] and not (i["ssh"] and i["ssh_authorized_keys"]):
-        warnings.append(f"no password and no SSH key: nobody can log in as {i['user']} (console or SSH)")
+        warnings.append("no password and no SSH key: the board's first boot stops at the Raspberry Pi OS wizard on "
+                        "its console (screen and keyboard), which asks for a user name and password")
     if i["wifi_ssid"] and not i["wifi_password"]:
         warnings.append(f"Wi-Fi {i['wifi_ssid']!r} has no password: the board joins it as an open network")
     ch = _choices()
-    return {"settings": view, "warnings": warnings, "choices": {"timezones": ch["timezones"], "countries": ch["countries"]}}
+    return {"settings": view, "warnings": warnings,
+            "choices": {"timezones": ch["timezones"], "countries": ch["countries"], "keyboards": ch["keyboards"]}}
 
 
 def _save_image(data: Any) -> tuple[int, Any]:
@@ -156,7 +159,8 @@ def _save_image(data: Any) -> tuple[int, Any]:
         return 400, {"detail": "unknown image setting(s): " + ", ".join(unknown)}
     changed = {k: data[k] for k in IMAGE_FIELDS if data.get(k) is not None}
     host = changed.get("hostname")
-    if host is not None and not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", str(host).strip().lower()):
+    if host is not None and not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?",
+                                             str(host).strip().lower().replace("{serial}", "0123abcd")):
         return 400, {"detail": f"config image.hostname: hostname {host!r}: lower-case letters, digits and '-'"}
     ch = _choices()
     if changed.get("timezone") is not None and str(changed["timezone"]).strip() not in ch["_valid"]:

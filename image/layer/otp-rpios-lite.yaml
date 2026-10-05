@@ -1,0 +1,38 @@
+# METABEGIN
+# X-Env-Layer-Name: otp-rpios-lite
+# X-Env-Layer-Category: suite
+# X-Env-Layer-Desc: Raspberry Pi OS Lite (trixie, arm64) on rpi-image-gen: the
+#  packages of the official release (otp-rpios-packages) on rpi-image-gen's
+#  Debian and Raspberry Pi base, with the manual pages, documentation and
+#  translations the official image has and rpi-image-gen's base leaves out.
+#  What pi-gen configures beyond packages is done by otp-rpios-setup.
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Requires: debian-trixie-arm64-multi,
+#  rpi-debian-trixie,
+#  rpi-misc-utils,
+#  rpi-essential-base,
+#  rpi-misc-skel,
+#  network-manager,
+#  systemd-timesyncd,
+#  otp-rpios-packages
+# METAEND
+---
+mmdebstrap:
+  dpkgopts:
+    # The Debian base layer excludes /usr/share/{man,locale,doc,...}; dpkg obeys the last pattern
+    # that matches a path, so these put everything back.
+    - path-include=/usr/share/man/*
+    - path-include=/usr/share/locale/*
+    - path-include=/usr/share/doc/*
+    - path-include=/usr/share/info/*
+    - path-include=/usr/share/omf/*
+    - path-include=/usr/share/help/*
+    - path-include=/usr/share/gnome/help/*
+    - path-include=/usr/share/lintian/*
+  cleanup-hooks:
+    - |-
+      # mmdebstrap leaves the build host's /etc/resolv.conf in the image (here Docker's). Leave a
+      # file NetworkManager rewrites once a connection is up (a symlink belongs to someone else).
+      if [ ! -L "$1/etc/resolv.conf" ]; then
+         printf '# Written by NetworkManager once a network connection is up.\n' > "$1/etc/resolv.conf"
+      fi

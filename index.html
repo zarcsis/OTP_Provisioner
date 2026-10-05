@@ -52,18 +52,19 @@
                 <button id="btn-image-revert" class="small push" disabled>Revert</button>
                 <button id="btn-image-save" class="small primary" disabled>Save</button>
             </div>
-            <p class="hint">Written into both images (open and secure). Saving rebuilds them on the server; stage 3 waits for the new image.</p>
+            <p class="hint">The image is Raspberry Pi OS Lite, the same for every board. Stage 3 writes these settings to each board's boot partition (cloud-init files, as Raspberry Pi Imager does), so saving applies them to the boards flashed from then on, without a rebuild. Only a new image name rebuilds the image.</p>
             <form id="image-form" class="form" autocomplete="off">
                 <h3>System</h3>
-                <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63"></label>
+                <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63" placeholder="pi5-{serial}" title="{serial} = the board's 8-hex serial"></label>
                 <label class="field"><span>Time zone</span><select name="timezone"></select></label>
+                <label class="field"><span>Keyboard</span><select name="keyboard" title="Console keyboard layout: the account password is typed with it"></select></label>
                 <h3>Account</h3>
                 <label class="field"><span>User</span><input type="text" name="user" class="mono" spellcheck="false" maxlength="32"></label>
                 <div class="field"><span>Password</span>
                     <div class="pw">
                         <input type="password" name="password" autocomplete="new-password" spellcheck="false">
                         <button type="button" class="small" data-show="password" title="Show the typed password">show</button>
-                        <button type="button" class="small" data-remove="password" title="Remove the password: nobody can log in with one">remove</button>
+                        <button type="button" class="small" data-remove="password" title="Remove the password (without an SSH key the board's first boot asks for an account on its console)">remove</button>
                     </div>
                 </div>
                 <h3>SSH</h3>

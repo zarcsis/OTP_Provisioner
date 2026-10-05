@@ -1,23 +1,19 @@
-# rpi-image-gen config written by OTP_Provisioner from the station settings (image.*).
-# Secrets are files in secrets/ next to this config, never values: rpi-image-gen expands $ in values.
+# rpi-image-gen config written by OTP_Provisioner: Raspberry Pi OS Lite for the Raspberry Pi 5.
+# The same image for every board; stage 3 writes each board's account, SSH, Wi-Fi, host name and
+# time zone to its boot partition as cloud-init files (image.* settings).
 device:
   layer: rpi5
-  hostname: "pi5"
+  hostname: "raspberrypi"
   user1: "pi"
-  user1sudo: "none"
+  user1sudo: "passwd"
+  user1groups: "adm,dialout,cdrom,audio,users,video,games,plugdev,input,gpio,spi,i2c,netdev,render"
 
 image:
   layer: image-rpios
   boot_part_size: "200%"
   root_part_size: "300%"
-  name: "deb13-arm64-min"
+  name: "rpios-trixie-arm64-lite"
 
 layer:
-  base: otp-minbase
-  station: otp-image
-
-locale:
-  timezone: "Europe/Kyiv"
-
-ieee80211:
-  regdom: "UA"
+  base: otp-rpios-lite
+  station: otp-rpios-setup

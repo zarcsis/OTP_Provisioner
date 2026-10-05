@@ -20,8 +20,9 @@ Scripts (see SPEC section 11 / the header of each script for mounts and env):
   stage1.sh        EEPROM stage-1 rpiboot dir       /ext ro, /out rw, /keys ro (signed)
                    env MODE=unsigned|signed CHANNEL=default|latest SIGN_RECOVERY=0|1 [SOURCE_DATE_EPOCH]
   stage2-sign.sh   boot.sig + counter-signed bootfiles.bin   /in ro, /keys ro, /out rw
-  boot-resign.sh   re-sign an IDP boot slot sparse           /in ro, /keys ro, /out rw
-                   env SIMAGE=<name> MAX_PIECE=<bytes>
+  boot-slot.sh     one board's IDP boot slot: first-boot files (+ re-signed with SIGN=1)
+                   /in ro, /seed ro, /keys ro (SIGN=1), /out rw
+                   env SIMAGE=<name> SIGN=0|1 MAX_PIECE=<bytes>
   image-collect.sh collect image.json + sparse pieces         /work ro, /out rw, env MAX_PIECE=<bytes>
 EOF
     if [ -d "${SCRIPTS_DIR}" ]; then
