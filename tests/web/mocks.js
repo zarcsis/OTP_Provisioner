@@ -5,10 +5,11 @@
  *                 permissions keyed like Chrome's (vendor:product:serial).
  *   romDevice     BCM2712 boot ROM (iSerialNumber 3): accepts the second stage, answers status 0.
  *   fsDevice      second-stage file server (iSerialNumber 1) replaying a script of 260-byte messages.
- *   FastbootSim   an rpi-fastbootd simulator (getvar, download/DATA, upload, flash, erase, oem idp*, fwcrypto,
- *                 cryptsetpassword, upload-file / download-file, reboot) with an in-memory gadget filesystem and
- *                 our otp-keyexport helper (docker/gadget-helpers); records every command and every data-phase
- *                 transfer size.
+ *   FastbootSim   the station's rpi-fastbootd (docker/fastbootd/otp-station.patch): getvar, download/DATA, upload,
+ *                 flash, erase, reboot and only the OEM commands that build allows (idp*, fwcrypto init,
+ *                 cryptcheck, upload-file / download-file of the otp-keyexport files), with an in-memory gadget
+ *                 filesystem and our otp-keyexport helper (docker/gadget-helpers); records every command and
+ *                 every data-phase transfer size.
  *   MockBoard     glues them into one Raspberry Pi 5: ROM → recovery → ROM → gadget bootloader → fastboot.
  *   FakeApi       an in-memory OTP.api with stage manifests, 409 build waits, scenarios (setMode), the device-key
  *                 hand-over (deviceKey, checked with WebCrypto) and call recording.
@@ -266,7 +267,7 @@
             this.o = Object.assign({
                 serial64: '10000000a7eb274c',
                 maxDownload: 0x10000000,
-                blocks: ['mmcblk0p1:boot.sparse', 'mapper/osroot_crypt:root.sparse'],
+                blocks: ['mmcblk0p1:boot.sparse', 'mmcblk0p2:root.luks.sparse'],   // the station-built container, raw
                 staleIdp: false,
                 failFlash: null,        // dev name → FAIL on flash
                 goneOnFlash: null,      // dev name → the board disappears while flashing
@@ -280,6 +281,8 @@
                 keyGenError: null,      // request mode: genkey fails with this text
                 uploadChunk: 512,       // largest bulk IN transfer of an upload data phase
                 fileCommands: true,     // false: an old rpi-fastbootd without "oem upload-file" / "oem download-file"
+                cryptCheckFails: false, // oem cryptcheck: the board's key does not open the container
+                cryptCheckSlot: 0,      // oem cryptcheck: the keyslot the board's key opens
                 noiseInfo: true,
                 onReboot: null,
             }, opts || {});
@@ -293,7 +296,7 @@
             this.responses = [];
             this.downloads = [];      // [{size, chunks: [sizes], checksum}]
             this.flashes = [];        // [{dev, size, checksum}]
-            this.passwords = [];      // [{dev, pass}]
+            this.cryptChecks = [];    // [{dev, keyslot}] from oem cryptcheck
             this.erased = [];
             this.uploads = [];        // [{path, size, asked: [transferIn lengths], sent: [bytes per transfer]}]
             this.fileWrites = [];     // [{path, size}] from oem download-file
@@ -370,7 +373,7 @@
             }
             const cmd = dec.decode(u);
             this.maxCommandSeen = Math.max(this.maxCommandSeen, u.byteLength);
-            this.commands.push(cmd.startsWith('oem cryptsetpassword ') ? cmd.split(' ').slice(0, 3).join(' ') + ' <pass>' : cmd);
+            this.commands.push(cmd);
             if (u.byteLength > 256) { this.responses.push('FAILcommand too long'); return { status: 'ok', bytesWritten: u.byteLength }; }
             this.handle(cmd);
             return { status: 'ok', bytesWritten: u.byteLength };
@@ -413,7 +416,7 @@
                     'version-bootloader': '2026/06/03',
                     'version-fastbootd': '14.0.0~git20260902.cca05b2',
                     secure: 'no', 'secure-otp': 'not present', 'secure-devkey': 'present',
-                    'mmc-cid': '1b534d4542345154c0a1b2c301a4',
+                    'mmc-cid': '1b534d4542345154c0a1b2c301a4ce00\n',   // sysfs text: 32 hex + newline, as rpi-fastbootd returns it
                     'mac-ethernet': '2c:cf:67:70:76:f3',
                     'rpi-duid': '001000911006186073',
                     'otp-lock-status': 'ok',
@@ -454,13 +457,14 @@
                 return;
             }
             if (cmd === 'reboot') { this.ok('Rebooting'); if (this.o.onReboot) setTimeout(this.o.onReboot, 5); return; }
+            if (cmd === 'shutdown') { this.ok('Powering off'); this.poweredOff = true; return; }   // the station build
             if (cmd.startsWith('oem ')) return this.oem(cmd.slice(4).split(' '));
             this.fail(`Unrecognized command ${cmd.split(':')[0]}`);
         }
 
         oem(args) {
             const c = args[0];
-            if (c === 'fwcrypto' && args[1] === 'init') {
+            if (c === 'fwcrypto' && args.length === 2 && args[1] === 'init') {
                 if (this.keyProvisioned) this.ok('Key already provisioned');
                 else { this.keyProvisioned = true; this.ok('Key provisioned and LOCKed'); }
                 return;
@@ -486,13 +490,25 @@
                 return;
             }
             if (c === 'idpdone') { if (!this.idp) { this.ok('IDP:not initialised'); return; } this.idp = null; this.ok('IDP:done'); return; }
-            if (c === 'cryptsetpassword') {
-                if (this.idp !== 'partitioned') { this.fail('no open container'); return; }
-                this.passwords.push({ dev: args[1], pass: args[2] });
-                this.ok('User passphrase set successfully');
+            if (c === 'cryptcheck') {
+                // the station build derives the LUKS key from OTP and checks it against <dev> (what was flashed)
+                if (args.length !== 2 || !/^[a-z0-9]{1,32}$/.test(args[1])) { this.fail('Usage: oem cryptcheck <block_device>'); return; }
+                if (!this.keyProvisioned) { this.fail('Cannot generate LUKS key - unsupported device type'); return; }
+                if (this.o.cryptCheckFails || !this.flashes.some((f) => f.dev === args[1])) {
+                    this.fail(`cryptcheck /dev/${args[1]}: Key does not open the LUKS header: Operation not permitted`);
+                    return;
+                }
+                this.cryptChecks.push({ dev: args[1], keyslot: this.o.cryptCheckSlot });
+                this.ok(`cryptcheck /dev/${args[1]}: keyslot ${this.o.cryptCheckSlot}`);
                 return;
             }
-            if ((c === 'upload-file' || c === 'download-file') && !this.o.fileCommands) { this.fail('Unknown OEM command.'); return; }
+            // the station build exchanges only the otp-keyexport files
+            const kxFile = c === 'upload-file' ? [this.kx.key, this.kx.status].includes(args[1])
+                : c === 'download-file' ? args[1] === this.kx.request : false;
+            if ((c === 'upload-file' || c === 'download-file') && (!this.o.fileCommands || args.length !== 2 || !kxFile)) {
+                this.fail('Unknown OEM command.');
+                return;
+            }
             if (c === 'upload-file') {
                 // rpi-fastbootd: stage a file into the download buffer for "upload"
                 const f = this.files.get(args[1]);
@@ -614,11 +630,12 @@
      * Scenario rules mirror otp_server/modules.py (mode_of, set_mode, store_device_key).
      */
     class FakeApi {
-        constructor({ manifests, files, confirm, defaultMode, zeroWords, requireExport }) {
+        constructor({ manifests, files, confirm, defaultMode, zeroWords, requireExport, requireVerify }) {
             this.available = true;
             this.defaultMode = defaultMode || 'open';
             this.zeroWords = zeroWords || 0;
             this.requireExport = requireExport !== false;
+            this.requireVerify = requireVerify !== false;   // secure: the board's key must open keyslot 0 (like the server)
             this.lastStatus = { version: 'fake', config: { provisioning: { confirm_irreversible: confirm !== false, default_mode: this.defaultMode } } };
             this.manifests = manifests;
             this.files = files;
@@ -752,6 +769,11 @@
                 if (ok) this._advance(m, 'gadget');
             } else if (n === 3) {
                 if (ok && this._modeOf(m) === 'secure' && !m.otp.device_key_exported && this.requireExport) { ok = false; notes.push('the OTP device key was not exported to the server (secure mode needs it)'); }
+                const ver = ((body.details || {}).verified) || [];
+                if (ok && this._modeOf(m) === 'secure' && this.requireVerify && !(ver.length && ver.every((v) => v && v.keyslot === 0))) {
+                    ok = false;
+                    notes.push("the page did not confirm that the board's OTP key opens keyslot 0 of its station-built encrypted root (oem cryptcheck); the board may not boot");
+                }
                 if (ok) this._advance(m, 'flashed');
             }
             m.events.push({ t: 'now', kind: 'stage' + n, note: ok ? 'ok' : 'failed: ' + (body.error || notes.join('; ')) });

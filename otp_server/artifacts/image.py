@@ -46,6 +46,13 @@ SOURCES = ("build.sh", "docker", "layer")
 MAX_ROUNDS = 3
 #: docker/scripts: a board's boot slot (first-boot files, re-signed on signed boards).
 BOOT_SCRIPT = "boot-slot.sh"
+#: docker/scripts: a board's encrypted root (LUKS2 container built on the station) and its helper.
+LUKS_SCRIPT = "root-luks.sh"
+LUKS_HELPER = "luks_encrypt.py"
+#: Where the station puts the file system in its LUKS2 containers, and their sector size.
+LUKS_DATA_OFFSET = 16 * 1024 * 1024
+LUKS_SECTOR_SIZE = 4096
+_CID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 #: Where the gadget's otp-keyexport helper leaves its output (docker/gadget-helpers/otp-keyexport).
 KEY_EXPORT = {
@@ -464,6 +471,106 @@ class ImageBuilder:
         return [self.hashes.stage_file(str(p["file"]), out_dir / str(p["file"]), what)
                 for p in res.get("pieces") or []]
 
+    def _station_luks(self, record: dict, set_dir: Path, ij: dict, msim: dict, secrets_fn) -> dict | None:
+        """The board's encrypted root, built here (root-luks.sh, a quick build): ``{"image_json": StageFile,
+        "parts": {simage: [StageFile]}, "verify": [{"dev", "label"}], "containers": [...], "recovery": bool}``,
+        or None while the station does not hold the board's OTP device key (exported at the start of stage 3).
+
+        Keyslot 0 = the key the board derives at every boot: hex(HMAC-SHA256(OTP device key, SD CID + "\\n")),
+        the CID as the gadget reported it (``getvar mmc-cid``). Keyslot 1 = the recovery passphrase with
+        ``provisioning.recovery_passphrase``. The board only writes the container's bytes: the plain file
+        system never leaves the station.
+        """
+        from ..secrets_gen import device_key_scalar, luks_key, luks_passphrase
+
+        serial = str(record.get("serial") or "")
+        secrets = secrets_fn() or {}
+        pem = str(secrets.get("device_private_pem") or "")
+        if not pem:
+            return None
+        disk = imagejson.storage_device(ij)
+        if disk != "mmcblk0":
+            raise NotReady(f"the station encrypts the root for SD/eMMC storage (mmcblk0) only, this image is for {disk}")
+        cid = str(((record.get("facts") or {}).get("fastboot") or {}).get("mmc-cid") or "").strip().lower()
+        if not _CID_RE.fullmatch(cid):
+            raise NotReady(f"board {serial} reported no usable SD card CID (getvar mmc-cid: {cid!r}); the encrypted "
+                           "root is keyed to it")
+        key = luks_key(device_key_scalar(pem), (cid + "\n").encode("ascii"))
+        new_ij, containers = imagejson.station_luks(ij, LUKS_DATA_OFFSET)
+        prov = self.cfg.provisioning
+        max_piece = int(prov.max_piece_size)
+        out_parts: dict[str, list[StageFile]] = {}
+        verify = []
+        recovery = bool(prov.recovery_passphrase)
+        ij_dir: Path | None = None
+        for c in containers:
+            pieces = msim.get(c["plain_simage"]) or []
+            if not pieces:
+                raise NotReady(f"image set {set_dir.name} lacks {c['plain_simage']}; rebuild the image")
+            rec_key = ""
+            if recovery:
+                dsec = secrets.get("device_secret")
+                if not dsec:
+                    raise NotReady(f"module {serial} has no device secret; cannot derive the recovery passphrase")
+                rec_key = luks_passphrase(dsec, c["mname"], serial)
+            fp = fingerprint("stage3-luks", set_dir.name, c["plain_simage"], [p.get("sha256") for p in pieces],
+                             hashlib.sha256(key.encode()).hexdigest(), hashlib.sha256(rec_key.encode()).hexdigest(),
+                             c["uuid"], c["label"], LUKS_DATA_OFFSET, LUKS_SECTOR_SIZE, self.tools.hash(),
+                             self.tools.script_hash(LUKS_SCRIPT, LUKS_HELPER), max_piece)
+            out_dir = Path(self.cfg.work_dir) / "modules" / serial / "luks" / fp
+            keys = {"luks.key": key.encode("ascii")}
+            if rec_key:
+                keys["recovery.key"] = rec_key.encode("ascii")
+            env = {"PIECES": " ".join(str(p["name"]) for p in pieces), "OUT_SIMAGE": c["simage"],
+                   "LABEL": c["label"], "UUID": c["uuid"], "DATA_OFFSET": str(LUKS_DATA_OFFSET),
+                   "SECTOR_SIZE": str(LUKS_SECTOR_SIZE), "MAX_PIECE": str(max_piece)}
+
+            def build(job: Any, out_dir=out_dir, keys=keys, env=env, c=c) -> None:
+                if is_complete(out_dir):
+                    return
+                self.tools.ensure(job.log)
+                part = fresh_partial(out_dir)
+                with TempFiles(self.cfg.work_dir, keys) as kdir:
+                    self.tools.run_script(LUKS_SCRIPT, mounts=[Mount.bind(set_dir, "/in", readonly=True),
+                                                               Mount.bind(kdir, "/keys", readonly=True),
+                                                               Mount.bind(part, "/out")], env=env, log=job.log)
+                res = read_json(part / "luks.json")
+                files = [part / str(p["file"]) for p in res.get("pieces") or []]
+                if not files or res.get("simage") != c["simage"] or res.get("uuid") != c["uuid"]:
+                    raise RuntimeError(f"{LUKS_SCRIPT} reported {res.get('simage')!r}/{res.get('uuid')!r}, expected "
+                                       f"{c['simage']}/{c['uuid']}")
+                for p, f in zip(res["pieces"], files):
+                    if not f.is_file() or f.stat().st_size != int(p.get("size", -1)) or f.stat().st_size > max_piece:
+                        raise RuntimeError(f"{LUKS_SCRIPT} piece {f.name} missing, of the wrong size or too large")
+                sparse.check_pieces(files)
+                commit_partial(part, out_dir, {"stage": 3, "simage": c["simage"]})
+                self._prune_luks(out_dir)
+
+            if not is_complete(out_dir):
+                self.tools.require(self.jobs)
+            require_quick_build(self.jobs, f"stage3:{serial}", f"Stage 3 encrypted root for {serial}", build,
+                                lambda out_dir=out_dir: is_complete(out_dir),
+                                f"the encrypted root of {serial} ({c['simage']})")
+            res = read_json(out_dir / "luks.json")
+            what = f"{c['image']} as this board's LUKS2 container (built on the station; ciphertext only)"
+            out_parts[c["simage"]] = [self.hashes.stage_file(str(p["file"]), out_dir / str(p["file"]), what)
+                                      for p in res.get("pieces") or []]
+            verify.append({"dev": imagejson.partition_name(disk, c["index"]), "label": c["label"]})
+            ij_dir = ij_dir or out_dir
+        ij_path = ij_dir / "image.json"
+        if not ij_path.is_file():
+            write_json(ij_path, new_ij)
+        ij_sf = self.hashes.stage_file("image.json", ij_path, "image.json for this board: the station-built "
+                                       "containers as plain partitions")
+        return {"image_json": ij_sf, "image": new_ij, "parts": out_parts, "verify": verify,
+                "containers": containers, "recovery": recovery}
+
+    def _prune_luks(self, keep: Path) -> None:
+        """Older encrypted roots of the board (a few GB each): only the newest is ever served."""
+        for d in keep.parent.iterdir():
+            if d != keep and d.is_dir() and not d.name.endswith(".partial"):
+                rmtree(d)
+
     def stage3(self, record: dict, *, secure: bool, signed: bool, secrets_fn,
                base_url: str) -> tuple[dict, dict[str, Path]]:
         """Stage-3 manifest (SPEC §8) and {name: path}.
@@ -518,28 +625,49 @@ class ImageBuilder:
             notes.append("board OTP is locked to our key: boot partition re-signed for this board")
         ijm = man.get("image_json") or {}
         ij_path = set_dir / "image.json"
-        ij_sf = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
-                          str(ijm.get("sha256") or self.hashes.sha256(ij_path)), origin)
-        crypt = []
-        if secure and prov.recovery_passphrase:
-            secrets = secrets_fn()
-            dsec = secrets.get("device_secret") if secrets else None
-            if not dsec:
-                raise NotReady(f"module {serial} has no device secret; cannot derive the recovery passphrase")
-            from ..secrets_gen import luks_passphrase
-            for c in imagejson.crypt_containers(ij):
-                crypt.append({"dev": imagejson.partition_name(disk, c["index"]), "mname": c["mname"],
-                              "label": c["label"], "passphrase": luks_passphrase(dsec, c["mname"], serial)})
+        ij_sf: StageFile | None = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
+                                            str(ijm.get("sha256") or self.hashes.sha256(ij_path)), origin)
+        pending = ""
+        verify: list[dict] = []
+        encrypted_root = None
+        if secure:
+            # The station encrypts the root: the plain file system of the crypt set never goes to the page.
+            parts = {s: pl for s, pl in parts.items() if s in boots}
+            luks = self._station_luks(record, set_dir, ij, msim, secrets_fn)
+            if luks is None:
+                pending = ("the root file system is encrypted on the station for this board once its OTP device key "
+                           "is on the station: export the key (key_export), then ask for this manifest again")
+                parts, ij_sf = {}, None
+                notes.append("encrypted root: built on the station after the device key export")
+            else:
+                ij_sf = luks["image_json"]
+                order = [s for s in imagejson.simages(luks["image"]) if s in parts or s in luks["parts"]]
+                parts = {s: parts.get(s) or luks["parts"][s] for s in order}
+                verify = luks["verify"]
+                encrypted_root = {"built_by": "station", "sector_size": LUKS_SECTOR_SIZE,
+                                  "data_offset": LUKS_DATA_OFFSET,
+                                  "containers": [{"dev": v["dev"], "label": c["label"], "uuid": c["uuid"],
+                                                  "simage": c["simage"], "keyslots": [0, 1] if luks["recovery"] else [0]}
+                                                 for v, c in zip(luks["verify"], luks["containers"])]}
+                notes.append("the root file system is encrypted on the station for this board (LUKS2, keyslot 0 = the "
+                             "board's OTP key + SD CID): the page and the board only see ciphertext")
+                notes.append("after writing, the board checks that its own key opens keyslot 0 (oem cryptcheck: "
+                             "nothing is opened or decrypted on the board)")
+                if luks["recovery"]:
+                    notes.append("recovery passphrase in LUKS keyslot 1 (derived from the board's device secret)")
         irreversible = []
+        key_held = bool(record.get("device_private_pem"))
         if secure:
             irreversible.append({"key": "oem fwcrypto init", "value": "", "why": WHY_FWCRYPTO})
-            notes.append("the OTP device key is exported to the station before the storage is erased")
+            notes.append("the station already holds this board's OTP device key: it is not read from the board "
+                         "again (the page checks getvar:public-key against it)" if key_held else
+                         "the OTP device key is exported to the station before the storage is erased")
         else:
             notes.append("open scenario: clear image, OTP is not touched")
         if prov.erase_storage:
             irreversible.append({"key": "erase", "value": disk, "why": WHY_ERASE})
-        paths = {"image.json": ij_path}
-        total = ij_sf.size
+        paths = {"image.json": ij_sf.path} if ij_sf else {}
+        total = ij_sf.size if ij_sf else 0
         for pl in parts.values():
             for f in pl:
                 paths[f.name] = f.path
@@ -556,14 +684,16 @@ class ImageBuilder:
                       "variant": variant, "device_class": man.get("device_class", ""),
                       "storage_type": man.get("storage_type", ""), "encrypted": encrypted},
             "storage_device": disk,
-            "image_json": _entry(ij_sf, file_url(base_url, serial, 3, "image.json")),
+            "pending": pending,
+            "image_json": _entry(ij_sf, file_url(base_url, serial, 3, "image.json")) if ij_sf else None,
             "parts": {s: [_entry(f, file_url(base_url, serial, 3, f.name)) for f in pl] for s, pl in parts.items()},
             "total_bytes": total,
             "max_piece_size": int(prov.max_piece_size),
             "fwcrypto_init": bool(secure),
-            "key_export": dict(KEY_EXPORT) if secure else None,
+            "key_export": dict(KEY_EXPORT) if secure and not key_held else None,
             "erase": bool(prov.erase_storage),
-            "crypt": crypt,
+            "encrypted_root": encrypted_root,
+            "verify_key": verify,
             "firstboot": seed.summary,
             "irreversible": irreversible,
             "notes": notes,

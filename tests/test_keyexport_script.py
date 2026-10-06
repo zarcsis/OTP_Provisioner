@@ -150,8 +150,10 @@ class Gadget:
     """The gadget's view: an OTP key slot behind the fake rpi-fw-crypto, the export dir, the mailbox."""
 
     def __init__(self, tmp_path: Path, shell: list[str], *, slot: str = "blank", key: bytes = KEY_DER,
-                 tool: bool = True):
+                 tool: bool = True, cmdline: str = "rootwait console=tty1 root=/dev/ram0 quiet"):
         self.shell = shell
+        self.cmdline = tmp_path / "cmdline"
+        self.cmdline.write_bytes(cmdline.encode("ascii") + b"\n")        # /proc/cmdline: one line
         self.state = tmp_path / "fw"
         self.state.mkdir()
         self.bin = tmp_path / "bin"
@@ -184,6 +186,7 @@ class Gadget:
         env["OTP_KEYEXPORT_DIR"] = posix(self.dir)
         env["OTP_KEYEXPORT_MBOX"] = posix(self.mbox if mailbox else self.mbox.with_name("no-such-mailbox"))
         env["FAKE_FW_STATE"] = posix(self.state)
+        env["OTP_KEYEXPORT_CMDLINE"] = posix(self.cmdline)
         return subprocess.run([*self.shell, posix(SCRIPT), *mode], env=env, capture_output=True, timeout=120)
 
     @property
@@ -515,3 +518,38 @@ def test_export_dir_and_files_are_private(tmp_path, shell):
     assert stat.S_IMODE(g.dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(g.key.stat().st_mode) == 0o600
     assert stat.S_IMODE((g.dir / "status").stat().st_mode) == 0o600
+
+
+# ------------------------------------------------------------------ otp_keyexport=off (the station holds the key)
+OFF = "rootwait console=tty1 root=/dev/ram0 quiet otp_keyexport=off"
+
+
+def test_disabled_boot_never_reads_the_key(tmp_path, shell):
+    g = Gadget(tmp_path, shell, slot="present", cmdline=OFF)
+    g.dir.mkdir(parents=True)
+    g.key.write_bytes(b"stale")                            # whatever an earlier boot left: gone
+    r = g.run("boot")
+    assert r.returncode == 0, explain(r)
+    assert g.status.startswith("disabled ") and "already holds this board's device key" in g.status
+    assert not g.key.exists() and g.calls == [] and g.slot == "present"
+
+
+def test_disabled_request_neither_generates_nor_exports(tmp_path, shell):
+    g = Gadget(tmp_path, shell, slot="blank", cmdline=OFF)
+    req = g.request_file()
+    r = g.run("request")
+    assert r.returncode == 1 and not req.exists()          # the request is consumed: no path-unit loop
+    assert g.status.startswith("disabled ") and g.calls == [] and g.slot == "blank" and not g.key.exists()
+
+
+@pytest.mark.parametrize("cmdline", ["quiet otp_keyexport=offx", "quiet xotp_keyexport=off", "quiet otp_keyexport=on"])
+def test_only_the_exact_word_disables(tmp_path, shell, cmdline):
+    g = Gadget(tmp_path, shell, slot="present", cmdline=cmdline)
+    r = g.run("boot")
+    assert r.returncode == 0, explain(r)
+    assert g.status == "exported key.der" and g.key.read_bytes() == KEY_DER
+
+
+def test_disabled_as_the_first_or_only_word(tmp_path, shell):
+    g = Gadget(tmp_path, shell, slot="present", cmdline="otp_keyexport=off")
+    assert g.run("boot").returncode == 0 and g.status.startswith("disabled ") and g.calls == []

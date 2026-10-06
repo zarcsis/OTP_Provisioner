@@ -461,15 +461,15 @@
 
         // ================================================================ T7 FastbootClient IDP against the rpi-fastbootd simulator
         section = 'idp';
-        const PASS = 'f0'.repeat(32);
-        const imageJsonObj = { IGversion: '2.0.0', IGmeta: { IGconf_device_class: 'pi5', IGconf_device_storage_type: 'sd' }, layout: { partitionimages: { boot: { simage: 'boot.sparse' }, root: { simage: 'root.sparse' } } } };
+        // the station's layout: the boot partition plus the root as a LUKS2 container the station built, written raw
+        const imageJsonObj = { IGversion: '2.0.0', IGmeta: { IGconf_device_class: 'pi5', IGconf_device_storage_type: 'sd' }, layout: { partitionimages: { boot: { simage: 'boot.sparse' }, root: { simage: 'root.luks.sparse' } } } };
         const imageJson = enc.encode(JSON.stringify(imageJsonObj));
         const bootPiece = T.bytesOf(300000, 11);
         const root0 = T.bytesOf(2 * 1048576 + 123, 12);
         const root1 = T.bytesOf(3 * 65536, 13);
         const idpParts = () => ({
             'boot.sparse': [{ name: 'boot.sparse', size: bootPiece.byteLength, bytes: bootPiece }],
-            'root.sparse': [{ name: 'root.sparse.0', size: root0.byteLength, bytes: root0 }, { name: 'root.sparse.1', size: root1.byteLength, bytes: root1 }],
+            'root.luks.sparse': [{ name: 'root.luks.sparse.0', size: root0.byteLength, bytes: root0 }, { name: 'root.luks.sparse.1', size: root1.byteLength, bytes: root1 }],
         });
         {
             const sim = new T.FastbootSim({ staleIdp: true });
@@ -484,7 +484,6 @@
             const tErase = Date.now();
             const res = await c.idpProvision({
                 imageJson, parts: idpParts(),
-                crypt: [{ dev: 'mmcblk0p2', mname: 'osroot_crypt', passphrase: PASS }],
                 onDeviceKey: async (p) => keys.push(p), onProgress: (p) => prog.push(p), log: (l, m) => logs.push(`${l}: ${m}`),
             });
             const norm = sim.commands.map((x) => (x.startsWith('download:') ? 'download' : x));
@@ -492,29 +491,52 @@
                 'erase:mmcblk0', 'download', 'oem idpinit', 'oem idpdone',
                 'erase:mmcblk0', 'download', 'oem idpinit', 'oem idpwrite',
                 'oem idpgetblk', 'download', 'flash:mmcblk0p1',
-                'oem idpgetblk', 'download', 'flash:mapper/osroot_crypt', 'download', 'flash:mapper/osroot_crypt',
-                'oem idpgetblk', 'oem cryptsetpassword mmcblk0p2 <pass>', 'oem idpdone', 'reboot'], 'full IDP command sequence (fwcrypto, erase, idpinit retry, multi-piece flash, cryptsetpassword, reboot)');
+                'oem idpgetblk', 'download', 'flash:mmcblk0p2', 'download', 'flash:mmcblk0p2',
+                'oem idpgetblk', 'oem idpdone', 'reboot'], 'full IDP command sequence (fwcrypto, erase, idpinit retry, multi-piece flash, reboot)');
             assert(Date.now() - tErase >= 60, 'erase waits eraseSettleMs after each erase');
             eq(sim.erased.join(','), 'mmcblk0,mmcblk0', 'erase:mmcblk0 before each idpinit attempt');
             deq(sim.flashes.map((f) => [f.dev, f.size, f.checksum]), [
                 ['mmcblk0p1', bootPiece.byteLength, T.checksum(bootPiece)],
-                ['mapper/osroot_crypt', root0.byteLength, T.checksum(root0)],
-                ['mapper/osroot_crypt', root1.byteLength, T.checksum(root1)]], 'pieces flashed in order, byte-exact');
+                ['mmcblk0p2', root0.byteLength, T.checksum(root0)],
+                ['mmcblk0p2', root1.byteLength, T.checksum(root1)]], 'pieces flashed in order, byte-exact');
             const dl = sim.downloads;
             assert(dl.length === 5, 'five data phases (2× image.json + 3 pieces)', String(dl.length));
             const aligned = dl.every((d) => d.chunks.slice(0, -1).every((n) => n % 65536 === 0));
             assert(aligned, 'every data-phase transferOut except the last is a multiple of 64 KiB', JSON.stringify(dl.map((d) => d.chunks)));
             assert(dl.some((d) => d.chunks.length >= 3), 'a >2 MiB piece is sent in several chunks', JSON.stringify(dl.map((d) => d.chunks)));
             assert(dl.every((d) => d.chunks.reduce((a, b) => a + b, 0) === d.size), 'data phases carry exactly the announced size');
-            eq(sim.passwords.length === 1 && sim.passwords[0].dev === 'mmcblk0p2' && sim.passwords[0].pass === PASS, true, 'cryptsetpassword reached the device with the passphrase');
-            assert(!logs.some((l) => l.includes(PASS)), 'the passphrase never appears in the log');
             assert(keys.length === 1 && keys[0].includes('BEGIN PUBLIC KEY') && keys[0].includes('END PUBLIC KEY'), 'device public key PEM reported');
-            eq(res.flashed.map((f) => `${f.dev}:${f.simage}:${f.pieces.length}`).join(' '), 'mmcblk0p1:boot.sparse:1 mapper/osroot_crypt:root.sparse:2', 'result.flashed');
-            eq(res.crypt[0].dev + ':' + res.crypt[0].mname, 'mmcblk0p2:osroot_crypt', 'result.crypt');
+            eq(res.flashed.map((f) => `${f.dev}:${f.simage}:${f.pieces.length}`).join(' '), 'mmcblk0p1:boot.sparse:1 mmcblk0p2:root.luks.sparse:2', 'result.flashed');
+            deq(res.verified, [], 'result.verified: nothing to check without verifyKey');
             const last = prog[prog.length - 1];
             eq(last.phase + ':' + (last.sent === last.total) + ':' + last.total, `done:true:${bootPiece.byteLength + root0.byteLength + root1.byteLength}`, 'progress ends at total bytes');
             assert(sim.maxCommandSeen <= 256, 'no command above 256 bytes');
             eq(sim.idp, null, 'IDP closed with idpdone');
+        }
+        for (const outcome of ['ok', 'fails', 'slot1']) {
+            // station-built LUKS container: the board writes it raw to mmcblk0p2, then checks that its own key opens
+            // keyslot 0 (oem cryptcheck: nothing is opened on the board)
+            const sim = new T.FastbootSim({ blocks: ['mmcblk0p1:boot.sparse', 'mmcblk0p2:root.luks.sparse'],
+                cryptCheckFails: outcome === 'fails', cryptCheckSlot: outcome === 'slot1' ? 1 : 0 });
+            const c = new OTP.fastboot.FastbootClient(sim);
+            await c.open();
+            sim.commands.length = 0;
+            const parts = { 'boot.sparse': idpParts()['boot.sparse'], 'root.luks.sparse': [{ name: 'root.luks.sparse.0', size: root1.byteLength, bytes: root1 }] };
+            const run = () => c.idpProvision({ imageJson, parts, erase: false, powerOff: true, verifyKey: [{ dev: 'mmcblk0p2', label: 'OSROOT_CRYPT' }] });
+            if (outcome === 'ok') {
+                const res = await run();
+                deq(sim.commands.slice(-4), ['oem idpgetblk', 'oem cryptcheck mmcblk0p2', 'oem idpdone', 'shutdown'],
+                    'verifyKey: oem cryptcheck after the last block, before idpdone; powerOff: "shutdown" instead of "reboot"');
+                eq(sim.poweredOff, true, 'powerOff: the gadget powered the board off');
+                deq(sim.flashes.map((f) => f.dev), ['mmcblk0p1', 'mmcblk0p2'], 'the container is written raw to the partition, no mapper');
+                deq(res.verified, [{ dev: 'mmcblk0p2', keyslot: 0 }], 'result.verified: keyslot 0');
+            } else if (outcome === 'fails') {
+                await throwsLike(run, /OTP device key does not open mmcblk0p2 \(OSROOT_CRYPT\).*stays in the fastboot gadget/, 'a container the board cannot open fails the run');
+                deq(sim.commands.slice(-2), ['oem cryptcheck mmcblk0p2', 'oem idpdone'], '… with idpdone and without reboot');
+            } else {
+                await throwsLike(run, /opens keyslot 1 of mmcblk0p2 \(OSROOT_CRYPT\), not keyslot 0.*stays in the fastboot gadget/, 'the board key must open keyslot 0, not another slot');
+                deq(sim.commands.slice(-2), ['oem cryptcheck mmcblk0p2', 'oem idpdone'], '… with idpdone and without reboot');
+            }
         }
         {
             const sim = new T.FastbootSim({ blocks: ['mmcblk0p1:boot.sparse'] });
@@ -528,19 +550,22 @@
             eq(sim.commands.length, n, 'an over-long command is never sent');
             await throwsLike(() => c.command('oem ' + 'x'.repeat(252)), /Unknown OEM command/, 'a 256-byte command is sent');
             eq(sim.maxCommandSeen, 256, 'device received exactly 256 bytes');
-            await throwsLike(() => c.cryptSetPassword('mmcblk0p2', 'two words'), /without spaces/, 'passphrase with a space refused');
+            const nc = sim.commands.length;
+            await throwsLike(() => c.cryptCheck('mapper/osroot_crypt'), /invalid partition/, 'cryptCheck: a bare partition name only');
+            await throwsLike(() => c.cryptCheck('../sda'), /invalid partition/, 'cryptCheck: no paths');
+            eq(sim.commands.length, nc, '… and nothing is sent for them');
             const fc = await c.fwcryptoInit();
             eq(fc.message + ':' + fc.created, 'Key provisioned and LOCKed:true', 'fwcryptoInit: new key');
             const fc2 = await c.fwcryptoInit();
             eq(fc2.message + ':' + fc2.created, 'Key already provisioned:false', 'fwcryptoInit: idempotent');
         }
         {
-            const sim = new T.FastbootSim({ failFlash: 'mapper/osroot_crypt', keyProvisioned: true });
+            const sim = new T.FastbootSim({ failFlash: 'mmcblk0p2', keyProvisioned: true });
             const c = new OTP.fastboot.FastbootClient(sim);
             c.eraseSettleMs = 0;
             await c.open();
             await throwsLike(() => c.idpProvision({ imageJson, parts: idpParts(), log: () => {} }), /exceeds partition/, 'flash FAIL → error');
-            deq(sim.commands.slice(-2), ['flash:mapper/osroot_crypt', 'oem idpdone'], 'flash failure → oem idpdone, no reboot');
+            deq(sim.commands.slice(-2), ['flash:mmcblk0p2', 'oem idpdone'], 'flash failure → oem idpdone, no reboot');
         }
         {
             const sim = new T.FastbootSim({ maxDownload: 0x100000, keyProvisioned: true });
@@ -556,7 +581,7 @@
             c.eraseSettleMs = 0;
             await c.open();
             const parts = idpParts();
-            delete parts['root.sparse'];
+            delete parts['root.luks.sparse'];
             await throwsLike(() => c.idpProvision({ imageJson, parts, log: () => {} }), /no such file/, 'unknown simage requested → error');
             eq(sim.commands[sim.commands.length - 1], 'oem idpdone', '… and the IDP is closed');
         }
@@ -564,22 +589,23 @@
         // ================================================================ T7b upload / upload-file / download-file
         section = 'upload';
         {
-            const sim = new T.FastbootSim({ keyExport: false });
+            // the station rpi-fastbootd exchanges only the otp-keyexport files (here under /run/x)
+            const sim = new T.FastbootSim({ keyExport: false, keyExportDir: '/run/x' });
             const c = new OTP.fastboot.FastbootClient(sim);
             await c.open();
-            eq(await c.uploadFile('/run/x/missing'), null, 'uploadFile: a missing file ("Error opening file, ERRNO: 2") → null');
-            deq(sim.commands, ['oem upload-file /run/x/missing'], '… after "oem upload-file" alone (no upload)');
-            sim.files.set('/run/x/empty', new Uint8Array(0));
-            eq(await c.uploadFile('/run/x/empty'), null, 'uploadFile: an empty file ("Filesize zero") → null');
+            eq(await c.uploadFile('/run/x/status'), null, 'uploadFile: a missing file ("Error opening file, ERRNO: 2") → null');
+            deq(sim.commands, ['oem upload-file /run/x/status'], '… after "oem upload-file" alone (no upload)');
+            sim.files.set('/run/x/status', new Uint8Array(0));
+            eq(await c.uploadFile('/run/x/status'), null, 'uploadFile: an empty file ("Filesize zero") → null');
             const small = T.bytesOf(200, 51);
-            sim.files.set('/run/x/small', small);
-            const gotSmall = await c.uploadFile('/run/x/small');
+            sim.files.set('/run/x/key.der', small);
+            const gotSmall = await c.uploadFile('/run/x/key.der');
             eq(gotSmall && `${gotSmall.byteLength}:${T.checksum(gotSmall)}`, `200:${T.checksum(small)}`, 'uploadFile: 200 bytes back byte-exact');
-            deq(sim.commands.slice(-2), ['oem upload-file /run/x/small', 'upload'], 'uploadFile: oem upload-file <path>, then upload');
+            deq(sim.commands.slice(-2), ['oem upload-file /run/x/key.der', 'upload'], 'uploadFile: oem upload-file <path>, then upload');
             deq(sim.uploads[0] && [sim.uploads[0].asked, sim.uploads[0].sent], [[200], [200]], 'upload: one transfer asking for exactly the 200 announced bytes');
             const big = T.bytesOf(1300, 52);
-            sim.files.set('/run/x/big', big);
-            const gotBig = await c.uploadFile('/run/x/big');
+            sim.files.set('/run/x/key.der', big);
+            const gotBig = await c.uploadFile('/run/x/key.der');
             eq(gotBig && `${gotBig.byteLength}:${T.checksum(gotBig)}`, `1300:${T.checksum(big)}`, 'uploadFile: 1300 bytes (more than one 512-byte transfer) reassembled byte-exact');
             deq(sim.uploads[1] && sim.uploads[1].sent, [512, 512, 276], 'upload: the device sends the data phase as 512 + 512 + 276');
             deq(sim.uploads[1] && sim.uploads[1].asked, [1300, 788, 276], 'upload: every transferIn asks for exactly the bytes still due');
@@ -593,22 +619,29 @@
             await throwsLike(() => c.uploadFile('/run/x/a b'), /invalid path/, 'uploadFile: a path with whitespace is refused');
             await throwsLike(() => c.downloadFile('', enc.encode('x')), /invalid path/, 'downloadFile: an empty path is refused');
             eq(sim.commands.length, n, '… and nothing is sent for them');
+            // anything else on the board cannot be read or written through the station gadget
+            sim.files.set('/etc/shadow', enc.encode('root:*:'));
+            await throwsLike(() => c.uploadFile('/etc/shadow'), /Unknown OEM command/, 'uploadFile: a path outside the key export helper is refused');
+            await throwsLike(() => c.uploadFile('/dev/mmcblk0p2'), /Unknown OEM command/, 'uploadFile: a block device is refused');
+            await throwsLike(() => c.downloadFile('/run/x/key.der', enc.encode('x')), /Unknown OEM command/, 'downloadFile: only the request file');
+            await throwsLike(() => c.command('oem cryptopen mmcblk0p2 x'), /Unknown OEM command/, 'oem cryptopen is refused');
+            await throwsLike(() => c.command('oem mount /dev/mmcblk0p2 /mnt'), /Unknown OEM command/, 'oem mount is refused');
         }
         {
             // more than 1 MiB: the reads are capped at 1 MiB (DATA_CHUNK), the rest is asked for exactly
-            const sim = new T.FastbootSim({ keyExport: false, uploadChunk: 4 << 20 });
+            const sim = new T.FastbootSim({ keyExport: false, keyExportDir: '/run/x', uploadChunk: 4 << 20 });
             const c = new OTP.fastboot.FastbootClient(sim);
             await c.open();
             const huge = T.bytesOf((1 << 20) + 4103, 53);
-            sim.files.set('/run/x/huge', huge);
-            const got = await c.uploadFile('/run/x/huge');
+            sim.files.set('/run/x/key.der', huge);
+            const got = await c.uploadFile('/run/x/key.der');
             eq(got && `${got.byteLength}:${T.checksum(got)}`, `${huge.byteLength}:${T.checksum(huge)}`, 'upload of 1 MiB + 4103 bytes byte-exact');
             deq(sim.uploads[0] && sim.uploads[0].asked, [1 << 20, 4103], 'upload: transferIn lengths capped at 1 MiB, then the remainder');
             const fresh = new T.FastbootSim({ keyExport: false });
             const c2 = new OTP.fastboot.FastbootClient(fresh);
             await c2.open();
             await throwsLike(() => c2.upload(), /FAIL No data/, 'upload with nothing staged → FAIL');
-            const old = new T.FastbootSim({ keyExport: false, fileCommands: false });
+            const old = new T.FastbootSim({ keyExport: false, keyExportDir: '/run/x', fileCommands: false });
             const c3 = new OTP.fastboot.FastbootClient(old);
             await c3.open();
             await throwsLike(() => c3.uploadFile('/run/x/key.der'), /Unknown OEM command/, 'uploadFile: a gadget without "oem upload-file" is an error, not a missing file');
@@ -800,24 +833,27 @@
             };
             const ij = await add(3, 'image.json', imageJson);
             const pb = await add(3, 'boot.sparse', bootPiece);
-            const r0 = await add(3, 'root.sparse.0', root0);
-            const r1 = await add(3, 'root.sparse.1', root1);
-            // secure scenario (with provisioning.recovery_passphrase on: one LUKS container gets keyslot 1)
+            const r0 = await add(3, 'root.luks.sparse.0', root0);
+            const r1 = await add(3, 'root.luks.sparse.1', root1);
+            const c0 = await add(3, 'root.sparse.0', root0);
+            const c1 = await add(3, 'root.sparse.1', root1);
+            // secure scenario: the root as the board's LUKS2 container, built on the station (ciphertext only)
             const m3 = {
                 stage: 3, kind: 'fastboot-idp', title: 'Image', ready: true, mode: 'unsigned', scenario: 'secure',
                 image: { name: 'deb13-arm64-min', version: 'v1-test', set: 'set1', variant: 'crypt', encrypted: true },
                 storage_device: 'mmcblk0', image_json: ij,
-                parts: { 'boot.sparse': [pb], 'root.sparse': [r0, r1] },
+                parts: { 'boot.sparse': [pb], 'root.luks.sparse': [r0, r1] },
                 total_bytes: bootPiece.byteLength + root0.byteLength + root1.byteLength, max_piece_size: 268435456,
                 fwcrypto_init: true, key_export: Object.assign({}, KX), erase: true,
-                crypt: [{ dev: 'mmcblk0p2', mname: 'osroot_crypt', label: 'OSROOT_CRYPT', passphrase: PASS }],
+                verify_key: [{ dev: 'mmcblk0p2', label: 'OSROOT_CRYPT' }],
                 irreversible: [{ key: 'oem fwcrypto init', value: '', why: 'device key in OTP' }, { key: 'erase', value: 'mmcblk0', why: 'wipes the card' }],
                 notes: ['the OTP device key is exported to the station before the storage is erased'],
             };
             // open scenario: clear image, no OTP key, nothing exported
             const m3open = Object.assign({}, m3, {
                 scenario: 'open', image: { name: 'deb13-arm64-min', version: 'v1-test', set: 'set1-clear', variant: 'clear', encrypted: false },
-                fwcrypto_init: false, key_export: null, crypt: [],
+                parts: { 'boot.sparse': [pb], 'root.sparse': [c0, c1] },
+                fwcrypto_init: false, key_export: null, verify_key: [],
                 irreversible: [{ key: 'erase', value: 'mmcblk0', why: 'wipes the card' }],
                 notes: ['open scenario: clear image, OTP is not touched'],
             });
@@ -888,7 +924,8 @@
             assert(ev.logs.some((l) => /still attached/.test(l)), 'stage 1: WinUSB control-IN timeouts during the EEPROM write were retried', ev.logs.filter((l) => /Read failed|went away/.test(l)).join(' | '));
             const b3 = res[2] && res[2][3];
             eq(b3 && b3.ok && b3.details.flashed.length, 2, 'stage 3 result: two simages flashed');
-            eq(b3 && b3.details.crypt[0].dev, 'mmcblk0p2', 'stage 3 result: crypt container');
+            deq(b3 && b3.details.verified, [{ dev: 'mmcblk0p2', keyslot: 0 }], 'stage 3 result: the board key opens keyslot 0 of its container');
+            eq(b3 && 'crypt' in b3.details, false, 'stage 3 result: no passphrase field at all');
             assert(b3 && /BEGIN PUBLIC KEY/.test(b3.details.device_key_pem), 'stage 3 result: device key');
             const facts = api.calls.find((c) => c[0] === 'facts');
             eq(facts && facts[2].duid + ':' + /BEGIN PUBLIC KEY/.test(facts[2].device_key_pem), '10000000a7eb274c:true', 'facts posted: device_key_pem + duid');
@@ -936,11 +973,13 @@
             eq(ev.need[ev.need.length - 1], null, 'need cleared at the end');
             eq(ev.errors.length, 0, 'no errors in the device pickers');
             const sim = board.fb;
-            deq(sim && sim.flashes.map((f) => [f.dev, f.checksum]), [['mmcblk0p1', T.checksum(bootPiece)], ['mapper/osroot_crypt', T.checksum(root0)], ['mapper/osroot_crypt', T.checksum(root1)]], 'the gadget received the server pieces byte-exact');
-            eq(sim && sim.passwords[0] && sim.passwords[0].pass, PASS, 'recovery passphrase set on mmcblk0p2');
+            deq(sim && sim.flashes.map((f) => [f.dev, f.checksum]), [['mmcblk0p1', T.checksum(bootPiece)], ['mmcblk0p2', T.checksum(root0)], ['mmcblk0p2', T.checksum(root1)]], 'the gadget received the server pieces byte-exact');
+            deq(sim && sim.cryptChecks, [{ dev: 'mmcblk0p2', keyslot: 0 }], 'the board checked its key against the container (oem cryptcheck)');
             assert(sim && sim.downloads.every((d) => d.chunks.slice(0, -1).every((n) => n % 65536 === 0)), 'flow: 64 KiB-aligned data phases');
-            assert(!ev.logs.some((l) => l.includes(PASS)), 'flow: passphrase not in the log');
-            eq(sim && sim.commands[sim.commands.length - 1], 'reboot', 'gadget rebooted at the end');
+            assert(sim && !sim.commands.some((c) => /^oem (cryptopen|cryptsetpassword|mount)\b/.test(c)), 'flow: nothing opens or reads the container on the board');
+            eq(sim && sim.commands[sim.commands.length - 1], 'shutdown', 'the gadget powers the board off at the end (no reboot into the new system on the station\'s USB power)');
+            eq(sim && sim.commands.includes('reboot'), false, '… and never reboots it');
+            assert(/powered off: unplug it/.test(flow.stages[3].detail), 'stage 3 detail tells the operator to move the board to its own supply', flow.stages[3].detail);
             const p3 = ev.progress[3];
             eq(p3 && p3.sent === p3.total && p3.total === m3.total_bytes, true, 'stage 3 progress reached total_bytes');
             deq(flow.plan(), [], 'plan after provisioning: nothing left');
@@ -969,7 +1008,8 @@
             eq(board.fb && board.fb.keyProvisioned, false, 'open: the OTP key slot stays empty');
             eq(api.calls.some((c) => c[0] === 'deviceKey' || c[0] === 'facts'), false, 'open: no device key posted (the board has none)');
             deq(board.fb && board.fb.flashes.map((f) => f.dev), ['mmcblk0p1', 'mmcblk0p2', 'mmcblk0p2'], 'open: clear image flashed to the plain partitions');
-            eq(board.fb && board.fb.passwords.length, 0, 'open: no cryptsetpassword');
+            eq(board.fb && board.fb.cryptChecks.length, 0, 'open: no oem cryptcheck (nothing encrypted)');
+            eq(board.fb && board.fb.commands[board.fb.commands.length - 1], 'shutdown', 'open: the board is powered off at the end too');
             eq(ev.confirms.length, 1, 'open: one confirmation');
             eq(ev.confirms[0] && ev.confirms[0].flags.map((f) => f.key).join('|'), 'stage 3: erase', 'open: the only irreversible step is the erase');
             const b1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
@@ -1015,7 +1055,7 @@
             const { files, m3 } = await buildServerFiles();
             const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
             const hub = new T.MockHub();
-            const sim = new T.FastbootSim({ goneOnFlash: 'mapper/osroot_crypt', deviceKey: KEY_A });
+            const sim = new T.FastbootSim({ goneOnFlash: 'mmcblk0p2', deviceKey: KEY_A });
             hub.plug(sim);
             const ev = newEv();
             const flow = makeFlow(api, hub, ev);

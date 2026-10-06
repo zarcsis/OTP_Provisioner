@@ -9,7 +9,15 @@
  *   oem fwcrypto init → getvar:public-key → erase:<disk> (+3 s) →
  *   download image.json → oem idpinit → oem idpwrite →
  *   loop { oem idpgetblk → download + flash:<dev> for every piece } →
- *   oem cryptsetpassword <container> <passphrase> → oem idpdone → reboot
+ *   oem cryptcheck <partition> (secure) → oem idpdone → shutdown
+ *
+ * The station ends with "shutdown" (the station build powers the board off): the new system's first boot
+ * then runs on the board's own power supply, not on the station's USB port, where unplugging the board
+ * would cut it short.
+ *
+ * The gadget's rpi-fastbootd is the station build (docker/fastbootd/otp-station.patch): it answers only
+ * these commands, plus "oem upload-file" / "oem download-file" for the otp-keyexport files, and nothing
+ * that reads the board back (no cryptopen, mount or arbitrary file upload).
  *
  * Wire protocol (AOSP fastboot, unmodified in rpi-fastbootd): the host sends
  * one ASCII command (at most 256 bytes — the daemon reads 256), the device
@@ -298,6 +306,8 @@
 
         async oem(cmd) { return this.command(`oem ${cmd}`); }
         async reboot() { return this.command('reboot'); }
+        /** "shutdown": the station's rpi-fastbootd powers the board off (systemctl poweroff). */
+        async powerOff() { return this.command('shutdown'); }
 
         /**
          * oem fwcrypto init: creates the device ECDSA key in OTP (IRREVERSIBLE, idempotent).
@@ -337,11 +347,17 @@
             return null;
         }
 
-        /** oem cryptsetpassword <dev> <pass>: adds the passphrase as LUKS keyslot 1. The passphrase never reaches the log. */
-        async cryptSetPassword(dev, pass) {
-            if (!dev || /\s/.test(dev)) throw new FastbootError(`invalid container device "${dev}"`);
-            if (!pass || /\s/.test(pass)) throw new FastbootError('the passphrase must be a single token without spaces');
-            return this.command(`oem cryptsetpassword ${dev} ${pass}`, `oem cryptsetpassword ${dev} <redacted>`);
+        /**
+         * oem cryptcheck <dev> (station gadget): the board derives its LUKS key from OTP and checks it against the
+         * container on <dev> without opening it (nothing decrypted appears on the board). Returns the keyslot the
+         * key opened ("cryptcheck /dev/<dev>: keyslot N").
+         */
+        async cryptCheck(dev) {
+            if (!dev || !/^[a-z0-9]{1,32}$/.test(dev)) throw new FastbootError(`invalid partition "${dev}"`);
+            const r = await this.oem(`cryptcheck ${dev}`);
+            const m = /keyslot (\d+)/.exec(r.message || '');
+            if (!m) throw new FastbootError(`oem cryptcheck ${dev}: no keyslot in the answer "${clean(r.message)}"`);
+            return Number(m[1]);
         }
 
         async _idpDoneQuietly() {
@@ -357,22 +373,24 @@
          *   storageDevice   disk to erase (default "mmcblk0")
          *   erase           erase the disk first (default true)
          *   fwcryptoInit    run "oem fwcrypto init" + read the public key first (default true)
-         *   crypt           [{dev, mname, passphrase}] → oem cryptsetpassword before idpdone
+         *   verifyKey       [{dev, label?}] → oem cryptcheck after writing: the board's OTP key must open keyslot 0
+         *                   of each station-built LUKS container, else the run fails before idpdone/reboot
          *   reboot          send "reboot" at the end (default true)
+         *   powerOff        send "shutdown" at the end instead (the station flow; takes precedence over reboot)
          *   totalBytes      for the progress callback (default: sum of piece sizes)
          *   onProgress      ({sent, total, piece, dev, phase}) → void
          *   onDeviceKey     async (pem) → void, called as soon as the public key is known
          *   log             (level, msg) → void
-         * Returns {flashed: [{dev, simage, pieces, bytes}], crypt: [{dev, mname}], device_key_pem, fwcrypto}.
+         * Returns {flashed: [{dev, simage, pieces, bytes}], verified: [{dev, keyslot}], device_key_pem, fwcrypto}.
          */
         async idpProvision(opts) {
-            const o = Object.assign({ storageDevice: 'mmcblk0', erase: true, fwcryptoInit: true, crypt: [], reboot: true, parts: {} }, opts || {});
+            const o = Object.assign({ storageDevice: 'mmcblk0', erase: true, fwcryptoInit: true, verifyKey: [], reboot: true, parts: {} }, opts || {});
             const log = o.log || this.log;
             const say = (level, msg) => log(level, msg);
             if (!o.imageJson || !o.imageJson.byteLength) throw new FastbootError('image.json is missing');
             const readPiece = o.readPiece || (async (p) => { if (!p.bytes) throw new FastbootError(`no data for ${p.name}`); return p.bytes; });
             const total = o.totalBytes || Object.values(o.parts).flat().reduce((a, p) => a + (p.size || (p.bytes ? p.bytes.byteLength : 0)), 0);
-            const result = { flashed: [], crypt: [], device_key_pem: null, fwcrypto: null };
+            const result = { flashed: [], verified: [], device_key_pem: null, fwcrypto: null };
             let done = 0;
             const progress = (extra) => { if (o.onProgress) o.onProgress(Object.assign({ sent: done, total }, extra)); };
 
@@ -441,12 +459,23 @@
                     }
                     result.flashed.push({ dev: blk.dev, simage: blk.simage, pieces: pieces.map((p) => p.name), bytes });
                 }
-                for (const c of o.crypt || []) {
-                    say('info', `oem cryptsetpassword ${c.dev} <recovery passphrase> (LUKS keyslot 1)`);
-                    progress({ phase: 'crypt' });
-                    const r = await this.cryptSetPassword(c.dev, c.passphrase);
-                    say('ok', `${c.dev}: ${clean(r.message) || 'OKAY'}`);
-                    result.crypt.push({ dev: c.dev, mname: c.mname || '' });
+                for (const v of o.verifyKey || []) {
+                    const what = `${v.dev}${v.label ? ' (' + v.label + ')' : ''}`;
+                    say('info', `oem cryptcheck ${v.dev}: does the board's OTP key open its encrypted root?`);
+                    progress({ phase: 'verify' });
+                    let slot;
+                    try {
+                        slot = await this.cryptCheck(v.dev);
+                    } catch (e) {
+                        throw new FastbootError(`the board's OTP device key does not open ${what}: `
+                            + `${e.message || e}. The board would not boot this image; it stays in the fastboot gadget`);
+                    }
+                    if (slot !== 0) {
+                        throw new FastbootError(`the board's OTP device key opens keyslot ${slot} of ${what}, not keyslot 0 `
+                            + `(the board's own). The board stays in the fastboot gadget`);
+                    }
+                    say('ok', `${v.dev}: the board's own key opens keyslot 0 (checked on the board, nothing opened)`);
+                    result.verified.push({ dev: v.dev, keyslot: slot });
                 }
             } catch (e) {
                 await this._idpDoneQuietly();
@@ -454,7 +483,9 @@
             }
             const d = await this.oem('idpdone');
             say('ok', `idpdone: ${clean(d.message)}`);
-            if (o.reboot) {
+            if (o.powerOff) {
+                try { await this.powerOff(); say('ok', 'shutdown sent: the board powers off'); } catch (e) { say('warn', `shutdown: ${e.message || e}`); }
+            } else if (o.reboot) {
                 try { await this.reboot(); say('ok', 'reboot sent'); } catch (e) { say('warn', `reboot: ${e.message || e}`); }
             }
             progress({ phase: 'done' });

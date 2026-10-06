@@ -31,7 +31,7 @@ from otp_server.artifacts.stage1 import config_txt, signed_boot_conf
 from otp_server.firstboot import wifi_psk
 from otp_server.jobs import JobManager
 from otp_server.modules import ModuleService
-from otp_server.secrets_gen import luks_passphrase
+from otp_server.secrets_gen import luks_key, luks_passphrase
 
 SERIAL = "a7eb274c"
 SERIAL2 = "0badc0de"
@@ -112,12 +112,14 @@ def make_repo(base: Path) -> tuple[Path, Path]:
     (repo / "docker" / "scripts").mkdir(parents=True)
     for name in ("tools.Dockerfile", "tools-entrypoint.sh", "gadget.Dockerfile", "gadget-entrypoint.sh"):
         (repo / "docker" / name).write_text(f"# {name}\n", encoding="utf-8")
-    for name in ("stage1.sh", "stage2-sign.sh", "boot-slot.sh", "image-collect.sh"):
+    for name in ("stage1.sh", "stage2-sign.sh", "boot-slot.sh", "image-collect.sh", "root-luks.sh", "luks_encrypt.py"):
         (repo / "docker" / "scripts" / name).write_text(f"#!/bin/bash\n# {name}\n", encoding="utf-8")
     helpers = repo / "docker" / "gadget-helpers" / "otp-keyexport"
     helpers.mkdir(parents=True)
     for name, text in HELPER_FILES.items():
         (helpers / name).write_bytes(text.encode("utf-8"))
+    (repo / "docker" / "fastbootd").mkdir()
+    (repo / "docker" / "fastbootd" / "otp-station.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
     fw = repo / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712"
     for ch in ("default", "latest"):
         d = fw / ch
@@ -243,6 +245,10 @@ def h_stage2(call):
     (out / "boot.sig").write_text(hashlib.sha256(b"b").hexdigest() + "\nrsa2048: " + "cd" * 256 + "\n",
                                   encoding="ascii")
     (out / "bootfiles.bin").write_bytes(b"signed-bootfiles")
+    extra = call["env"].get("CMDLINE_APPEND")
+    if extra:                                              # the board's own gadget: its cmdline.txt changed
+        src = Path(call["mounts"]["/in"].source) / "boot.img"
+        (out / "boot.img").write_bytes(src.read_bytes() + b"\ncmdline+=" + extra.encode())
 
 
 def h_gadget(call):
@@ -318,6 +324,30 @@ def h_boot_slot(call):
                                    encoding="utf-8")
 
 
+def h_root_luks(call):
+    """root-luks.sh: records the keys it was given (``call["luks_key"]``, ``call["recovery_key"]``)."""
+    out = out_dir(call)
+    env = call["env"]
+    keys = Path(call["mounts"]["/keys"].source)
+    call["luks_key"] = (keys / "luks.key").read_bytes()
+    rec = keys / "recovery.key"
+    call["recovery_key"] = rec.read_bytes() if rec.is_file() else None
+    for name in env["PIECES"].split():
+        assert (Path(call["mounts"]["/in"].source) / name).is_file(), name
+    s = env["OUT_SIMAGE"]
+    make_sparse(out / f"{s}.0", [("raw", 2), ("dc", 70)])
+    make_sparse(out / f"{s}.1", [("dc", 2), ("raw", 3), ("dc", 67)])
+    (out / "luks.json").write_text(json.dumps({
+        "simage": s, "uuid": env["UUID"], "label": env["LABEL"], "data_offset": int(env["DATA_OFFSET"]),
+        "sector_size": int(env["SECTOR_SIZE"]), "keyslots": [0, 1] if call["recovery_key"] else [0],
+        "fs_bytes": 64 * BLK, "pieces": [{"file": f"{s}.{i}", "size": (out / f"{s}.{i}").stat().st_size} for i in (0, 1)]}),
+        encoding="utf-8")
+
+
+#: The SD card CID the fake gadget reports (getvar mmc-cid, sysfs text without its newline).
+CID = "035344534333324780b6e2a8d9012d00"
+
+
 # ---------------------------------------------------------------------- environment
 class Env:
     def __init__(self, cfg, docker, jobs, modules, store, arts):
@@ -333,6 +363,21 @@ class Env:
             rec["otp_key_hash"] = rec["customer_key_hash"] if lock == "ours" else "ab" * 32
             self.store.put(rec)
         return self.store.get(serial)
+
+    def export_key(self, serial=SERIAL, cid: str = CID) -> int:
+        """The page's stage-3 start on a secure board: the gadget's vars (SD CID) and the exported OTP device
+        key reach the server. Returns the key's private scalar d."""
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        self.modules.identify_fastboot(f"10000000{serial}", {"mmc-cid": cid + "\n"})
+        key = ec.generate_private_key(ec.SECP256R1())
+        der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption())
+        pub = key.public_key().public_bytes(serialization.Encoding.PEM,
+                                            serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        self.modules.store_device_key(serial, der, pub)
+        return key.private_numbers().private_value
 
     def wait_all(self):
         for j in self.jobs.list():
@@ -364,7 +409,8 @@ def make_env(make_cfg, tmp_path):
         cfg = make_cfg(tmp_path, repo_root=repo, paths=paths, **overrides)
         docker = FakeDocker()
         docker.handlers.update({"stage1.sh": h_stage1, "stage2-sign.sh": h_stage2, "image-collect.sh": h_collect,
-                                "boot-slot.sh": h_boot_slot, cfg.builds.gadget.image_tag: h_gadget,
+                                "boot-slot.sh": h_boot_slot, "root-luks.sh": h_root_luks,
+                                cfg.builds.gadget.image_tag: h_gadget,
                                 cfg.builds.image.builder_tag: h_builder})
         jobs = JobManager(cfg.work_dir)
         store = MemoryStore()
@@ -653,9 +699,10 @@ def test_gadget_build_job(make_env):
     assert source == "built" and version == key and path.parent.name == key
     st = env.arts.status()["gadget"]
     assert st["source"] == "built" and st["built"] == "2026-09-30T11:00:00Z" and st["job"]["status"] == "succeeded"
-    # every helper package file is part of the builder identity
+    # every helper package file and the rpi-fastbootd patch are part of the builder identity
     helpers = env.cfg.repo_root / "docker" / "gadget-helpers" / "otp-keyexport"
     assert {helpers / n for n in HELPER_FILES} <= set(env.arts.gadget.builder_files)
+    assert env.cfg.repo_root / "docker" / "fastbootd" / "otp-station.patch" in env.arts.gadget.builder_files
     # already built: a non-forced build does not run docker again
     n = len(env.docker.runs)
     env.arts.start_build("gadget").wait(10)
@@ -725,6 +772,26 @@ def test_stage2_signed_when_locked_to_our_key(make_env, chosen):
     assert env.arts.stage_file(SERIAL, 2, "boot.sig").parent == signed_bf.parent
     env.arts.stage_manifest(SERIAL, 2)
     assert len(env.docker.runs_of("stage2-sign.sh")) == 1          # cached per board
+    assert r["env"] == {}                                          # no key on the station yet: the shared gadget
+    assert env.arts.stage_file(SERIAL, 2, "boot.img").parent.name != signed_bf.parent.name
+
+
+def test_stage2_gadget_stops_exporting_once_the_station_holds_the_key(make_env):
+    env = make_env()
+    env.board(mode="secure", lock="ours")
+    build_gadget(env)
+    shared = env.arts.stage_file(SERIAL, 2, "boot.img") if env.arts.stage_manifest(SERIAL, 2) else None
+    env.export_key(SERIAL)
+    m = env.arts.stage_manifest(SERIAL, 2)
+    assert not any("exports the OTP device key" in n for n in m["notes"])
+    assert any("never exports it again (otp_keyexport=off" in n for n in m["notes"])
+    r = env.docker.runs_of("stage2-sign.sh")[-1]
+    assert r["env"] == {"CMDLINE_APPEND": "otp_keyexport=off"}
+    boot = env.arts.stage_file(SERIAL, 2, "boot.img")
+    assert boot != shared and boot.parent.parent == env.cfg.work_dir / "modules" / SERIAL / "stage2"
+    assert boot.read_bytes().endswith(b"cmdline+=otp_keyexport=off")          # the board's own, signed one
+    assert env.arts.stage_file(SERIAL, 2, "boot.sig").parent == boot.parent
+    assert [f["sha256"] for f in m["files"] if f["name"] == "boot.img"] == [sha(boot)]
 
 
 SECURE_NEEDS_STAGE1 = ("is in the secure scenario but its OTP does not hold this board's key hash yet: "
@@ -995,7 +1062,7 @@ def test_stage3_open_manifest(make_env):
     assert m["image"]["set"] == clear_man["set"] and m["image"]["name"] == "deb13-arm64-min"   # h_collect's
     assert m["image"]["storage_type"] == "sd" and m["image"]["device_class"] == "pi5"
     # nothing touches OTP: no fwcrypto init, no key export, no LUKS passphrase
-    assert m["fwcrypto_init"] is False and m["key_export"] is None and m["crypt"] == []
+    assert m["fwcrypto_init"] is False and m["key_export"] is None and "crypt" not in m and m["verify_key"] == []
     assert m["storage_device"] == "mmcblk0" and m["erase"] is True
     assert [i["key"] for i in m["irreversible"]] == ["erase"] and m["irreversible"][0]["value"] == "mmcblk0"
     assert any("open scenario" in n for n in m["notes"])
@@ -1040,7 +1107,7 @@ def test_stage3_open_scenario_ignores_recovery_passphrase(make_env):
     build_image(env)
     env.board()
     m = env.arts.stage_manifest(SERIAL, 3)
-    assert m["scenario"] == "open" and m["crypt"] == [] and m["erase"] is False
+    assert m["scenario"] == "open" and m["verify_key"] == [] and m["erase"] is False
     assert m["irreversible"] == [] and m["fwcrypto_init"] is False and m["key_export"] is None
 
 
@@ -1051,40 +1118,100 @@ def test_stage3_secure_manifest(make_env):
     env.report_stage1_locked(SERIAL)                          # stage 3 of a secure board follows stage 1
     crypt_dir, crypt_man = env.arts.image.current_set("crypt")
     n_runs = len(env.docker.runs)
+    # before the key export: the manifest says what happens and offers nothing to flash
+    m0 = env.arts.stage_manifest(SERIAL, 3, base_url="http://h")
+    assert m0["scenario"] == "secure" and m0["mode"] == "signed"          # locked to our key: boot slot re-signed
+    assert m0["image"]["variant"] == "crypt" and m0["image"]["encrypted"] is True
+    assert m0["image"]["set"] == crypt_man["set"]
+    assert m0["fwcrypto_init"] is True and m0["erase"] is True
+    assert m0["key_export"] == KEY_EXPORT and m0["key_export"] is not KEY_EXPORT    # a copy, not the constant
+    assert set(m0["key_export"]) == {"dir", "key", "status", "request"}
+    assert all(m0["key_export"][k].startswith(m0["key_export"]["dir"] + "/") for k in ("key", "status", "request"))
+    assert [i["key"] for i in m0["irreversible"]] == ["oem fwcrypto init", "erase"]
+    assert "OTP" in m0["irreversible"][0]["why"] and m0["irreversible"][1]["value"] == "mmcblk0"
+    assert m0["pending"] and "export" in m0["pending"] and m0["parts"] == {} and m0["image_json"] is None
+    assert m0["total_bytes"] == 0 and m0["verify_key"] == [] and m0["encrypted_root"] is None
+    for name in ("image.json", "root.ext4.sparse.0", "boot.vfat.sparse"):     # nothing is served yet
+        with pytest.raises(FileNotFoundError):
+            env.arts.stage_file(SERIAL, 3, name)
+    assert [r["args"][:1] for r in env.docker.runs[n_runs:]] == [["boot-slot.sh"]]
+    # the page exports the device key and asks again: the station builds the board's LUKS2 container
+    d = env.export_key(SERIAL)
     m = env.arts.stage_manifest(SERIAL, 3, base_url="http://h")
-    assert m["scenario"] == "secure" and m["mode"] == "signed"           # locked to our key: boot slot re-signed
-    assert m["image"]["variant"] == "crypt" and m["image"]["encrypted"] is True
-    assert m["image"]["set"] == crypt_man["set"]
-    assert m["fwcrypto_init"] is True and m["erase"] is True
-    assert m["key_export"] == KEY_EXPORT and m["key_export"] is not KEY_EXPORT     # a copy, not the constant
-    assert set(m["key_export"]) == {"dir", "key", "status", "request"}
-    assert all(m["key_export"][k].startswith(m["key_export"]["dir"] + "/") for k in ("key", "status", "request"))
-    assert [i["key"] for i in m["irreversible"]] == ["oem fwcrypto init", "erase"]
-    assert "OTP" in m["irreversible"][0]["why"] and m["irreversible"][1]["value"] == "mmcblk0"
-    assert m["crypt"] == []                                   # provisioning.recovery_passphrase is off by default
-    assert any("exported to the station" in n for n in m["notes"])
+    assert not m["pending"] and "crypt" not in m                # no passphrase ever goes to the page
+    assert list(m["parts"]) == ["boot.vfat.sparse", "root.luks.sparse"]
+    assert [p["name"] for p in m["parts"]["root.luks.sparse"]] == ["root.luks.sparse.0", "root.luks.sparse.1"]
+    assert m["verify_key"] == [{"dev": "mmcblk0p2", "label": "OSROOT_CRYPT"}]
+    assert any("oem cryptcheck" in n and "nothing is opened" in n for n in m["notes"])
+    assert m["encrypted_root"] == {"built_by": "station", "sector_size": 4096, "data_offset": 16 << 20,
+                                   "containers": [{"dev": "mmcblk0p2", "label": "OSROOT_CRYPT",
+                                                   "uuid": "0b7f3c1e-5d9a-4c7e-9f59-1f6c2a8d9e11",
+                                                   "simage": "root.luks.sparse", "keyslots": [0]}]}
+    assert any("only see ciphertext" in n for n in m["notes"])
+    r = env.docker.runs_of("root-luks.sh")[-1]
+    assert r["luks_key"] == luks_key(d, (CID + "\n").encode()).encode() and r["recovery_key"] is None
+    assert r["env"] == {"PIECES": "root.ext4.sparse.0 root.ext4.sparse.1", "OUT_SIMAGE": "root.luks.sparse",
+                        "LABEL": "OSROOT_CRYPT", "UUID": "0b7f3c1e-5d9a-4c7e-9f59-1f6c2a8d9e11",
+                        "DATA_OFFSET": str(16 << 20), "SECTOR_SIZE": "4096", "MAX_PIECE": "268435456"}
+    assert Path(r["mounts"]["/in"].source) == crypt_dir and r["mounts"]["/keys"].readonly
+    assert not Path(r["mounts"]["/keys"].source).exists()                 # the key file is gone after the run
     for simage, pieces in m["parts"].items():
         for p in pieces:
             path = env.arts.stage_file(SERIAL, 3, p["name"])
-            if simage == "boot.vfat.sparse":                  # per-board re-signed boot slot
-                assert path.parent.parent == env.cfg.work_dir / "modules" / SERIAL / "stage3"
-            else:                                             # everything else from the shared crypt set
-                assert path.parent == crypt_dir
-            assert sha(path) == p["sha256"]
-    ij = env.arts.stage_file(SERIAL, 3, "image.json")
-    assert ij.parent == crypt_dir and imagejson.is_encrypted(imagejson.load(ij)) is True
-    assert [r["args"][:1] for r in env.docker.runs[n_runs:]] == [["boot-slot.sh"]]   # the only docker run
+            where = {"boot.vfat.sparse": "stage3", "root.luks.sparse": "luks"}[simage]
+            assert path.parent.parent == env.cfg.work_dir / "modules" / SERIAL / where and sha(path) == p["sha256"]
+    with pytest.raises(FileNotFoundError):                    # the plain root is never served to a secure board
+        env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0")
+    ij = imagejson.load(env.arts.stage_file(SERIAL, 3, "image.json"))
+    assert imagejson.is_encrypted(ij) is False and imagejson.simages(ij) == ["boot.vfat.sparse", "root.luks.sparse"]
+    assert ij["layout"]["provisionmap"][1]["partitions"][1]["expand-to-fit"] is True
+    assert m["key_export"] is None                           # the key is on the station now: never read again
+    assert any("not read from the board again" in n for n in m["notes"])
+    env.arts.stage_manifest(SERIAL, 3)                        # built once per board, key and image
+    assert len(env.docker.runs_of("root-luks.sh")) == 1
+    text = json.dumps(m)
+    assert r["luks_key"].decode() not in text                 # the board key is never in a manifest
 
 
 def test_stage3_secure_with_recovery_passphrase(make_env):
     env = make_env(provisioning={"recovery_passphrase": True, "erase_storage": False})
     build_image(env)
     rec = env.board(mode="secure", lock="ours")
+    env.export_key(SERIAL)
     m = env.arts.stage_manifest(SERIAL, 3)
     assert m["mode"] == "signed" and m["scenario"] == "secure"
-    assert m["crypt"] == [{"dev": "mmcblk0p2", "mname": "osroot_crypt", "label": "OSROOT_CRYPT",
-                           "passphrase": luks_passphrase(rec["device_secret"], "osroot_crypt", SERIAL)}]
+    assert "crypt" not in m                                   # the station adds keyslot 1 itself
+    r = env.docker.runs_of("root-luks.sh")[-1]
+    assert r["recovery_key"] == luks_passphrase(rec["device_secret"], "osroot_crypt", SERIAL).encode()
+    assert m["encrypted_root"]["containers"][0]["keyslots"] == [0, 1]
+    assert any("keyslot 1" in n for n in m["notes"])
+    assert rec["device_secret"] not in json.dumps(m)
     assert m["erase"] is False and [i["key"] for i in m["irreversible"]] == ["oem fwcrypto init"]
+
+
+def test_stage3_secure_needs_the_sd_cid(make_env):
+    env = make_env()
+    build_image(env)
+    env.board(mode="secure", lock="ours")
+    env.export_key(SERIAL, cid="not-a-cid")
+    with pytest.raises(NotReady, match="no usable SD card CID"):
+        env.arts.stage_manifest(SERIAL, 3)
+
+
+def test_stage3_luks_rebuilt_for_a_new_card_and_old_one_pruned(make_env):
+    env = make_env()
+    build_image(env)
+    env.board(mode="secure", lock="ours")
+    d = env.export_key(SERIAL)
+    env.arts.stage_manifest(SERIAL, 3)
+    first = env.arts.stage_file(SERIAL, 3, "root.luks.sparse.0").parent
+    env.modules.identify_fastboot(f"10000000{SERIAL}", {"mmc-cid": "0353445343333247" + "00" * 8})   # another card
+    env.arts.stage_manifest(SERIAL, 3)
+    r = env.docker.runs_of("root-luks.sh")[-1]
+    assert len(env.docker.runs_of("root-luks.sh")) == 2
+    assert r["luks_key"] == luks_key(d, ("0353445343333247" + "00" * 8 + "\n").encode()).encode()
+    second = env.arts.stage_file(SERIAL, 3, "root.luks.sparse.0").parent
+    assert second != first and not first.exists()             # one encrypted root per board on disk
 
 
 @pytest.mark.parametrize("chosen", ["", "open", "secure"])
@@ -1102,12 +1229,14 @@ def test_stage3_signed_resigns_boot_slot(make_env, chosen):
     assert Path(r["mounts"]["/in"].source) == env.image_root / crypt_set
     assert r["mounts"]["/in"].readonly and r["keys_files"] == ["private.pem", "public.pem"]
     assert not r["keys_dir"].exists()
+    env.export_key(SERIAL)
+    m = env.arts.stage_manifest(SERIAL, 3)
     assert [p["name"] for p in m["parts"]["boot.vfat.sparse"]] == ["boot.vfat.sparse"]
     p = env.arts.stage_file(SERIAL, 3, "boot.vfat.sparse")
     assert p.parent.parent == env.cfg.work_dir / "modules" / SERIAL / "stage3"
     assert m["parts"]["boot.vfat.sparse"][0]["sha256"] == sha(p)
-    # root pieces still come from the shared crypt set
-    assert env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0").parent.name == crypt_set
+    # the root is the board's station-built container, made from the shared crypt set
+    assert Path(env.docker.runs_of("root-luks.sh")[-1]["mounts"]["/in"].source).name == crypt_set
     env.arts.stage_manifest(SERIAL, 3)
     assert len(env.docker.runs_of("boot-slot.sh")) == 1
 
@@ -1129,8 +1258,13 @@ def test_stage3_follows_the_board_scenario(make_env):
     env.report_stage1_locked(SERIAL)
     m = env.arts.stage_manifest(SERIAL, 3)
     assert m["scenario"] == "secure" and m["mode"] == "signed" and m["image"]["variant"] == "crypt"
-    assert env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0").parent == crypt_dir
-    assert env.arts.stage_file(SERIAL, 3, "image.json").parent == crypt_dir
+    assert m["pending"] and m["parts"] == {}
+    env.export_key(SERIAL)
+    m = env.arts.stage_manifest(SERIAL, 3)
+    assert "root.luks.sparse" in m["parts"]
+    assert Path(env.docker.runs_of("root-luks.sh")[-1]["mounts"]["/in"].source) == crypt_dir
+    with pytest.raises(FileNotFoundError):
+        env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0")
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -1147,6 +1281,114 @@ def test_stage3_refuses_an_image_whose_encryption_does_not_match(make_env, varia
     scenario = "open" if variant == "clear" else "secure"
     with pytest.raises(NotReady, match=f"the {scenario} scenario needs"):
         env.arts.stage_manifest(SERIAL, 3)
+
+
+def test_gadget_key_covers_the_fastbootd_patch(make_env):
+    env = make_env()
+    g = env.arts.gadget
+    build_gadget(env)
+    k1 = g.key()
+    patch = env.cfg.repo_root / "docker" / "fastbootd" / "otp-station.patch"
+    patch.write_bytes(patch.read_bytes() + b"+changed\n")      # another rpi-fastbootd: the gadget is stale
+    assert g.key() != k1 and g.built_image() is None
+
+
+FASTBOOTD_PATCH = REAL_REPO / "docker" / "fastbootd" / "otp-station.patch"
+
+
+def _patch_added(text: str, path: str) -> str:
+    """The new side of the patch's hunks for ``path``: added and context lines (git keeps the lines the new
+    code shares with the old as context)."""
+    out, cur, in_hunk = [], None, False
+    for ln in text.splitlines():
+        if ln.startswith("diff --git "):
+            cur, in_hunk = ln.split(" b/", 1)[1], False
+        elif ln.startswith("@@"):
+            in_hunk = True
+        elif cur == path and in_hunk and ln[:1] in ("+", " "):
+            out.append(ln[1:])
+    return "\n".join(out)
+
+
+def test_fastbootd_patch_allows_what_the_page_sends():
+    """The station rpi-fastbootd (docker/fastbootd/otp-station.patch) answers every command js/fastboot.js
+    sends, and nothing that reads the board back."""
+    text = FASTBOOTD_PATCH.read_text(encoding="utf-8")
+    cmds = _patch_added(text, "fastboot/device/commands.cpp")
+    table = cmds.split("kStationOemCommands[] = {", 1)[1].split("};", 1)[0]
+    oem_allowed = set(re.findall(r'\{"([a-z-]+)", oem_cmd_', table))
+    assert oem_allowed == {"idpinit", "idpwrite", "idpgetblk", "idpdone", "cryptcheck", "fwcrypto",
+                           "upload-file", "download-file"}
+    assert re.search(r'\{"fwcrypto", oem_cmd_fwcrypto,\s*\[\]\(const OemArgs& a\) \{ return a\.size\(\) == 3 '
+                     r'&& a\[2\] == "init"; \}\}', table)              # fwcrypto: only init
+    for bad in ("cryptopen", "mount", "cryptinit", "cryptsetpassword", "partinit", "veritysetup", "eeprom-read"):
+        assert f'"{bad}"' not in cmds
+    device = _patch_added(text, "fastboot/device/fastboot_device.cpp")
+    top = {m.lower() for m in re.findall(r"\{FB_CMD_([A-Z_]+), ", device)}
+    assert top == {"download", "upload", "getvar", "shutdown", "reboot", "erase", "flash", "oem"}
+    # shutdown powers off for real (upstream only paused the daemon)
+    assert 'execlp("systemctl", "systemctl", "poweroff", nullptr);' in cmds
+
+    js = (REAL_REPO / "js" / "fastboot.js").read_text(encoding="utf-8")
+    sent_oem = set(re.findall(r"this\.oem\([`']([a-z-]+)", js))
+    assert sent_oem and sent_oem <= oem_allowed, sent_oem - oem_allowed
+    sent_top = set(re.findall(r"this\.command\([`']([a-z]+)", js))
+    assert sent_top and sent_top <= top, sent_top - top
+    assert not re.search(r"oem (cryptopen|cryptsetpassword|mount) ", js)
+
+    # the only files it exchanges are the otp-keyexport ones
+    assert set(re.findall(r'"(/run/[^"]+)"', cmds)) == {KEY_EXPORT["key"], KEY_EXPORT["status"], KEY_EXPORT["request"]}
+    assert f'kKeyExportRequest = "{KEY_EXPORT["request"]}"' in cmds
+
+    # USB only, and no private-key getvar
+    assert 'mode = "usb";' in _patch_added(text, "fastboot/device/main.cpp")
+    assert "-        {FB_VAR_PRIVKEY, {GetPrivkey, nullptr}}," in text
+
+
+#: Every OEM command of rpi-fastbootd cca05b2 (OemCmdHandler).
+UPSTREAM_OEM = {"led", "cryptinit", "cryptopen", "cryptsetpassword", "partinit", "partapp", "mount", "umount",
+                "download-file", "upload-file", "gpioset", "veritysetup", "verityappend", "idpinit", "idpwrite",
+                "idpgetblk", "idpdone", "fwcrypto", "bmap-load", "bmap-verify", "eeprom-update", "eeprom-verify",
+                "eeprom-read"}
+
+
+def test_fastbootd_station_test_covers_every_refused_command():
+    """docker/fastbootd/station_test.cpp sends every upstream OEM command the station build refuses (and the
+    allowed ones with other arguments) and expects "Unknown OEM command." for each."""
+    # the upstream dispatcher the patch replaces names exactly these commands
+    removed = set(re.findall(r'^-.*command_name == "([a-z-]+)"', FASTBOOTD_PATCH.read_text(encoding="utf-8"), re.M))
+    assert removed == UPSTREAM_OEM, removed ^ UPSTREAM_OEM
+    src = (REAL_REPO / "docker" / "fastbootd" / "station_test.cpp").read_text(encoding="utf-8")
+    refused_block = src.split("// ---- OEM commands outside the allowlist", 1)[1].split("ExpectRefused(c, kUnknownOem)", 1)[0]
+    sent = set(re.findall(r'"oem ([a-z-]+)', refused_block))
+    allowed = {"idpinit", "idpwrite", "idpgetblk", "idpdone", "fwcrypto", "upload-file", "download-file"}
+    assert UPSTREAM_OEM - allowed <= sent, UPSTREAM_OEM - allowed - sent
+    assert {"fwcrypto", "upload-file", "download-file"} <= sent       # allowed names, other arguments
+    for path in ("/etc/passwd", "/dev/mmcblk0", "/dev/mapper/x", "/run/otp-keyexport/../../etc/passwd"):
+        assert f'"oem upload-file {path}"' in refused_block
+    assert '"getvar:private-key"' in src and '"set_active:a"' in src
+    assert "CryptCheckNative(luks, key0" in src and "slot == 0" in src and "slot == 1" in src
+    script = (REAL_REPO / "docker" / "fastbootd" / "station-test.sh").read_text(encoding="utf-8")
+    assert "device/main.cpp.o" in script and "-o station_test" in script and "--new-key-slot 1" in script
+
+
+def test_fastbootd_build_is_pinned_to_the_vendored_revision():
+    """gadget.Dockerfile builds the rpi-fastbootd revision pi-gen-micro vendors, and the patch names it."""
+    dockerfile = (REAL_REPO / "docker" / "gadget.Dockerfile").read_text(encoding="utf-8")
+    m = re.search(r"^ARG FASTBOOTD_COMMIT=([0-9a-f]{40})$", dockerfile, re.MULTILINE)
+    assert m
+    commit = m.group(1)
+    assert commit in FASTBOOTD_PATCH.read_text(encoding="utf-8").split("diff --git", 1)[0]
+    assert "COPY fastbootd /tmp/otp-fastbootd" in dockerfile
+    assert "git apply --whitespace=nowarn /tmp/otp-fastbootd/otp-station.patch" in dockerfile
+    # the compiled dispatcher is tested before the deb is kept
+    run = dockerfile.split("COPY fastbootd /tmp/otp-fastbootd", 1)[1]
+    assert run.index("dpkg-buildpackage") < run.index("station-test.sh") < run.index("cp \"${deb}\" /opt/otp-fastbootd/")
+    assert re.search(r"^ARG OTP_FASTBOOTD_SUFFIX=\+otp\d+$", dockerfile, re.MULTILINE)
+    vendored = sorted((REAL_REPO / "external" / "pi-gen-micro" / "internal" / "packages").glob("rpi-fastbootd_*.deb"))
+    if not vendored:
+        pytest.skip("external/pi-gen-micro is not checked out")
+    assert [v.name for v in vendored] == [f"rpi-fastbootd_14.0.0~git20260902.{commit[:7]}_arm64.deb"]
 
 
 def test_key_export_paths_match_the_gadget_helper():
@@ -1250,18 +1492,22 @@ def test_stage3_download_survives_an_image_rebuild(make_env, mode, lock, variant
     env = make_env()
     build_image(env)
     env.board(mode=mode, lock=lock)
+    root = "root.luks.sparse" if variant == "crypt" else "root.ext4.sparse"
+    if variant == "crypt":
+        env.export_key(SERIAL)
     m = env.arts.stage_manifest(SERIAL, 3)
     assert m["image"]["variant"] == variant and m["mode"] == ("signed" if lock else "unsigned")
     boot = env.arts.stage_file(SERIAL, 3, "boot.vfat.sparse")
-    old = env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0")
-    assert old.parent == env.arts.image.current_set(variant)[0]
+    old = env.arts.stage_file(SERIAL, 3, root + ".0")
+    if variant == "clear":
+        assert old.parent == env.arts.image.current_set(variant)[0]
     job = env.arts.start_build("image", force=True)
     assert job.wait(20) and job.status == "succeeded", job.error
     for v in VARIANTS:                                        # a forced build rebuilds both variants
         assert env.arts.image.current_set(v)[1]["set"].endswith("-r2")
     assert env.arts.image.current_set(variant)[0] != old.parent          # a new set is current
-    p = env.arts.stage_file(SERIAL, 3, "root.ext4.sparse.0")
-    assert p == old and p.is_file() and sha(p) == m["parts"]["root.ext4.sparse"][0]["sha256"]
+    p = env.arts.stage_file(SERIAL, 3, root + ".0")
+    assert p == old and p.is_file() and sha(p) == m["parts"][root][0]["sha256"]
     pb = env.arts.stage_file(SERIAL, 3, "boot.vfat.sparse")        # re-signed per board when locked
     assert pb == boot and sha(pb) == m["parts"]["boot.vfat.sparse"][0]["sha256"]
 
@@ -1536,6 +1782,7 @@ def test_board_settings_need_no_rebuild_but_the_image_name_does(make_env):
     build_image(env)
     env.board()
     env.board(SERIAL2, mode="secure", lock="ours")
+    env.export_key(SERIAL2)
     assert env.arts.image.missing_variants() == []
     original = env.cfg.image
     hashes = {v: env.arts.image.config_hash(v) for v in VARIANTS}
@@ -1606,11 +1853,13 @@ def test_stage3_writes_the_settings_as_first_boot_files(make_env):
     env.board()
     m = env.arts.stage_manifest(SERIAL, 3)
     r = env.docker.runs_of("boot-slot.sh")[-1]
-    assert sorted(r["seed"]) == ["meta-data", "network-config", "user-data"]
+    assert sorted(r["seed"]) == ["meta-data", "network-config", "ssh", "user-data"]
+    assert r["seed"]["ssh"] == b""                        # Raspberry Pi OS's sshswitch flag
     ud = r["seed"]["user-data"].decode()
     assert f'hostname: "drone-{SERIAL}"' in ud and f'passwd: "{pw_hash}"' in ud and "lock_passwd: false" in ud
     assert f'    - "{key}"' in ud and "ssh_pwauth: false" in ud and "  sudo: null" in ud
-    assert "  - [ systemctl, enable, --now, ssh ]" in ud and '  - [ raspi-config, nonint, do_wifi_country, "PL" ]' in ud
+    assert "      systemctl --no-reload enable ssh\n" in ud and "      raspi-config nonint do_wifi_country PL\n" in ud
+    assert "runcmd" not in ud
     nc = r["seed"]["network-config"].decode()
     assert '        "Field Net":' in nc and 'regulatory-domain: "PL"' in nc
     assert "p$ss" not in nc and wifi_psk("Field Net", "p$ss \\w0rd") in nc   # the PMK, as Imager writes it

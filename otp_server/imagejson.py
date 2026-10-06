@@ -195,3 +195,84 @@ def simage_partition_size(image_json: dict, simage: str) -> int | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+#: Suffix of the simage a station-built LUKS container gets in place of its plain file system's.
+STATION_LUKS_SUFFIX = ".luks.sparse"
+
+
+def station_luks(image_json: dict, data_offset: int) -> tuple[dict, list[dict]]:
+    """The image.json a board gets when the station builds its LUKS containers, and those containers.
+
+    Every top-level ``encrypted`` block (``etype`` raw, one partition inside) becomes a plain partition
+    entry at the same place in the map (joined to the ``partitions`` list before it, the shape of the
+    clear map), so ``oem idpwrite`` only writes the partition table and
+    ``oem idpgetblk`` hands out the partition itself (``mmcblk0p2``) instead of ``mapper/<mname>``;
+    its partition image gets the simage ``<name>.luks.sparse`` (the container the station builds) and
+    the container's size (file system + ``data_offset``). ``expand-to-fit`` moves to the partition.
+    Nothing else changes, so partition numbers stay the same.
+
+    Returns ``(new image.json, [{"index", "image", "simage", "plain_simage", "mname", "label", "uuid",
+    "cipher", "key_size", "hash", "fs_bytes", "expand_to_fit"}])``. ValueError for a map this does not
+    support (slots, a partitioned or multi-partition container).
+    """
+    import copy
+
+    ij = copy.deepcopy(image_json)
+    parts = partition_images(ij)
+    raw_parts = (ij.get("layout") or {}).get("partitionimages")
+    out: list[dict] = []
+    new_map: list = []
+    index = 0
+    for entry in provisionmap(ij):
+        if not isinstance(entry, dict):
+            new_map.append(entry)
+            continue
+        if "slots" in entry:
+            raise ValueError("station-built LUKS containers: A/B slot maps are not supported")
+        if "partitions" in entry:
+            index += sum(1 for p in entry.get("partitions") or [] if isinstance(p, dict))
+        enc = entry.get("encrypted")
+        if not isinstance(enc, dict):
+            new_map.append(entry)
+            continue
+        index += 1
+        luks = enc.get("luks2") or {}
+        inner = [p for p in enc.get("partitions") or [] if isinstance(p, dict)]
+        if str(luks.get("etype") or "raw") != "raw" or len(inner) != 1:
+            raise ValueError("station-built LUKS containers: only a raw container with one partition is supported")
+        name = str(inner[0].get("image") or "")
+        attrs = parts.get(name)
+        if not attrs or not attrs.get("simage"):
+            raise ValueError(f"the encrypted partition {name!r} has no partition image")
+        plain = str(attrs["simage"])
+        stem = plain[: -len(".sparse")] if plain.endswith(".sparse") else plain
+        stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+        simage = stem + STATION_LUKS_SUFFIX
+        try:
+            fs_bytes = int(attrs.get("size"))
+        except (TypeError, ValueError):
+            raise ValueError(f"partition image {name!r} has no size") from None
+        expand = _truthy(enc.get("expand-to-fit")) or _truthy(inner[0].get("expand-to-fit"))
+        ref = {"image": name, "comment": "LUKS2 container built by the provisioning station for this board"}
+        if expand:
+            ref["expand-to-fit"] = True
+        prev = new_map[-1] if new_map else None
+        if isinstance(prev, dict) and set(prev) == {"partitions"} and isinstance(prev["partitions"], list):
+            prev["partitions"].append(ref)          # the shape of the clear map: one list of partitions
+        else:
+            new_map.append({"partitions": [ref]})
+        new_attrs = dict(attrs, simage=simage, size=fs_bytes + int(data_offset))
+        if isinstance(raw_parts, list):
+            for i, p in enumerate(raw_parts):
+                if isinstance(p, dict) and str(p.get("name", i)) == name:
+                    raw_parts[i] = new_attrs
+        else:
+            raw_parts[name] = new_attrs
+        out.append({"index": index, "image": name, "simage": simage, "plain_simage": plain,
+                    "mname": str(luks.get("mname") or ""), "label": str(luks.get("label") or ""),
+                    "uuid": str(luks.get("uuid") or ""), "cipher": str(luks.get("cipher") or ""),
+                    "key_size": int(luks.get("key_size") or 0), "hash": str(luks.get("hash") or ""),
+                    "fs_bytes": fs_bytes, "expand_to_fit": expand})
+    ij["layout"]["provisionmap"] = new_map
+    return ij, out

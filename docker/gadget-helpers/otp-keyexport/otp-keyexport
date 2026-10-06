@@ -16,6 +16,8 @@
 #   key.der   the private key exactly as "rpi-fw-crypto privkey --key-id 1" returns it (DER)
 #   status    one line "<state> <detail>"; state = busy | blank | exported | locked | error
 # After an export the key is READ-locked for the rest of the boot (the lock rpi-fastbootd sets too).
+# "otp_keyexport=off" on the kernel command line (the station puts it into the signed boot.img of a board
+# whose key it already holds) disables both modes: the key is then never exported again; status "disabled".
 # The key is handed over in the clear: this is a demo station, the USB link goes to it only.
 # Busybox sh: only shell builtins, sed, mv, rm, mkdir, chmod, sleep and rpi-fw-crypto are used.
 set -u
@@ -23,6 +25,8 @@ umask 077
 DIR="${OTP_KEYEXPORT_DIR:-/run/otp-keyexport}"        # overridable for tests only
 KEY_ID=1
 MODE="${1:-boot}"
+CMDLINE="${OTP_KEYEXPORT_CMDLINE:-/proc/cmdline}"   # overridable for tests only
+DISABLED_MSG="the station already holds this board's device key (otp_keyexport=off): it is not exported again"
 LOCKED_MSG="the key is READ-locked in this boot; boot the gadget again (stage 2) to export it"
 
 log() {
@@ -85,10 +89,27 @@ export_key() {
     return 0
 }
 
+# True when the kernel command line carries otp_keyexport=off (read with a builtin: no grep or cat here).
+export_disabled() {
+    line=
+    [ -r "$CMDLINE" ] && read -r line < "$CMDLINE"
+    case " $line " in
+        *" otp_keyexport=off "*) return 0 ;;
+    esac
+    return 1
+}
+
 mkdir -p "$DIR" && chmod 0700 "$DIR"
 # Consume a station request before anything can fail: otp-keyexport-request.path fires while the file
 # exists, so leaving it behind would restart this service in a loop.
 [ "$MODE" = request ] && rm -f "$DIR/request"
+if export_disabled; then
+    rm -f "$DIR/key.der" "$DIR/key.der.tmp"
+    set_status "disabled $DISABLED_MSG"
+    [ "$MODE" = request ] && exit 1
+    exit 0
+fi
+
 if ! command -v rpi-fw-crypto >/dev/null 2>&1; then
     set_status "error rpi-fw-crypto is not installed in this gadget"
     exit 1

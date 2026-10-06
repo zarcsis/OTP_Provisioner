@@ -10,6 +10,7 @@
 #   binutils (strings)               usbboot tools/update-pieeprom.sh version gate
 #   dosfstools, mtools, file         usbboot tools/rpi-make-boot-image, boot-slot FAT32 rebuild
 #   android-sdk-libsparse-utils      simg2img, img2simg, simg2simg, simg_dump
+#   cryptsetup-bin, python3-cryptography   root-luks.sh: the board's LUKS2 container (header + AES-XTS)
 #   jq, zstd, tar, gawk, sed, grep   JSON manifests, rpi-image-gen deploy artefacts, bootfiles.bin
 #
 # Build (context = docker/):
@@ -35,10 +36,12 @@ RUN apt-get update \
         openssl xxd binutils coreutils tar sed gawk grep findutils \
         file jq zstd mtools dosfstools \
         android-sdk-libsparse-utils \
+        cryptsetup-bin python3-cryptography \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c "import Cryptodome.PublicKey.RSA, Cryptodome.Signature.pkcs1_15" \
-    && for t in simg2img img2simg simg2simg simg_dump mcopy mdir mkfs.fat strings xxd jq zstd; do \
+    && python3 -c "from cryptography.hazmat.primitives.ciphers import modes; modes.XTS" \
+    && for t in simg2img img2simg simg2simg simg_dump mcopy mdir mkfs.fat strings xxd jq zstd cryptsetup; do \
            command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; \
        done
 

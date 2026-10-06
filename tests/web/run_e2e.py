@@ -22,8 +22,10 @@ Scenario A (radio "open"): unsigned stages 1-3, the clear image, nothing written
 oem fwcrypto init. Scenario B (radio "secure"): signed stage 1 with program_pubkey=1; the board then reports our
 key hash, so stages 2 and 3 are signed (boot.sig, counter-signed bootfiles.bin, per-board re-signed boot slot); the
 crypt image; before anything is erased the page has the gadget's otp-keyexport helper generate the OTP device key
-(the mock's slot is blank) and hands it to the server, which keeps it. provisioning.recovery_passphrase is off by
-default, so there is no cryptsetpassword; --recovery-passphrase turns it on for B and checks the passphrase.
+(the mock's slot is blank) and hands it to the server, which keeps it; the board then writes the container the
+station built and checks its key against it (oem cryptcheck). The mock gadget answers only what the station's
+rpi-fastbootd does (docker/fastbootd/otp-station.patch). provisioning.recovery_passphrase is off by default;
+--recovery-passphrase turns it on for B (the station adds keyslot 1) and checks the passphrase.
 Exit code 0 when every assertion passed.
 """
 from __future__ import annotations
@@ -138,10 +140,14 @@ def current_set(variant: str) -> tuple[pathlib.Path, dict]:
 
 
 def image_blocks(variant: str) -> list[str]:
-    """What rpi-fastbootd's "oem idpgetblk" names for the image set: "<dev>:<simage>" in image.json order -- the
-    first (boot) partition is <disk>p1, the others are the LUKS mapper of a crypt image or the next partitions."""
+    """What rpi-fastbootd's "oem idpgetblk" names for the image.json a board gets: "<dev>:<simage>" in image.json
+    order. The crypt set goes to a board as the station-built containers (imagejson.station_luks): plain partitions
+    <disk>p1, p2, ... whose root simage is root.luks.sparse; a clear set's partitions are the same shape."""
     set_dir, man = current_set(variant)
     ij = imagejson.load(set_dir / "image.json")
+    if variant == "crypt":
+        ij, containers = imagejson.station_luks(ij, 16 << 20)
+        man = dict(man, simages={**(man.get("simages") or {}), **{c["simage"]: [] for c in containers}})
     disk = imagejson.storage_device(ij)
     order = [s for s in imagejson.simages(ij) if s in (man.get("simages") or {})]
     crypt = imagejson.crypt_containers(ij)
@@ -452,6 +458,8 @@ def run_scenario(name: str, args: argparse.Namespace, scratch: pathlib.Path, chr
     secure = sc["mode"] == "secure"
     C = Checks(name)
     settings = ["provisioning.recovery_passphrase=true"] if (secure and args.recovery_passphrase) else []
+    if args.image_name:
+        settings.append(f"image.name={args.image_name}")
     srv = OwnServer(scratch, f"scenario-{name}", settings)
     google_dir = work_dir() / "google"
     google_before = files_snapshot(google_dir)
@@ -522,8 +530,6 @@ def run_scenario(name: str, args: argparse.Namespace, scratch: pathlib.Path, chr
 def _redact(rep: dict) -> dict:
     r = json.loads(json.dumps(rep))
     fb = ((r.get("board") or {}).get("fastboot") or {})
-    for p in fb.get("passwords") or []:
-        p["pass"] = "<redacted>"
     if fb.get("deviceKeyDerB64"):
         fb["deviceKeyDerB64"] = "<redacted>"
     return r
@@ -694,17 +700,22 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
     C.eq("stage 3: scenario", m3.get("scenario"), mode)
     C.eq(f"stage 3: the {variant} image (variant, encrypted)", (m3["image"].get("variant"), m3["image"].get("encrypted")), (variant, secure))
     C.eq(f"stage 3: the current {variant} image set", m3["image"].get("set"), setman.get("set", set_dir.name))
+    C.check("stage 3: the final manifest has nothing pending", not m3.get("pending"), str(m3.get("pending")))
     C.eq("stage 3: fwcrypto_init", m3["fwcrypto_init"], secure)
-    C.eq("stage 3: key_export", m3.get("key_export"), KEY_EXPORT if secure else None)
+    first3 = next((m["body"] for m in st.manifests if m["stage"] == 3 and not m["harness"] and m["status"] == 200), {})
+    C.eq("stage 3: key_export (first manifest)", first3.get("key_export"), KEY_EXPORT if secure else None)
+    C.eq("stage 3: no key_export once the station holds the key (final manifest)", m3.get("key_export"), None)
     C.eq("stage 3: irreversible", [i["key"] for i in m3["irreversible"]], (["oem fwcrypto init"] if secure else []) + ["erase"])
     C.check("stage 3: mock block list = real simages", len(blocks) == len(parts) and blocks[0].startswith("mmcblk0p1:")
             and all(b.split(":", 1)[1] == s for b, s in zip(blocks, parts)), json.dumps(blocks))
-    crypt = m3.get("crypt") or []
-    if with_pass:
-        C.check("stage 3: one LUKS container mmcblk0p2 / osroot_crypt", len(crypt) == 1 and crypt[0]["dev"] == "mmcblk0p2" and crypt[0]["mname"] == "osroot_crypt",
-                json.dumps([{k: v for k, v in c.items() if k != "passphrase"} for c in crypt]))
+    C.check("stage 3: no passphrase field for the page (the station adds the recovery keyslot itself)", "crypt" not in m3)
+    if secure:
+        er = m3.get("encrypted_root") or {}
+        C.check("stage 3: encrypted root built by the station, keyslots", er.get("built_by") == "station"
+                and [c["keyslots"] for c in er.get("containers") or []] == [[0, 1] if with_pass else [0]], json.dumps(er))
+        C.eq("stage 3: verify_key", m3.get("verify_key"), [{"dev": "mmcblk0p2", "label": "OSROOT_CRYPT"}])
     else:
-        C.eq("stage 3: no recovery passphrase (provisioning.recovery_passphrase off)", crypt, [])
+        C.check("stage 3: open: no encrypted root, nothing to verify", not m3.get("encrypted_root") and not m3.get("verify_key"))
 
     # ---------------- stage 3: what the gadget saw
     cmds = fb.get("commands") or []
@@ -722,7 +733,7 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
         for p in parts[simage]:
             expect += [f"download:{p['size']:08x}", f"flash:{dev}"]
             order.append((dev, simage, p))
-    expect += ["oem idpgetblk"] + ([f"oem cryptsetpassword {crypt[0]['dev']} <pass>"] if with_pass and crypt else []) + ["oem idpdone", "reboot"]
+    expect += ["oem idpgetblk"] + (["oem cryptcheck mmcblk0p2"] if secure else []) + ["oem idpdone", "shutdown"]
     C.check("stage 3: command order (key export aside)", sig == expect, "\n      got:  " + " | ".join(sig) + "\n      want: " + " | ".join(expect))
     first_state = next((i for i, c in enumerate(cmds) if not c.startswith("getvar:")), -1)
     C.check("stage 3: identify (getvar serialno/product/...) before any state-changing command",
@@ -773,21 +784,27 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 (c.get("size"), c.get("sha256")) == (n, h) == (p["size"], p["sha256"]))
     n, h = sha256_url(base + ij["url"])
     C.check("stage 3: server image.json = manifest", (n, h) == (ij["size"], ij["sha256"]))
-    C.check(f"stage 3: image.json is the {variant} set's", (ij["size"], ij["sha256"]) == (setman["image_json"]["size"], setman["image_json"]["sha256"]))
+    if secure:
+        bij = imagejson.load(work_dir() / "modules" / serial / "luks" / next(
+            d.name for d in (work_dir() / "modules" / serial / "luks").iterdir() if (d / "image.json").is_file()) / "image.json")
+        C.check("stage 3: image.json is the board's: no encrypted block, the root as root.luks.sparse",
+                not imagejson.is_encrypted(bij) and imagejson.simages(bij) == list(parts), json.dumps(imagejson.simages(bij)))
+        C.eq("stage 3: the board's own key opens keyslot 0 of its encrypted root (oem cryptcheck)", fb.get("cryptChecks"),
+             [{"dev": "mmcblk0p2", "keyslot": 0}])
+        plain = {p["sha256"] for ps in (setman.get("simages") or {}).values() for p in ps}
+        C.check("stage 3: no piece of the plain crypt set went to the page", not plain & {p["sha256"] for _, _, p in order})
+    else:
+        C.check(f"stage 3: image.json is the {variant} set's", (ij["size"], ij["sha256"]) == (setman["image_json"]["size"], setman["image_json"]["sha256"]))
     C.eq("stage 3: erased", fb.get("erased"), ["mmcblk0"])
+    C.eq("stage 3: the board was powered off at the end (shutdown), not rebooted", fb.get("poweredOff"), True)
 
     # ---------------- secrets: what the server stored, what must never leak
     rec = json.loads((srv.registry / f"{serial}.json").read_text(encoding="utf-8"))
-    pw = fb.get("passwords") or []
-    passphrase = pw[0]["pass"] if pw else ""
+    passphrase = ""
+    C.check("stage 3: nothing reached the gadget that sets a passphrase or opens/mounts a container",
+            not any(c.startswith(("oem cryptsetpassword", "oem cryptopen", "oem mount")) for c in cmds))
     if with_pass:
-        expected = hmac.new(bytes.fromhex(rec["device_secret"]), f"osroot_crypt:{serial}".encode(), hashlib.sha256).hexdigest()
-        C.check("stage 3: cryptsetpassword mmcblk0p2 <64 hex>", len(pw) == 1 and pw[0]["dev"] == "mmcblk0p2" and re.fullmatch(r"[0-9a-f]{64}", passphrase or "") is not None,
-                f"{len(pw)} password command(s)")
-        C.check("stage 3: passphrase == HMAC-SHA256(device_secret, 'osroot_crypt:<serial>') from the registry", passphrase == expected)
-        C.check("stage 3: manifest passphrase == what the board received", bool(crypt) and crypt[0].get("passphrase") == passphrase)
-    else:
-        C.eq("stage 3: no cryptsetpassword", pw, [])
+        passphrase = hmac.new(bytes.fromhex(rec["device_secret"]), f"osroot_crypt:{serial}".encode(), hashlib.sha256).hexdigest()
     secrets = {"device_secret": rec.get("device_secret") or ""}
     if passphrase:
         secrets["recovery passphrase"] = passphrase
@@ -814,8 +831,14 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
             [p["sha256"] for p in parts[boot]] != set_boot and all(p["sha256"] not in set_boot for p in parts[boot]),
             f"served {[p['sha256'][:12] for p in parts[boot]]}, set {[h[:12] for h in set_boot]}")
     others = [s for s in parts if s != boot]
-    C.check("stage 3: root pieces are the image set's",
-            all([p["sha256"] for p in parts[s]] == [p["sha256"] for p in setman["simages"][s]] for s in others))
+    if secure:
+        luks_files = {sha256_file(f) for f in (work_dir() / "modules" / serial / "luks").glob("*/root.luks.sparse*")
+                      if not f.name.endswith(".sha256")}
+        C.check("stage 3: root pieces are the board's container in <work>/modules/<serial>/luks/<fp>/",
+                others == ["root.luks.sparse"] and all(p["sha256"] in luks_files for s in others for p in parts[s]))
+    else:
+        C.check("stage 3: root pieces are the image set's",
+                all([p["sha256"] for p in parts[s]] == [p["sha256"] for p in setman["simages"][s]] for s in others))
     per_board = []
     for p in parts[boot]:
         hits = list((work_dir() / "modules" / serial / "stage3").glob(f"*/{p['name']}"))
@@ -891,13 +914,20 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenario", choices=["A", "B", "both"], default="both")
     ap.add_argument("--recovery-passphrase", action="store_true",
-                    help="scenario B with provisioning.recovery_passphrase on (cryptsetpassword + passphrase checks)")
+                    help="scenario B with provisioning.recovery_passphrase on (keyslot 1 + passphrase checks)")
     ap.add_argument("--scratch", help="directory for temp registries and logs (default: a new temp dir)")
     ap.add_argument("--keep", action="store_true", help="keep the scratch dir and the per-board artifact dirs")
     ap.add_argument("--chrome")
     ap.add_argument("--timeout", type=float, default=1800.0, help="seconds per scenario run in the page")
     ap.add_argument("--wait-builds", type=float, default=40.0, help="minutes to wait for tools/gadget/image")
+    ap.add_argument("--image-name", help="image.name of the test server (default: the name of the station's current "
+                                         "image sets, so the e2e uses them instead of asking for a rebuild)")
     args = ap.parse_args(argv)
+    if args.image_name is None:
+        try:
+            args.image_name = (current_set("crypt")[1].get("image_settings") or {}).get("name") or ""
+        except (OSError, ValueError, KeyError):
+            args.image_name = ""
     chrome = find_chrome(args.chrome)
     made = not args.scratch
     scratch = pathlib.Path(args.scratch or tempfile.mkdtemp(prefix="otp-e2e-")).resolve()

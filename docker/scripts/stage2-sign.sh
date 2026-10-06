@@ -7,7 +7,11 @@
 #          /out  rw
 #          /ext  ro  <repo>/external (usbboot + rpi-eeprom submodules)
 # Env:     [SOURCE_DATE_EPOCH] (ts line of boot.sig)
+#          [CMDLINE_APPEND]   kernel parameters for this board's gadget (e.g. otp_keyexport=off): appended
+#                             to cmdline.txt inside boot.img (a parameter of the same name is replaced);
+#                             the board then gets its own boot.img, and boot.sig covers that one
 # Outputs: /out/boot.sig       rpi-eeprom-digest -k over boot.img, verified with public.pem
+#          /out/boot.img       only with CMDLINE_APPEND: the gadget with the board's cmdline.txt
 #          /out/bootfiles.bin  same tar, same member order, only 2712/bootcode5.bin replaced by
 #                              its customer counter-signed version (rpi-sign-bootcode -c 2712 -n 16 -v 0)
 # Same commands as usbboot mass-storage-gadget64/sign.sh.
@@ -62,14 +66,36 @@ step "stage2-sign"
 [ -d "${OUT}" ] || die "${OUT} is not mounted"
 [ -d "${EEPROM_DIR}" ] || die "${EEPROM_DIR} missing: mount <repo>/external at ${EXT}"
 stage_tools
-rm -f "${OUT}/boot.sig" "${OUT}/bootfiles.bin"
+rm -f "${OUT}/boot.sig" "${OUT}/bootfiles.bin" "${OUT}/boot.img"
 
-step "boot.sig over boot.img ($(stat -c %s "${IN}/boot.img") bytes)"
-rpi-eeprom-digest -k "${KEYS}/private.pem" -i "${IN}/boot.img" -o "${WORK}/boot.sig"
+BOOT_IMG="${IN}/boot.img"
+if [ -n "${CMDLINE_APPEND:-}" ]; then
+    step "board cmdline: ${CMDLINE_APPEND}"
+    case "${CMDLINE_APPEND}" in *[!A-Za-z0-9_.=,:/\ -]*) die "CMDLINE_APPEND has unexpected characters" ;; esac
+    export MTOOLS_SKIP_CHECK=1
+    cp "${IN}/boot.img" "${WORK}/boot.img"
+    mcopy -n -i "${WORK}/boot.img" ::/cmdline.txt "${WORK}/cmdline.txt" || die "boot.img has no cmdline.txt"
+    python3 - "${WORK}/cmdline.txt" "${CMDLINE_APPEND}" <<'EOF'
+import sys
+path, extra = sys.argv[1], sys.argv[2].split()
+words = open(path, "rb").read().decode("utf-8").split()
+keys = {w.split("=", 1)[0] for w in extra}
+words = [w for w in words if w.split("=", 1)[0] not in keys] + extra
+open(path, "wb").write((" ".join(words) + "\n").encode("utf-8"))
+EOF
+    mcopy -o -i "${WORK}/boot.img" "${WORK}/cmdline.txt" ::/cmdline.txt
+    mcopy -n -i "${WORK}/boot.img" ::/cmdline.txt "${WORK}/cmdline.check"
+    cmp -s "${WORK}/cmdline.txt" "${WORK}/cmdline.check" || die "cmdline.txt read back differs"
+    echo "    $(cat "${WORK}/cmdline.txt")"
+    BOOT_IMG="${WORK}/boot.img"
+fi
+
+step "boot.sig over boot.img ($(stat -c %s "${BOOT_IMG}") bytes)"
+rpi-eeprom-digest -k "${KEYS}/private.pem" -i "${BOOT_IMG}" -o "${WORK}/boot.sig"
 check_rsa_sig "${WORK}/boot.sig"
-[ "$(head -n1 "${WORK}/boot.sig")" = "$(sha256sum "${IN}/boot.img" | awk '{print $1}')" ] \
+[ "$(head -n1 "${WORK}/boot.sig")" = "$(sha256sum "${BOOT_IMG}" | awk '{print $1}')" ] \
     || die "boot.sig first line is not sha256(boot.img)"
-rpi-eeprom-digest -k "${KEYS}/public.pem" -i "${IN}/boot.img" -v "${WORK}/boot.sig" \
+rpi-eeprom-digest -k "${KEYS}/public.pem" -i "${BOOT_IMG}" -v "${WORK}/boot.sig" \
     || die "boot.sig does not verify with public.pem"
 
 step "counter-signing ${MEMBER} inside bootfiles.bin"
@@ -125,5 +151,6 @@ done < "${WORK}/members.txt"
 echo "    $(wc -l < "${WORK}/members.txt") members, same order, only ${MEMBER} changed"
 
 cp "${WORK}/boot.sig" "${WORK}/bootfiles.bin" "${OUT}/"
+if [ "${BOOT_IMG}" != "${IN}/boot.img" ]; then cp "${BOOT_IMG}" "${OUT}/boot.img"; fi
 ls -l "${OUT}"
 step "stage2-sign done"

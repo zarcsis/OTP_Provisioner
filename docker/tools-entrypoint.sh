@@ -24,6 +24,8 @@ Scripts (see SPEC section 11 / the header of each script for mounts and env):
                    /in ro, /seed ro, /keys ro (SIGN=1), /out rw
                    env SIMAGE=<name> SIGN=0|1 MAX_PIECE=<bytes>
   image-collect.sh collect image.json + sparse pieces         /work ro, /out rw, env MAX_PIECE=<bytes>
+  root-luks.sh     one board's LUKS2 container of the root      /in ro, /keys ro, /out rw
+                   env PIECES OUT_SIMAGE LABEL UUID DATA_OFFSET SECTOR_SIZE MAX_PIECE
 EOF
     if [ -d "${SCRIPTS_DIR}" ]; then
         echo

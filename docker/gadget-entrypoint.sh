@@ -6,7 +6,11 @@
 #          /out  rw  output dir
 # Env:     PGM_TARGETS (default pi5-family)   PGM_COMMIT (pi-gen-micro commit, from the host)
 # Outputs: /out/fastboot-gadget-${PGM_TARGETS}.img  (= /work/build/boot.img)
-#          /out/build-info.json {"targets","built","pi_gen_micro_commit","fastbootd_deb","helpers","size"}
+#          /out/build-info.json {"targets","built","pi_gen_micro_commit","fastbootd_deb","fastbootd_version",
+#                                "helpers","size"}
+# The gadget gets our rpi-fastbootd (/opt/otp-fastbootd, built by gadget.Dockerfile with
+# fastbootd/otp-station.patch) instead of the deb pi-gen-micro vendors; the build fails if any other
+# rpi-fastbootd ends up in it.
 set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -71,14 +75,27 @@ if [ -d "${HELPERS}" ]; then
     done
 fi
 echo "    helper packages: ${HELPER_PKGS[*]:-none}"
-FASTBOOTD_DEB="$(find "${STAGE}/internal/packages" -maxdepth 1 -name 'rpi-fastbootd_*.deb' -printf '%f\n' | sort | tail -n1)"
-[ -n "${FASTBOOTD_DEB}" ] || die "internal/packages/rpi-fastbootd_*.deb missing from the pi-gen-micro checkout"
-echo "    rpi-fastbootd: ${FASTBOOTD_DEB}"
+# rpi-fastbootd: ours in place of the vendored deb, pinned so no archive version can win over it.
+OTP_FASTBOOTD="${PGM_FASTBOOTD:-/opt/otp-fastbootd}"
+FASTBOOTD_DEB="$(find "${OTP_FASTBOOTD}" -maxdepth 1 -name 'rpi-fastbootd_*.deb' -printf '%f\n' 2>/dev/null | sort | tail -n1)"
+[ -n "${FASTBOOTD_DEB}" ] || die "${OTP_FASTBOOTD}/rpi-fastbootd_*.deb missing: rebuild the gadget builder image"
+FASTBOOTD_VERSION="$(dpkg-deb -f "${OTP_FASTBOOTD}/${FASTBOOTD_DEB}" Version)"
+[ -n "$(find "${STAGE}/internal/packages" -maxdepth 1 -name 'rpi-fastbootd_*.deb' -print -quit)" ] \
+    || die "internal/packages/rpi-fastbootd_*.deb missing from the pi-gen-micro checkout"
+rm -f "${STAGE}"/internal/packages/rpi-fastbootd_*.deb
+cp "${OTP_FASTBOOTD}/${FASTBOOTD_DEB}" "${STAGE}/internal/packages/"
+mkdir -p "${STAGE}/internal/apt/preferences.d"
+printf 'Package: rpi-fastbootd\nPin: version %s\nPin-Priority: 1001\n' "${FASTBOOTD_VERSION}" \
+    > "${STAGE}/internal/apt/preferences.d/50-otp-fastbootd.pref"
+echo "    rpi-fastbootd: ${FASTBOOTD_DEB} (station build, replaces the vendored deb)"
 
 step "pi-gen-micro fastboot ${TARGETS} (in ${BUILD})"
 mkdir -p "${BUILD}"
 cd "${BUILD}"
 rm -f boot.img 2710_bootfiles.bin
+# pi-gen-micro copies internal/packages into packages/ without --delete: drop any rpi-fastbootd an
+# earlier build left there (the vendored one), so only the station build is in the local repo.
+rm -f "${BUILD}"/packages/rpi-fastbootd_*.deb
 # pi-gen-micro's local repo (helper packages + vendored debs) has a Release file without hashes or a
 # date, so "apt-get update" against the apt lists kept in this volume never notices a new or changed
 # package ("Unable to locate package"). Drop the cached index of that repo before every build.
@@ -91,6 +108,19 @@ env CONFIGURATION_ROOT="${STAGE}/configurations/" \
     PATH="${STAGE}:/native/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "${STAGE}/pi-gen-micro" fastboot "${TARGETS}"
 [ -s "${BUILD}/boot.img" ] || die "pi-gen-micro finished without ${BUILD}/boot.img"
+# pi-gen-micro keeps two dpkg databases: dpkg_admin (its first phase) and the rootfs's own (build/var/lib/dpkg,
+# where the configuration's packages go). rpi-fastbootd must be in exactly one of them, as the station build,
+# and the daemon packed into the gadget must be the patched one.
+installed=""
+for adm in "${BUILD}/build/var/lib/dpkg" "${BUILD}/dpkg_admin"; do
+    v="$(dpkg-query --admindir="${adm}" -W -f '${Version}' rpi-fastbootd 2>/dev/null || true)"
+    if [ -n "${v}" ]; then installed="${installed}${installed:+ }${v}"; fi
+done
+[ "${installed}" = "${FASTBOOTD_VERSION}" ] \
+    || die "the gadget has rpi-fastbootd '${installed:-none}', not the station build ${FASTBOOTD_VERSION}"
+grep -q 'oem cryptcheck' "${BUILD}/build/usr/bin/fastbootd" \
+    || die "${BUILD}/build/usr/bin/fastbootd is not the station build"
+echo "    rpi-fastbootd in the gadget: ${installed}"
 
 step "copying the gadget to ${OUT}"
 IMG="fastboot-gadget-${TARGETS}.img"
@@ -102,10 +132,11 @@ jq -n \
     --arg built "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg commit "${COMMIT}" \
     --arg deb "${FASTBOOTD_DEB}" \
+    --arg fbver "${FASTBOOTD_VERSION}" \
     --arg helpers "${HELPER_PKGS[*]:-}" \
     --argjson size "${SIZE}" \
     '{targets: $targets, built: $built, pi_gen_micro_commit: $commit, fastbootd_deb: $deb,
-      helpers: ($helpers | split(" ") | map(select(length > 0))), size: $size}' \
+      fastbootd_version: $fbver, helpers: ($helpers | split(" ") | map(select(length > 0))), size: $size}' \
     > "${OUT}/build-info.json"
 cat "${OUT}/build-info.json"
 step "gadget done in $(( $(date -u +%s) - START )) s: ${OUT}/${IMG} (${SIZE} bytes)"

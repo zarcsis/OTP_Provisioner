@@ -1,11 +1,13 @@
-"""Fastboot gadget (pi-gen-micro ``fastboot`` configuration + our helper packages) and the stage-2
-rpiboot directory.
+"""Fastboot gadget (pi-gen-micro ``fastboot`` configuration + our helper packages + our rpi-fastbootd) and
+the stage-2 rpiboot directory.
 
 The gadget is always built here (no prebuilt image): it carries our ``otp-keyexport`` helper
-(docker/gadget-helpers), which hands the OTP device key to the station in the secure scenario.
+(docker/gadget-helpers), which hands the OTP device key to the station in the secure scenario, and an
+rpi-fastbootd rebuilt with docker/fastbootd/otp-station.patch, which answers only the commands the page
+sends and cannot read anything back from the board (no cryptopen / mount / arbitrary upload-file).
 Built gadget: ``<work>/artifacts/gadget/<key>[-r<N>]/fastboot-gadget-<targets>.img`` (+ build-info.json,
 .complete), key = ``<pi-gen-micro commit>-<builder hash>-<targets>`` where the builder hash covers
-docker/gadget.Dockerfile, gadget-entrypoint.sh and the helper packages. A forced rebuild of the same key
+docker/gadget.Dockerfile, gadget-entrypoint.sh, the helper packages and docker/fastbootd. A forced rebuild of the same key
 goes to the next ``-r<N>`` directory instead of replacing one that may be being served; the newest
 complete one wins.
 Stage 2 = ``bootfiles.bin`` (usbboot firmware) + ``boot.img`` (the gadget) + ``config.txt``; for a board
@@ -25,6 +27,10 @@ from .common import (NotReady, TempKeys, commit_partial, content_hash, file_url,
                      write_json, write_text)
 
 STAGE2_CONFIG = "boot_ramdisk=1\nuart_2ndstage=1\n"
+#: Kernel parameter of a board's gadget once the station holds its OTP device key: otp-keyexport then never
+#: exports the key again (docker/gadget-helpers/otp-keyexport). In the signed boot.img, so a client cannot
+#: take it out.
+KEYEXPORT_OFF = "otp_keyexport=off"
 
 
 class GadgetBuilder:
@@ -67,13 +73,21 @@ class GadgetBuilder:
         return Path(self.cfg.repo_root) / "docker" / "gadget-helpers"
 
     @property
+    def fastbootd_dir(self) -> Path:
+        """Our rpi-fastbootd patch (built into the gadget builder image, see gadget.Dockerfile)."""
+        return Path(self.cfg.repo_root) / "docker" / "fastbootd"
+
+    @property
     def builder_files(self) -> list[Path]:
         d = Path(self.cfg.repo_root) / "docker"
-        helpers = sorted(p for p in self.helpers_dir.rglob("*") if p.is_file()) if self.helpers_dir.is_dir() else []
-        return [d / "gadget.Dockerfile", d / "gadget-entrypoint.sh", *helpers]
+        files = []
+        for sub in (self.helpers_dir, self.fastbootd_dir):
+            files += sorted(p for p in sub.rglob("*") if p.is_file()) if sub.is_dir() else []
+        return [d / "gadget.Dockerfile", d / "gadget-entrypoint.sh", *files]
 
     def builder_hash(self) -> str:
-        """Content hash of gadget.Dockerfile, gadget-entrypoint.sh and the helper packages (CRLF-normalised)."""
+        """Content hash of gadget.Dockerfile, gadget-entrypoint.sh, the helper packages and the rpi-fastbootd patch
+        (CRLF-normalised)."""
         return content_hash(self.builder_files)
 
     def key(self) -> str:
@@ -186,7 +200,13 @@ class GadgetBuilder:
             base["built"] = read_json(path.parent / "build-info.json").get("built")
         except (OSError, ValueError, AttributeError):
             pass
-        base["detail"] = f"pi-gen-micro fastboot {self.gcfg.targets} + otp-keyexport"
+        base["detail"] = f"pi-gen-micro fastboot {self.gcfg.targets} + otp-keyexport + station rpi-fastbootd"
+        try:
+            fbver = read_json(path.parent / "build-info.json").get("fastbootd_version")
+        except (OSError, ValueError, AttributeError):
+            fbver = None
+        if fbver:
+            base["detail"] += f" {fbver}"
         return base
 
     # ------------------------------------------------------------------ stage 2
@@ -200,13 +220,17 @@ class GadgetBuilder:
         write_text(p, STAGE2_CONFIG)
         return p
 
-    def signed_dir(self, serial: str, boot_sha: str, bootfiles_sha: str, khash: str) -> tuple[Path, str]:
-        fp = fingerprint("stage2", boot_sha, bootfiles_sha, khash, self.tools.hash(),
-                         self.tools.script_hash("stage2-sign.sh"))
+    def signed_dir(self, serial: str, boot_sha: str, bootfiles_sha: str, khash: str,
+                   cmdline: str = "") -> tuple[Path, str]:
+        parts = ["stage2", boot_sha, bootfiles_sha, khash, self.tools.hash(), self.tools.script_hash("stage2-sign.sh")]
+        if cmdline:
+            parts.append(cmdline)
+        fp = fingerprint(*parts)
         return Path(self.cfg.work_dir) / "modules" / serial / "stage2" / fp, fp
 
-    def sign_build(self, job: Any, out_dir: Path, boot_img: Path, secrets: dict) -> None:
-        """Job body: stage2-sign.sh → boot.sig + counter-signed bootfiles.bin in ``out_dir``."""
+    def sign_build(self, job: Any, out_dir: Path, boot_img: Path, secrets: dict, cmdline: str = "") -> None:
+        """Job body: stage2-sign.sh → boot.sig + counter-signed bootfiles.bin in ``out_dir`` (+ the board's own
+        boot.img with ``cmdline`` appended to its cmdline.txt, which boot.sig then covers)."""
         if is_complete(out_dir):
             job.log(f"==> signed stage-2 files already complete: {out_dir}")
             return
@@ -223,10 +247,11 @@ class GadgetBuilder:
                                       mounts=[Mount.bind(indir, "/in", readonly=True),
                                               Mount.bind(kdir, "/keys", readonly=True),
                                               Mount.bind(part, "/out")],
+                                      env={"CMDLINE_APPEND": cmdline} if cmdline else None,
                                       log=job.log)
         finally:
             rmtree(indir)
-        for n in ("boot.sig", "bootfiles.bin"):
+        for n in ("boot.sig", "bootfiles.bin") + (("boot.img",) if cmdline else ()):
             if not (part / n).is_file() or (part / n).stat().st_size == 0:
                 raise RuntimeError(f"stage2-sign.sh did not produce {n}")
         sig = (part / "boot.sig").read_text(encoding="ascii", errors="replace")
@@ -246,16 +271,21 @@ class GadgetBuilder:
         cfg_path = self.config_path()
         boot_sf = self.hashes.stage_file("boot.img", boot_img, f"fastboot gadget ({source}: {version})")
         notes: list[str] = []
+        key_held = bool(record.get("device_private_pem"))
         if signed:
             bootfiles_sha = self.hashes.sha256(self.bootfiles_path)
             khash = str(record.get("customer_key_hash") or "")
-            out_dir, _fp = self.signed_dir(serial, boot_sf.sha256, bootfiles_sha, khash)
+            cmdline = KEYEXPORT_OFF if key_held else ""
+            out_dir, _fp = self.signed_dir(serial, boot_sf.sha256, bootfiles_sha, khash, cmdline)
             if not is_complete(out_dir):
                 self.tools.require(self.jobs)
                 secrets = secrets_fn()
                 require_quick_build(self.jobs, f"stage2:{serial}", f"Stage 2 signing for {serial}",
-                                    lambda job: self.sign_build(job, out_dir, boot_img, secrets),
+                                    lambda job: self.sign_build(job, out_dir, boot_img, secrets, cmdline),
                                     lambda: is_complete(out_dir), "signed stage 2 files")
+            if cmdline:
+                boot_sf = self.hashes.stage_file("boot.img", out_dir / "boot.img",
+                                                 f"fastboot gadget ({source}: {version}) with {cmdline}")
             files = [
                 self.hashes.stage_file("bootfiles.bin", out_dir / "bootfiles.bin",
                                        "usbboot firmware/bootfiles.bin (2712/bootcode5.bin counter-signed)"),
@@ -264,13 +294,16 @@ class GadgetBuilder:
                 self.hashes.stage_file("config.txt", cfg_path, "generated"),
             ]
             notes.append("board OTP is locked to our key: boot.img signed, bootcode5.bin counter-signed")
+            if cmdline:
+                notes.append(f"the station holds this board's OTP device key: the gadget never exports it again "
+                             f"({cmdline} in the signed boot.img)")
         else:
             files = [
                 self.hashes.stage_file("bootfiles.bin", self.bootfiles_path, "usbboot firmware/bootfiles.bin"),
                 boot_sf,
                 self.hashes.stage_file("config.txt", cfg_path, "generated"),
             ]
-        if secure:
+        if secure and not key_held:
             notes.append("secure scenario: the gadget exports the OTP device key to the station in stage 3")
         manifest = {
             "stage": 2,

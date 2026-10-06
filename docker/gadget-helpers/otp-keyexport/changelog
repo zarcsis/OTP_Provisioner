@@ -1,3 +1,10 @@
+otp-keyexport (1.1.0) unstable; urgency=medium
+
+  * otp_keyexport=off on the kernel command line disables the export (the
+    station sets it once it holds the board's key).
+
+ -- OTP_Provisioner <otp-provisioner@localhost>  Tue, 06 Oct 2026 12:00:00 +0000
+
 otp-keyexport (1.0.0) unstable; urgency=medium
 
   * Initial release.

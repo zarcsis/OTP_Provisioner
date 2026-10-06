@@ -19,15 +19,15 @@ is provisioned in one of two **scenarios**, picked on the page per board (both a
 | --- | --- | --- |
 | Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`) |
 | Stage 2 · Fastboot gadget | the gadget built by this server | the same gadget, `boot.sig` once the board is locked |
-| Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**, then Raspberry Pi OS Lite LUKS2-encrypted (`IGconf_image_pmap=crypt`); the boot partition carries the board's first-boot files and is re-signed per board |
+| Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**; the **server builds the board's LUKS2 container** holding the root file system (`IGconf_image_pmap=crypt` image, keyslot 0 = the board's key) and the board writes that ciphertext raw, then proves its key opens it (`oem cryptcheck`, nothing is decrypted on the board); the boot partition carries the board's first-boot files and is re-signed per board |
 
 In every scenario a board goes through the same three stages:
 
 | Stage | What the board does | Files come from | Registry stage after success |
 | --- | --- | --- | --- |
 | 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, …) and reboots straight back into RPIBOOT (`set_reboot_order=0x3`, `recovery_reboot=1`). | `external/usbboot/rpi-eeprom` firmware, packed by `docker/scripts/stage1.sh` | `eeprom` |
-| 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` | `gadget` |
-| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / `idpdone`) → `reboot`. | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants | `flashed` |
+| 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with our build of rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` + `docker/fastbootd` | `gadget` |
+| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → stage-3 manifest again (the server encrypts the root for the board) → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / (secure) `oem cryptcheck` / `idpdone`) → `shutdown` (the board powers off). | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants | `flashed` |
 
 Status: the open scenario has provisioned a real Pi 5 end to end (stages 1-3). **The secure scenario has not
 been run on a real board yet** (the signed boot chain, the device key export, the encrypted image), and
@@ -100,9 +100,10 @@ meanwhile and its **Server builds** card shows each job with a live log:
 1. **tools**: the `otp-tools:latest` image from `docker/tools.Dockerfile` (Debian trixie with openssl,
    pycryptodome, mtools and the Android sparse tools). It is used for all signing and packing. The
    image is rebuilt whenever `docker/tools.Dockerfile` or `docker/tools-entrypoint.sh` changes.
-2. **gadget**: the pi-gen-micro fastboot ramdisk plus our helper packages, built in an arm64 container
-   (about 3 minutes). Stage 2 answers "not ready" until it exists — there is no prebuilt fallback, because
-   only this gadget carries the device key export.
+2. **gadget**: the pi-gen-micro fastboot ramdisk plus our helper packages and our rpi-fastbootd, built in an
+   arm64 container (about 3 minutes; the first build of the builder image also compiles rpi-fastbootd, about
+   7 more). Stage 2 answers "not ready" until it exists — there is no prebuilt fallback, because only this
+   gadget carries the device key export and the restricted rpi-fastbootd (see "The station's rpi-fastbootd").
 3. **image**: the OS image in both variants, `clear` (open scenario) and `crypt` (secure scenario),
    about twelve minutes each (the first build in a new work volume takes longer). rpi-image-gen runs in the
    builder image from `image/docker` and builds Raspberry Pi OS Lite (see below); each
@@ -114,8 +115,8 @@ On Windows, if the Docker engine is not running, the server starts Docker Deskto
 Build rules worth knowing:
 
 * **Rebuild triggers.** The gadget key is `<pi-gen-micro commit>-<hash of docker/gadget.Dockerfile,
-  gadget-entrypoint.sh and every file under docker/gadget-helpers>-<targets>`, so editing any of them makes
-  the gadget "not built". An image set is reported as `rebuild needed: …` (status not ready, stage 3 409)
+  gadget-entrypoint.sh and every file under docker/gadget-helpers and docker/fastbootd>-<targets>`, so editing
+  any of them makes the gadget "not built". An image set is reported as `rebuild needed: …` (status not ready, stage 3 409)
   when it was built from another rpi-image-gen revision than the one checked out now (`git describe --tags
   --always --dirty` of `image/rpi-image-gen`), with another image name (`image.name`),
   `builds.image.overrides` or station image sources (`image/build.sh`, `image/docker/`, `image/layer/`), as
@@ -152,6 +153,7 @@ Build artifacts live **outside the repo**, in the work directory. The default is
 <work>/artifacts/image/current-clear.json, current-crypt.json   which set stage 3 serves per variant
 <work>/modules/<serial>/stage{1,2}/<fp>/    per-board signed files (secure scenario only)
 <work>/modules/<serial>/stage3/<fp>/   the board's boot partition (first-boot files; re-signed on secure boards)
+<work>/modules/<serial>/luks/<fp>/     secure: the board's LUKS2 container (root.luks.sparse.N) + its image.json
 <work>/jobs/<id>.log                   build logs
 <work>/tmp/keys-<id>/ + keys-<id>.lock  short-lived key / first-boot files (deleted after use, swept at start)
 <work>/tmp/heavy.lock                  cross-process lock for gadget/image builds
@@ -177,19 +179,29 @@ worksheet. Open and secure boards get the same settings.
 | Time zone (a list) | `image.timezone` (`Europe/Kyiv`) | `/etc/localtime`, `/etc/timezone` |
 | Keyboard (a list) | `image.keyboard` (`us`) | `/etc/default/keyboard`: the console layout the password is typed with. Raspberry Pi OS itself defaults to `gb`, where Shift+2 gives `"` and Shift+' gives `@` |
 | User, password | `image.user` (`pi`), `image.password_hash` | Raspberry Pi OS renames its first user `pi` to this name (userconf) and sets the password; it is in the `sudo` group and `sudo` asks for the password |
-| SSH server, password login, authorized keys | `image.ssh` (off), `image.ssh_password_login` (on), `image.ssh_authorized_keys` | `ssh` enabled at first boot, `~/.ssh/authorized_keys`; password login off = keys only |
-| Wi-Fi network, password, country (a list), hidden | `image.wifi_ssid`, `image.wifi_password`, `image.wifi_country` (`UA`), `image.wifi_hidden` | a netplan network that NetworkManager runs (WPA-PSK as a PMK, DHCP), the regulatory domain; the Wi-Fi radio is switched on at first boot (`raspi-config nonint do_wifi_country`) |
+| SSH server, password login, authorized keys | `image.ssh` (off), `image.ssh_password_login` (on), `image.ssh_authorized_keys` | `ssh` enabled at first boot (an empty `ssh` file in the boot partition, plus the first-boot block), `~/.ssh/authorized_keys`; password login off = keys only |
+| Wi-Fi network, password, country (a list), hidden | `image.wifi_ssid`, `image.wifi_password`, `image.wifi_country` (`UA`), `image.wifi_hidden` | a netplan network that NetworkManager runs (WPA-PSK as a PMK, DHCP), the regulatory domain; the Wi-Fi radio is switched on at first boot (`raspi-config nonint do_wifi_country`, in the first-boot block) |
 | Image name | `image.name` (`rpios-trixie-arm64-lite`) | the name of the image sets; **the only setting that rebuilds the image** |
 
 * **The first-boot files** (`otp_server/firstboot.py`) are Imager's `cloudinit-rpi` files: `user-data`
-  (`#cloud-config`: host name, time zone, keyboard, the `user:` section, `ssh_pwauth`, `runcmd`), `network-config`
-  (netplan v2, only with a Wi-Fi network) and `meta-data` (`instance-id: otp-<serial>-<hash>`), plus
+  (`#cloud-config`: host name, time zone, keyboard, the `user:` section, `ssh_pwauth`, `bootcmd`), `network-config`
+  (netplan v2, only with a Wi-Fi network), `meta-data` (`instance-id: otp-<serial>-<hash>`) and, with SSH on,
+  an empty `ssh` file (Raspberry Pi OS's `sshswitch.service` enables SSH when it finds it), plus
   Imager's kernel parameters in `cmdline.txt`: `cfg80211.ieee80211_regdom=<country>` and
   `ds=nocloud;i=<instance>`. On a secure board the boot partition holds the signed `boot.img`, so the
   parameters go into that `boot.img` (re-signed for the board anyway) and the three files next to it, where
   the OS reads them (`/boot/firmware`). They are plain files on a FAT partition on every board, so the
   account hash and the Wi-Fi PMK on the boot partition are readable to whoever has the SD card (the root
   file system of a secure board is encrypted; its boot partition is not).
+* **A first boot cut short does no harm.** What Imager puts in `runcmd` (SSH on, password-less `sudo` for a
+  key-only account, the Wi-Fi radio on) is one `bootcmd` block instead. `bootcmd` runs at the start of every
+  boot (in the init-local stage here, before NetworkManager starts); the block does its work, `sync`s and only
+  then writes its marker (`/var/lib/cloud/instance/otp-firstboot.done`), so it runs until it has completed
+  once. cloud-init's own per-instance markers are not enough: a board unplugged during its first boot
+  (2026-10-06, ebbdf4fd) kept them as empty files with their work lost, and cloud-init then marked its user
+  scripts done on a boot that had no user-data, so `runcmd` never ran and the board came up without Wi-Fi
+  and SSH. The station also ends stage 3 by powering the board off (below), so that first boot runs on the
+  board's own power supply.
 * **No account.** With no password and no SSH key there is no `user:` section: the first boot stops at the
   Raspberry Pi OS wizard on the board's console (screen and keyboard), as on an image nobody customised.
   The page warns about it. An account with SSH keys but no password gets password-less `sudo`.
@@ -240,7 +252,10 @@ worksheet. Open and secure boards get the same settings.
    Chrome needs permission for the re-enumerated device, a **Select device** button appears.
 6. When the gadget has booted, click **Connect fastboot gadget** and pick *Raspberry Pi …* in the chooser.
    Chrome's list updates while Linux boots. Stage 3 identifies the board, (secure) exports its device key,
-   then flashes the image with a progress bar, and the board reboots into the new image.
+   then flashes the image with a progress bar and **powers the board off** (`shutdown`).
+7. Unplug the board and power it from its own supply. Its first boot sets it up from the first-boot files
+   (account, SSH, Wi-Fi, host name, time zone, keyboard). The board is not rebooted into the new system on
+   the station's USB port on purpose: unplugging it during that first boot is what this avoids.
 
 The page skips stages that are already done. Switching a provisioned board to the other scenario resets it
 to stage 1: every stage is redone (the EEPROM, the gadget signing and the image all differ). A board whose
@@ -268,13 +283,39 @@ exact bytes confirmed in the irreversible dialog are pinned and served even if t
 ## The secure scenario and the device key export
 
 The BCM2712 has one device-unique OTP key slot (`rpi-fw-crypto` key-id 1, ECDSA P-256). The crypt
-image unlocks its LUKS root with `HMAC-SHA256(that key, the storage device id)` computed by the firmware
-(keyslot 0, created on the board by rpi-fastbootd during IDP). In the secure scenario the station keeps
-**a copy of that key**, so it can derive the LUKS key of any card used in the board:
+image unlocks its LUKS root at every boot with `HMAC-SHA256(that key, the storage device id)` computed by the
+firmware (initramfs keyscript `hwkey`). In the secure scenario the station keeps **a copy of that key**, so it
+can derive the LUKS key of any card used in the board:
 
 ```
 luks_key = hex( HMAC-SHA256(key = d as 32 big-endian bytes, msg = <cid of the card> + "\n") )   # secrets_gen.luks_key
 ```
+
+**The root file system is encrypted on the station, not on the board**, so only ciphertext goes to the page
+and over USB (the plain crypt image set never leaves the server):
+
+* After the key export the page asks for the stage-3 manifest again. The server builds the board's LUKS2
+  container with `docker/scripts/root-luks.sh` in the tools image: `cryptsetup luksFormat` on a file
+  (aes-xts-plain64, 512-bit random volume key, sector size 4096, the label `OSROOT_CRYPT` and UUID of the
+  image's provisioning map, low-cost argon2id since the passphrases are 256-bit secrets), keyslot 0 =
+  `luks_key` of the card the gadget reports (`getvar mmc-cid`), keyslot 1 = the recovery passphrase with
+  `provisioning.recovery_passphrase`; `docker/scripts/luks_encrypt.py` then encrypts the plain sparse pieces
+  exactly as dm-crypt would (XTS tweak = the sector offset in 512-byte units; checked against dm-crypt),
+  leaving never-written blocks out. About 1.5 minutes; `<work>/modules/<serial>/luks/<fp>/`, one per board.
+* The board gets its own `image.json`: the `encrypted` block becomes a plain root partition with
+  `expand-to-fit` (`imagejson.station_luks`), so `oem idpwrite` only writes the partition table and the
+  container goes raw to `mmcblk0p2` (`root.luks.sparse`). The LUKS2 data segment is dynamic, so it covers
+  the whole partition; `rpi-resize` grows the file system at first boot.
+* Before `idpdone` and the power-off the page runs `oem cryptcheck mmcblk0p2`: rpi-fastbootd derives the key from
+  OTP itself and checks it against the container's keyslots without activating it (no `/dev/mapper` device, so
+  nothing decrypted ever exists on the board), answering the keyslot it opened. It must be keyslot 0. A board
+  that fails (the one link the station takes on trust: the firmware's HMAC key is the raw OTP key) fails stage
+  3 and is not powered off (it stays in the gadget); the server does not accept a secure stage 3 without that check.
+* The transfer is larger than the plain image (about 2.4 GB instead of 1.6 GB): zero-filled areas of the file
+  system (journal, inode tables) are written as ciphertext.
+* Still in the clear on the way to the board: the boot partition (kernel, initramfs; signed for the board) with
+  the first-boot files, and the exported device key (the page relays it to the server). Whoever sees the
+  device key and the CID can derive the LUKS key.
 
 How the key gets to the server:
 
@@ -291,6 +332,14 @@ How the key gets to the server:
   server accepts it only when its public half equals the key the board reports (and the device key already
   recorded for the board, if any), and stores it in the registry (`device_private_pem`). Stage 3 continues
   (erase, IDP) only after that; a secure stage 3 without an exported key is not accepted.
+* **The key leaves the board once.** When the station holds it, stage 3 no longer asks for it (no
+  `key_export` in the manifest; the page checks `getvar:public-key` against the stored key and stops before
+  erasing on a mismatch), and stage 2 serves the board **its own signed gadget**: `stage2-sign.sh` adds
+  `otp_keyexport=off` to `cmdline.txt` inside `boot.img` before `boot.sig` is made, and the helper then never
+  exports the key in that boot (status `disabled`). The flag is covered by the signature, so a client cannot
+  take it out. Gadget files of the first run (the shared gadget and its `boot.sig`) stay valid for that board,
+  so a client that kept them could still boot an exporting gadget; that client saw the key during the first
+  run anyway.
 
 Failure cases:
 
@@ -324,8 +373,8 @@ the `modules` worksheet in the clear; anyone who can open the spreadsheet can re
 (encryption at rest, access control) is left to the production system.
 
 **Optional LUKS recovery passphrase** (`provisioning.recovery_passphrase`, secure scenario, default off —
-the exported device key already lets the server derive the LUKS key): keyslot 1 added by
-`oem cryptsetpassword`, `HMAC-SHA256(key = bytes.fromhex(device_secret), msg = "<mname>:<serial>")`.
+the exported device key already lets the server derive the LUKS key): keyslot 1 of the container the station
+builds, `HMAC-SHA256(key = bytes.fromhex(device_secret), msg = "<mname>:<serial>")`. It never goes to the page.
 
 The page and `/api/modules` show only a public view: which secrets exist, the hashes and the fingerprints.
 Private keys and device secrets never go back out over the API.
@@ -402,9 +451,13 @@ What the server needs before anyone has signed in is not a setting: the listen a
   "cross-site POST rejected". Requests without either header (curl, scripts, the CLI) still work.
 * Private keys are written to a temporary directory only for the duration of a signing container run, then
   deleted. Logs never contain keys, secrets or passphrases.
-* **The signed fastboot gadget of a board is a master key to it**: rpi-fastbootd can open the board's LUKS
-  container (`oem cryptopen`), read files (`oem upload-file`) and sign with its device key. Keep the
-  per-board stage-2 files on the station.
+* **The signed fastboot gadget cannot read the board back.** Whoever runs the page drives it, so its
+  rpi-fastbootd is our build (see "The station's rpi-fastbootd"): no `oem cryptopen`, `mount`,
+  `cryptsetpassword` or `fwcrypto` signing, `oem upload-file` / `download-file` only for the otp-keyexport
+  files, no `getvar:private-key`, USB only. With it a client can erase or overwrite the card, and nothing more:
+  the container needs the board's key to open, and the key leaves the board once (see above). Gadgets
+  signed for a board before this build (stock rpi-fastbootd) stay valid for it, since a signature cannot be
+  withdrawn; rebuild before boards go out, and keep the per-board stage-2 files on the station.
 
 What the irreversible operations burn (the page lists each one and asks for the serial first):
 
@@ -511,9 +564,11 @@ otp_server/
   winusb.py                Windows WinUSB driver-package check (read-only)
 docker/
   tools.Dockerfile, tools-entrypoint.sh     otp-tools image ("otp-run <script>")
-  scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, image-collect.sh
-  gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder
+  scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, root-luks.sh (+ luks_encrypt.py), image-collect.sh
+  gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder (+ rpi-fastbootd build stage)
   gadget-helpers/otp-keyexport/             pi-gen-micro helper package: OTP device key export
+  fastbootd/otp-station.patch               our changes to rpi-fastbootd (command allowlist, cryptcheck, USB only)
+  fastbootd/station-test.sh, station_test.cpp  build-time self-test of the compiled daemon
 image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
@@ -548,7 +603,42 @@ droneos repository, which the station no longer uses.
 **rpi-fastbootd is deliberately not a submodule.** Its repository contains the systemd unit
 `dev-usb\x2dffs-fastboot.mount`, a file name Windows cannot check out, and building it needs Raspberry Pi
 OS libraries (librpifwcrypto, libblockdeviceid). pi-gen-micro vendors the official
-`internal/packages/rpi-fastbootd_*_arm64.deb`, which is exactly what the gadget is built from.
+`internal/packages/rpi-fastbootd_*_arm64.deb`; the gadget builder image clones the same revision inside the
+container instead (see below).
+
+### The station's rpi-fastbootd
+
+The signed gadget runs whatever the person at the page asks of it, and stock rpi-fastbootd can decrypt the
+board's root (`oem cryptopen` with the key it derives from OTP), mount it and upload any file or block device.
+So the gadget gets our build: `docker/gadget.Dockerfile` clones `raspberrypi/rpi-fastbootd` at
+`FASTBOOTD_COMMIT` (the revision pi-gen-micro vendors, `cca05b2`), applies
+`docker/fastbootd/otp-station.patch` and builds `rpi-fastbootd_<upstream version>+otp1_arm64.deb`;
+`gadget-entrypoint.sh` puts it in place of the vendored deb in its staged pi-gen-micro copy, pins it
+(priority 1001) and fails the build unless that exact version ended up in the gadget (`fastbootd_version` in
+`build-info.json`). The patch:
+
+* answers only `download`, `upload`, `getvar`, `shutdown`, `reboot`, `erase`, `flash` and `oem` (no
+  `set_active`, `fetch`), and only these OEM commands: `idpinit`, `idpwrite`, `idpgetblk`, `idpdone`,
+  `fwcrypto init`, `cryptcheck`, `upload-file` of `/run/otp-keyexport/{key.der,status}` and `download-file`
+  of `/run/otp-keyexport/request`;
+* adds `oem cryptcheck <partition>`: the LUKS key the board derives from OTP is checked against the
+  container (`crypt_activate_by_passphrase` without a device name), answering `keyslot N`;
+* makes `shutdown` power the board off (`systemctl poweroff`; upstream answered OKAY and only paused the
+  daemon), which is how stage 3 ends;
+* drops `getvar:private-key`;
+* serves USB only: `-i usb+tcp` from the package's launcher is ignored (the TCP data plane flashes and
+  erases for anyone on the board's network).
+
+The builder image does not keep a deb that has not passed `docker/fastbootd/station-test.sh`: it links
+`station_test.cpp` with the daemon's own objects (all but `main.cpp`) and drives the compiled dispatcher over a
+scripted transport. Every upstream OEM command outside the list, the allowed ones with other arguments, other
+file paths (`/etc/passwd`, `/dev/mmcblk0`, `..`), `getvar:private-key` and the dropped top-level commands
+must be refused; the helper file exchange, IDP and `cryptcheck` must reach their handlers; and
+`CryptCheckNative` must name keyslot 0 for the board key and keyslot 1 for the recovery key of a LUKS2 header
+made there. `tests/test_artifacts.py` checks the patch against what `js/fastboot.js` sends, and the page
+tests run against a gadget simulator that refuses everything else. What a client can still do with the gadget: erase or
+overwrite the card (it could do that with the board in hand anyway), and generate the OTP key of a blank
+slot (`fwcrypto init`, which stage 3 does in any case).
 
 Scripts stage a CR-stripped copy of every shell script inside the container, and never rely on git symlinks
 (for example `usbboot/firmware/2712/*`) being materialised in a Windows checkout. The gadget build drops

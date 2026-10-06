@@ -607,7 +607,7 @@
             client.log = (l, m) => this.log(l, m);
             client.eraseSettleMs = this.opt.eraseSettleMs;
             this.client = client;
-            let details = { flashed: [], crypt: [], device_key_pem: null };
+            let details = { flashed: [], verified: [], device_key_pem: null };
             let posted = false;
             const want = this.serial; // the board this run is for; identify() below would switch this.serial
             try {
@@ -628,23 +628,32 @@
                 this._setModule(idr.module);
                 this.log('ok', `Fastboot gadget: serialno ${id.serialno}, ${id.vars.product || ''} ${id.vars['version-fastbootd'] ? 'fastbootd ' + id.vars['version-fastbootd'] : ''}`);
 
-                const manifest = await this._manifest(3);
+                let manifest = await this._manifest(3);
                 if (manifest.kind && manifest.kind !== 'fastboot-idp') throw new Error(`stage 3: unexpected manifest kind "${manifest.kind}"`);
                 await this._confirm(this._irreversibleOf(3, manifest));
                 if (this.aborted) throw new FlowAbort();
                 const img = manifest.image || {};
                 this._setStage(3, 'running', `${img.name || 'image'} ${img.version || ''} → ${manifest.storage_device || 'mmcblk0'}${img.encrypted ? ' (LUKS2)' : ''}`);
-                const imageJson = await this._fetchVerified(manifest.image_json);
                 if (manifest.key_export) {
                     details.device_key_pem = await this._exportDeviceKey(client, manifest.key_export);
+                    // the station encrypts the root for this board once it holds the key: ask again
+                    this._setStage(3, 'running', 'the station encrypts the root file system for this board…');
+                    manifest = await this._manifest(3);
                     this._setStage(3, 'running', `${img.name || 'image'} ${img.version || ''} → ${manifest.storage_device || 'mmcblk0'}${img.encrypted ? ' (LUKS2)' : ''}`);
                 }
+                if (manifest.pending) throw new Error(`stage 3: ${manifest.pending}`);
+                const imageJson = await this._fetchVerified(manifest.image_json);
                 const postKey = async (pem) => {
                     details.device_key_pem = pem;
                     try {
                         const f = await this.api.facts(this.serial, { device_key_pem: pem, duid: id.serialno });
                         this._setModule(f.module);
-                    } catch (e) { this.log('warn', `Could not store the device key: ${errText(e)}`); }
+                    } catch (e) {
+                        // an OTP key never changes: another key than the one the station holds stops the run here,
+                        // before anything is erased (the encrypted root is keyed to the held one)
+                        if (/differs from the exported one/.test(errText(e))) throw new Error(`stage 3: ${errText(e)}`);
+                        this.log('warn', `Could not store the device key: ${errText(e)}`);
+                    }
                 };
                 if (manifest.fwcrypto_init === false) {
                     const pem = await client.publicKey();
@@ -658,8 +667,8 @@
                     storageDevice: manifest.storage_device || 'mmcblk0',
                     erase: manifest.erase !== false,
                     fwcryptoInit: manifest.fwcrypto_init !== false,
-                    crypt: manifest.crypt || [],
-                    reboot: true,
+                    verifyKey: manifest.verify_key || [],
+                    powerOff: true,
                     totalBytes: total,
                     onDeviceKey: postKey,
                     log: (l, m) => this.log(l, m),
@@ -670,7 +679,7 @@
                         this.hooks.onProgress(3, { label, sent: p.sent, total: p.total });
                     },
                 });
-                details = { flashed: res.flashed, crypt: res.crypt, device_key_pem: res.device_key_pem || details.device_key_pem };
+                details = { flashed: res.flashed, verified: res.verified || [], device_key_pem: res.device_key_pem || details.device_key_pem };
                 posted = true;
                 const rr = await this.api.result(this.serial, 3, { ok: true, error: null, details });
                 this._setModule(rr.module);
@@ -680,7 +689,10 @@
                     e.verdict = verdict;
                     throw e;
                 }
-                const summary = `${res.flashed.map((f) => `${f.simage} → ${f.dev}`).join(', ')}${res.crypt.length ? `; recovery passphrase on ${res.crypt.map((c) => c.dev).join(', ')}` : ''}; rebooting`;
+                const verified = res.verified || [];
+                const summary = `${res.flashed.map((f) => `${f.simage} → ${f.dev}`).join(', ')}`
+                    + `${verified.length ? `; the board's key opens ${verified.map((v) => v.dev).join(', ')}` : ''}`
+                    + '; the board is powered off: unplug it and power it from its own supply, it sets itself up on that first boot';
                 this._setStage(3, 'done', summary, { verdict });
                 this.log('ok', `Stage 3 (Image) done: ${summary}`);
                 this.deviceStale = true;

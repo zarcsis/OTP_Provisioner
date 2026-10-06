@@ -134,7 +134,7 @@
     const STEP_INFO = {
         1: { title: 'EEPROM & OTP', sub: 'recovery flashes the EEPROM and reports the board metadata; the board reboots into RPIBOOT' },
         2: { title: 'Fastboot gadget', sub: 'the bootloader loads the rpi-fastbootd ramdisk from the station' },
-        3: { title: 'Image', sub: 'fastboot IDP: (secure) OTP device key exported to the server, partitions (+ LUKS2), sparse images, reboot' },
+        3: { title: 'Image', sub: 'fastboot IDP: (secure) OTP device key exported to the server, partitions (+ LUKS2), sparse images, power off' },
     };
     const ICONS = { idle: '○', running: '◐', waiting: '◔', done: '✓', failed: '✗' };
     const steps = {};

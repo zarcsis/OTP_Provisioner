@@ -1,0 +1,329 @@
+OTP_Provisioner station gadget: rpi-fastbootd that cannot read the board back
+
+Applied by docker/gadget.Dockerfile to rpi-fastbootd cca05b29f3ce1276151973398867b5c82c38ae40, the
+revision pi-gen-micro vendors (internal/packages/rpi-fastbootd_14.0.0~git20260902.cca05b2_arm64.deb).
+The signed gadget a board boots from the station is driven by whoever runs the provisioning page, so
+the daemon in it only does what that page needs:
+
+* commands: download, upload, getvar (without private-key), shutdown, reboot, erase, flash, oem;
+* shutdown powers the board off (systemctl poweroff; upstream only paused the daemon): the station ends
+  stage 3 with it, so the first boot of the new system does not run on the station's USB power;
+* oem: idpinit/idpwrite/idpgetblk/idpdone, fwcrypto init, the new cryptcheck, and upload-file /
+  download-file for the otp-keyexport helper's files only (/run/otp-keyexport/{key.der,status,request});
+  cryptopen, mount, partinit/partapp, cryptinit/cryptsetpassword, verity*, gpioset, led, bmap-*,
+  eeprom-* and the other fwcrypto operations are refused;
+* oem cryptcheck <blkdev>: checks that the LUKS key the board derives from OTP opens the container
+  (crypt_activate_by_passphrase without a name), so no decrypted device is ever created;
+* USB only: "-i usb+tcp" from run_fastboot is ignored (the TCP data plane flashes and erases);
+* debian/gen-version.sh: OTP_FASTBOOTD_SUFFIX puts the build above the upstream version.
+
+diff --git a/debian/gen-version.sh b/debian/gen-version.sh
+index 9b1632b..cf0f993 100755
+--- a/debian/gen-version.sh
++++ b/debian/gen-version.sh
+@@ -29,6 +29,20 @@ echo "Generating debian/changelog with version ${VERSION}..."
+ # Start fresh changelog
+ > "${OUTPUT}"
+ 
++# OTP_Provisioner: a patched build is versioned above the upstream revision it is built from
++# (OTP_FASTBOOTD_SUFFIX, e.g. "+otp1"), so apt prefers it and dpkg says what it is.
++if [ -n "${OTP_FASTBOOTD_SUFFIX:-}" ]; then
++    case "${OTP_FASTBOOTD_SUFFIX}" in *[!A-Za-z0-9.+~]*) echo "bad OTP_FASTBOOTD_SUFFIX" >&2; exit 1 ;; esac
++    cat >> "${OUTPUT}" << EOF
++${PACKAGE_NAME} (${VERSION}${OTP_FASTBOOTD_SUFFIX}) ${DISTRIBUTION}; urgency=medium
++
++  * OTP_Provisioner station gadget: command allowlist, oem cryptcheck, USB only.
++
++ -- OTP_Provisioner <otp-provisioner@localhost>  $(git show -s --format=%aD HEAD)
++
++EOF
++fi
++
+ # Get all commits after baseline (newest first for Debian changelog format)
+ mapfile -t COMMITS < <(git rev-list ${BASELINE_COMMIT}^..HEAD 2>/dev/null || true)
+ 
+diff --git a/fastboot/device/commands.cpp b/fastboot/device/commands.cpp
+index e199e01..b686d13 100644
+--- a/fastboot/device/commands.cpp
++++ b/fastboot/device/commands.cpp
+@@ -213,7 +213,6 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
+         {FB_VAR_EEPROM_UNIQUE_ID, {GetEepromUniqueId, nullptr}},
+         {FB_VAR_EEPROM_SPI_SPEED, {GetEepromSpiSpeed, nullptr}},
+         {FB_VAR_BOOTLOADER_BUILD_TIMESTAMP, {GetBootloaderBuildTimestamp, nullptr}},
+-        {FB_VAR_PRIVKEY, {GetPrivkey, nullptr}},
+         {FB_VAR_IPV4_ADDRESS, {GetIpv4Address, nullptr}},
+         {FB_VAR_IPV4_GATEWAY, {GetIpv4Gateway, nullptr}},
+         {FB_VAR_IPV4_NETMASK, {GetIpv4Netmask, nullptr}},
+@@ -1895,6 +1894,56 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
+         return device->WriteOkay("eeprom-read: " + std::to_string(image.size()) +
+                                  " bytes staged for upload");
+     }
++
++    // A bare kernel block device name ("mmcblk0p2"): no path, no "..", nothing under /dev/mapper.
++    static bool IsPlainBlockDeviceName(const std::string& name) {
++        if (name.empty() || name.size() > 32) {
++            return false;
++        }
++        return std::all_of(name.begin(), name.end(), [](char c) {
++            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
++        });
++    }
++
++    // oem cryptcheck <blkdev> (OTP_Provisioner): does the LUKS key this board derives from its OTP
++    // device key open the container on <blkdev>? Only the passphrase is checked; no /dev/mapper
++    // device is created, so nothing decrypted is ever exposed by this gadget.
++    static bool oem_cmd_cryptcheck(FastbootDevice* device, const std::vector<std::string>& args) {
++        if (args.size() != 3 || !IsPlainBlockDeviceName(args[2])) {
++            return device->WriteFail("Usage: oem cryptcheck <block_device>");
++        }
++        const std::string block_device = "/dev/" + args[2];
++
++        std::string luks_key = generateLuksKeyFromPartition(block_device);
++        if (luks_key.empty()) {
++            return device->WriteFail("Cannot generate LUKS key - unsupported device type");
++        }
++
++#ifdef HAVE_LIBCRYPTSETUP
++        std::string error_msg;
++        int slot = -1;
++        bool ok = CryptCheckNative(block_device, luks_key, &slot, &error_msg);
++        OPENSSL_cleanse(luks_key.data(), luks_key.size());
++        if (!ok) {
++            return device->WriteFail("cryptcheck " + block_device + ": " + error_msg);
++        }
++        return device->WriteOkay("cryptcheck " + block_device + ": keyslot " + std::to_string(slot));
++#else
++        OPENSSL_cleanse(luks_key.data(), luks_key.size());
++        return device->WriteFail("cryptcheck needs a build with libcryptsetup");
++#endif
++    }
++
++    // The only files this gadget exchanges: those of the otp-keyexport helper (OTP_Provisioner
++    // docker/gadget-helpers/otp-keyexport). The helper itself decides whether the key is there.
++    constexpr const char* kKeyExportUploads[] = {"/run/otp-keyexport/key.der",
++                                                 "/run/otp-keyexport/status"};
++    constexpr const char* kKeyExportRequest = "/run/otp-keyexport/request";
++
++    static bool IsKeyExportUpload(const std::string& path) {
++        return std::any_of(std::begin(kKeyExportUploads), std::end(kKeyExportUploads),
++                           [&](const char* p) { return path == p; });
++    }
+ } //namespace anonymous
+ 
+ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args) {
+@@ -1909,56 +1958,37 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
+ 
+     // device->WriteInfo(message);
+     std::vector<std::string> split_args = android::base::Split(args[0], " ");
+-    auto command_name = split_args[1];
+-
+-    if (command_name == "led") {
+-        return oem_cmd_led(device, split_args);
+-    } else if (command_name == "cryptinit") {
+-        return oem_cmd_cryptinit(device, split_args);
+-    } else if (command_name == "cryptopen") {
+-        return oem_cmd_cryptopen(device, split_args);
+-    } else if (command_name == "cryptsetpassword") {
+-        return oem_cmd_cryptsetpassword(device, split_args);
+-    } else if (command_name == "partinit") {
+-        return oem_cmd_partinit(device, split_args);
+-    } else if (command_name == "partapp") {
+-        return oem_cmd_partapp(device, split_args);
+-    } else if (command_name == "mount") {
+-        return oem_cmd_mount(device, split_args);
+-    } else if (command_name == "umount") {
+-        return oem_cmd_umount(device, split_args);
+-    } else if (command_name == "download-file") {
+-        return oem_cmd_download_file(device, split_args);
+-    } else if (command_name == "upload-file") {
+-        return oem_cmd_upload_file(device, split_args);
+-    } else if (command_name == "gpioset") {
+-        return oem_cmd_gpioset(device, split_args);
+-    } else if (command_name == "veritysetup") {
+-        return oem_cmd_veritysetup(device, split_args);
+-    } else if (command_name == "verityappend") {
+-        return oem_cmd_verityappend(device, split_args);
+-    } else if (command_name == "idpinit") {
+-        return oem_cmd_idp_init(device, split_args);
+-    } else if (command_name == "idpwrite") {
+-        return oem_cmd_idp_write(device, split_args);
+-    } else if (command_name == "idpgetblk") {
+-        return oem_cmd_idp_getblk(device, split_args);
+-    } else if (command_name == "idpdone") {
+-        return oem_cmd_idp_done(device, split_args);
+-    } else if (command_name == "fwcrypto") {
+-        return oem_cmd_fwcrypto(device, split_args);
+-    } else if (command_name == "bmap-load") {
+-        return oem_cmd_bmap_load(device, split_args);
+-    } else if (command_name == "bmap-verify") {
+-        return oem_cmd_bmap_verify(device, split_args);
+-    } else if (command_name == "eeprom-update") {
+-        return oem_cmd_eeprom_update(device, split_args);
+-    } else if (command_name == "eeprom-verify") {
+-        return oem_cmd_eeprom_verify(device, split_args);
+-    } else if (command_name == "eeprom-read") {
+-        return oem_cmd_eeprom_read(device, split_args);
+-    }
+ 
++    // OTP_Provisioner station gadget: the OEM commands the provisioning page sends, each with the
++    // arguments it sends it with (args_ok). Everything else -- cryptopen, mount, partinit, verity,
++    // gpio, eeprom, bmap, other fwcrypto operations, file transfer outside the key export helper --
++    // is refused, so nothing on the board can be read back through this gadget.
++    using OemArgs = std::vector<std::string>;
++    struct StationOemCommand {
++        const char* name;
++        bool (*handler)(FastbootDevice*, const OemArgs&);
++        bool (*args_ok)(const OemArgs&);
++    };
++    static const StationOemCommand kStationOemCommands[] = {
++        {"idpinit", oem_cmd_idp_init, nullptr},
++        {"idpwrite", oem_cmd_idp_write, nullptr},
++        {"idpgetblk", oem_cmd_idp_getblk, nullptr},
++        {"idpdone", oem_cmd_idp_done, nullptr},
++        {"cryptcheck", oem_cmd_cryptcheck, nullptr},
++        {"fwcrypto", oem_cmd_fwcrypto,
++         [](const OemArgs& a) { return a.size() == 3 && a[2] == "init"; }},
++        {"upload-file", oem_cmd_upload_file,
++         [](const OemArgs& a) { return a.size() == 3 && IsKeyExportUpload(a[2]); }},
++        {"download-file", oem_cmd_download_file,
++         [](const OemArgs& a) { return a.size() == 3 && a[2] == kKeyExportRequest; }},
++    };
++    if (split_args.size() >= 2) {
++        for (const auto& c : kStationOemCommands) {
++            if (split_args[1] == c.name && (c.args_ok == nullptr || c.args_ok(split_args))) {
++                return c.handler(device, split_args);
++            }
++        }
++    }
+     return device->WriteFail("Unknown OEM command.");
+ }
+ 
+@@ -2082,10 +2112,22 @@ bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& ar
+     return device->WriteStatus(FastbootResult::FAIL, "Unable to set slot");
+ }
+ 
++// OTP_Provisioner: power the board off for real (upstream answered OKAY and only paused the daemon). The
++// station ends stage 3 with it, so the board's first boot happens later on its own power supply instead of
++// on the station's USB port, where unplugging it would cut that first boot short.
+ bool ShutDownHandler(FastbootDevice* device, const std::vector<std::string>& /* args */) {
+-    auto result = device->WriteStatus(FastbootResult::OKAY, "Shutting down");
+-    // android::base::SetProperty(ANDROID_RB_PROPERTY, "shutdown,fastboot");
++    auto result = device->WriteStatus(FastbootResult::OKAY, "Powering off");
+     device->CloseDevice();
++    pid_t pid = fork();
++    if (pid < 0) {
++        PLOG(ERROR) << "fork() failed in shutdown handler";
++        return false;
++    }
++    if (pid == 0) {
++        execlp("systemctl", "systemctl", "poweroff", nullptr);
++        PLOG(ERROR) << "execlp(systemctl poweroff) failed";
++        _exit(127);
++    }
+     TEMP_FAILURE_RETRY(pause());
+     return result;
+ }
+diff --git a/fastboot/device/crypto_native.cpp b/fastboot/device/crypto_native.cpp
+index 90f9245..3956c75 100644
+--- a/fastboot/device/crypto_native.cpp
++++ b/fastboot/device/crypto_native.cpp
+@@ -84,6 +84,35 @@ bool CryptInitNative(const std::string& device_path, const std::string& label,
+     return CryptInitNative(device_path, params, key_data, error_msg);
+ }
+ 
++bool CryptCheckNative(const std::string& device_path, const std::string& key_data, int* slot,
++                      std::string* error_msg) {
++    struct crypt_device *cd = NULL;
++
++    int r = crypt_init(&cd, device_path.c_str());
++    if (r < 0) {
++        *error_msg = "Failed to initialize crypt device: " + std::string(strerror(-r));
++        return false;
++    }
++
++    r = crypt_load(cd, CRYPT_LUKS, NULL);
++    if (r < 0) {
++        *error_msg = "Failed to load LUKS header: " + std::string(strerror(-r));
++        crypt_free(cd);
++        return false;
++    }
++
++    // name == NULL: libcryptsetup only checks the passphrase and activates nothing.
++    r = crypt_activate_by_passphrase(cd, NULL, CRYPT_ANY_SLOT,
++                                     key_data.c_str(), key_data.size(), 0);
++    crypt_free(cd);
++    if (r < 0) {
++        *error_msg = "Key does not open the LUKS header: " + std::string(strerror(-r));
++        return false;
++    }
++    *slot = r;
++    return true;
++}
++
+ bool CryptOpenNative(const std::string& device_path, const std::string& mapped_name,
+                     const std::string& key_data, std::string* error_msg) {
+     struct crypt_device *cd = NULL;
+diff --git a/fastboot/device/crypto_native.h b/fastboot/device/crypto_native.h
+index ebb4731..320681e 100644
+--- a/fastboot/device/crypto_native.h
++++ b/fastboot/device/crypto_native.h
+@@ -31,6 +31,11 @@ bool CryptOpenNative(const std::string& device_path, const std::string& mapped_n
+ 
+ bool CryptCloseNative(const std::string& mapped_name, std::string* error_msg);
+ 
++// Checks key_data against the LUKS keyslots of device_path without activating anything (no
++// device-mapper target is created). On success *slot is the keyslot the key opened.
++bool CryptCheckNative(const std::string& device_path, const std::string& key_data, int* slot,
++                      std::string* error_msg);
++
+ bool CryptSetPasswordNative(const std::string& device_path, const std::string& hw_key,
+                            const std::string& user_passphrase, bool remove_passphrase,
+                            std::string* error_msg);
+diff --git a/fastboot/device/fastboot_device.cpp b/fastboot/device/fastboot_device.cpp
+index e08081f..4888167 100644
+--- a/fastboot/device/fastboot_device.cpp
++++ b/fastboot/device/fastboot_device.cpp
+@@ -32,22 +32,19 @@ using std::string_literals::operator""s;
+ 
+ namespace sph = std::placeholders;
+ 
++// OTP_Provisioner station gadget: only the commands the provisioning page sends. Whoever drives this
++// gadget may write and erase the board, never read anything back from it; the OEM side is narrowed
++// the same way in OemCmdHandler.
+ std::unordered_map<std::string, CommandHandler> FastbootDevice::BuildCommandMap() {
+     return {
+-              {FB_CMD_SET_ACTIVE, SetActiveHandler},
+               {FB_CMD_DOWNLOAD, DownloadHandler},
+-              {"stage", DownloadHandler},  // Compat: older rpi-imager sends "stage:" on the wire
+               {FB_CMD_UPLOAD, UploadHandler},
+               {FB_CMD_GETVAR, GetVarHandler},
+               {FB_CMD_SHUTDOWN, ShutDownHandler},
+               {FB_CMD_REBOOT, RebootHandler},
+-              {FB_CMD_REBOOT_BOOTLOADER, RebootBootloaderHandler},
+-            //   {FB_CMD_REBOOT_FASTBOOT, RebootFastbootHandler},
+-            //   {FB_CMD_REBOOT_RECOVERY, RebootRecoveryHandler},
+               {FB_CMD_ERASE, EraseHandler},
+               {FB_CMD_FLASH, FlashHandler},
+               {FB_CMD_OEM, OemCmdHandler},
+-              {FB_CMD_FETCH, FetchHandler},
+     };
+ }
+ 
+diff --git a/fastboot/device/main.cpp b/fastboot/device/main.cpp
+index 60a477c..bac0422 100644
+--- a/fastboot/device/main.cpp
++++ b/fastboot/device/main.cpp
+@@ -247,6 +247,13 @@ int main(int argc, char* argv[]) {
+     }
+     sparse_print_verbose = LogSparseVerboseMessage;
+ 
++    // OTP_Provisioner station gadget: USB only. The TCP data plane lets anyone on the board's
++    // network flash or erase it, and the station never uses it.
++    if (std::string(mode) != "usb") {
++        LOG(WARNING) << "-i " << mode << " ignored: this build serves USB only";
++        mode = "usb";
++    }
++
+     // The OTP private-key LOCK pass used to live here, but a failing
+     // LOG(FATAL) before the USB transport opened ep0 made any lock-time
+     // problem indistinguishable on the host from "broken USB" — the gadget

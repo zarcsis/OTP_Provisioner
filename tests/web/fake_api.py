@@ -307,7 +307,8 @@ def _manifest(m: dict, n: int) -> dict:
                       "built": "2026-09-30T09:01:12Z", "variant": variant, "device_class": "pi5", "storage_type": "sd",
                       "encrypted": secure},
             "storage_device": "mmcblk0", "image_json": None, "parts": {}, "total_bytes": 0, "max_piece_size": 268435456,
-            "fwcrypto_init": secure, "key_export": dict(KEY_EXPORT) if secure else None, "erase": True, "crypt": [],
+            "fwcrypto_init": secure, "key_export": dict(KEY_EXPORT) if secure else None, "erase": True,
+            "verify_key": [{"dev": "mmcblk0p2", "label": "OSROOT_CRYPT"}] if secure else [],
             "irreversible": irreversible, "notes": []}
 
 

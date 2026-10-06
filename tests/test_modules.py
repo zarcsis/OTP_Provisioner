@@ -256,7 +256,7 @@ def test_stage3(module_service):
     module_service.hello("a7eb274c")
     rec, v = module_service.record_result("a7eb274c", 3, {
         "ok": False, "error": "flash failed",
-        "details": {"flashed": ["boot.vfat.sparse"], "crypt": [], "device_key_pem": EC_PEM}})
+        "details": {"flashed": ["boot.vfat.sparse"], "device_key_pem": EC_PEM}})
     assert v["ok"] is False and rec["stage"] == "new"
     assert rec["device_key_pem"] == EC_PEM  # stored even on failure (fwcrypto init is irreversible)
     rec, v = module_service.record_result("a7eb274c", 3, {
@@ -265,8 +265,8 @@ def test_stage3(module_service):
                     "crypt": [{"dev": "mmcblk0p2", "mname": "osroot_crypt", "passphrase": "SECRET" * 10}],
                     "device_key_pem": None}})
     assert v["ok"] is True and rec["stage"] == "flashed"
-    assert rec["facts"]["stage3"]["crypt"] == [{"dev": "mmcblk0p2", "mname": "osroot_crypt"}]
-    assert "SECRET" not in json.dumps(rec["facts"])
+    assert "crypt" not in rec["facts"]["stage3"]          # not something the station asks for: not kept
+    assert "SECRET" not in json.dumps(rec)
     assert rec["events"][-1]["kind"] == "stage3"
 
 
@@ -789,8 +789,19 @@ def test_stage3_secure_needs_the_exported_device_key(module_service):
     assert rec["device_key_pem"] == _pub(key)  # the reported key is still kept
 
     module_service.store_device_key("a7eb274c", _der(key), _pub(key))
+    # the key is there, but the page did not prove that the board's key opens its encrypted root
+    rec, v = module_service.record_result("a7eb274c", 3, ok_run)
+    assert v["ok"] is False and any("oem cryptcheck" in n for n in v["notes"]) and rec["stage"] == "gadget"
+    # the board's key must open keyslot 0 (its own); keyslot 1 is the recovery passphrase, a bool is not a slot
+    for bad in ([{"dev": "mmcblk0p2", "keyslot": 1}], [{"dev": "mmcblk0p2", "keyslot": False}],
+                [{"dev": "mmcblk0p2"}], [{"dev": "mmcblk0p2", "keyslot": 0}, {"dev": "mmcblk0p3", "keyslot": 1}]):
+        ok_run["details"]["verified"] = bad
+        rec, v = module_service.record_result("a7eb274c", 3, ok_run)
+        assert v["ok"] is False and any("keyslot 0" in n for n in v["notes"]) and rec["stage"] == "gadget", bad
+    ok_run["details"]["verified"] = [{"dev": "mmcblk0p2", "keyslot": 0, "passphrase": "x" * 64}]
     rec, v = module_service.record_result("a7eb274c", 3, ok_run)
     assert v == {"ok": True, "notes": []} and rec["stage"] == "flashed"
+    assert rec["facts"]["stage3"]["verified"] == [{"dev": "mmcblk0p2", "keyslot": 0}]   # nothing else kept
     assert rec["events"][-1] == {**rec["events"][-1], "kind": "stage3", "note": "ok"}
 
 
@@ -818,7 +829,7 @@ def test_stage3_fails_when_the_reported_key_differs_from_the_exported_one(module
     assert rec["stage"] == "new" and rec["device_key_pem"] == _pub(key)  # the recorded key is not replaced
     # with the matching key (CRLF from the page) the run counts
     rec, v = module_service.record_result("a7eb274c", 3, {
-        "ok": True, "details": {"device_key_pem": _pub(key).replace("\n", "\r\n")}})
+        "ok": True, "details": {"device_key_pem": _pub(key).replace("\n", "\r\n"), "verified": [{"dev": "mmcblk0p2", "keyslot": 0}]}})
     assert v["ok"] is True and rec["stage"] == "flashed" and rec["device_key_pem"] == _pub(key)
 
 

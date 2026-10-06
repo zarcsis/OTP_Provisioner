@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +32,13 @@ def yaml_doc(data: bytes):
     return yaml.safe_load(data.decode("utf-8"))
 
 
+def bootcmd(seed) -> list[str]:
+    """The lines of the first-boot block (the one ``bootcmd`` entry), as the board's shell gets them."""
+    doc = yaml_doc(seed.files["user-data"])
+    assert len(doc["bootcmd"]) == 1 and isinstance(doc["bootcmd"][0], str)
+    return [ln.strip() for ln in doc["bootcmd"][0].splitlines()]
+
+
 def test_defaults_leave_the_account_to_the_wizard():
     seed = fb.render(image(), SERIAL)
     assert sorted(seed.files) == ["meta-data", "user-data"]          # no Wi-Fi network: no network-config
@@ -35,10 +46,17 @@ def test_defaults_leave_the_account_to_the_wizard():
     assert ud.startswith("#cloud-config\nmanage_resolv_conf: false\n\n")
     assert f'hostname: "pi5-{SERIAL}"\nmanage_etc_hosts: true\n' in ud
     assert 'timezone: "Europe/Kyiv"\nkeyboard:\n  model: pc105\n  layout: "us"\n' in ud
-    assert "\nuser:" not in ud and "ssh_pwauth" not in ud and "systemctl, enable" not in ud
-    assert ud.endswith('runcmd:\n  - [ rfkill, unblock, wifi ]\n'
-                       '  - [ sh, -c, "for f in /var/lib/systemd/rfkill/*:wlan; do echo 0 > \\"$f\\"; done" ]\n'
-                       '  - [ raspi-config, nonint, do_wifi_country, "UA" ]\n')
+    assert "\nuser:" not in ud and "ssh_pwauth" not in ud and "systemctl" not in ud and "runcmd" not in ud
+    assert ud.endswith("\nbootcmd:\n  - |\n"
+                       "    # OTP_Provisioner first boot: runs until it has completed once "
+                       "(/var/lib/cloud/instance/otp-firstboot.done)\n"
+                       "    if [ ! -s /var/lib/cloud/instance/otp-firstboot.done ]; then\n"
+                       "      rfkill unblock wifi\n"
+                       '      for f in /var/lib/systemd/rfkill/*:wlan; do [ -e "$f" ] && echo 0 > "$f"; done\n'
+                       "      s=/var/lib/NetworkManager/NetworkManager.state\n"
+                       """      [ -f "$s" ] && sed -i 's/^WirelessEnabled=.*/WirelessEnabled=true/' "$s"\n"""
+                       "      raspi-config nonint do_wifi_country UA\n"
+                       "      sync\n      date -u +%s >/var/lib/cloud/instance/otp-firstboot.done\n      sync\n    fi\n")
     assert seed.summary["account"] == "first-boot wizard" and seed.summary["user"] == ""
     assert seed.summary["sudo"] == "wizard"
 
@@ -49,9 +67,15 @@ def test_user_data_parses_as_cloud_config():
     assert doc["keyboard"] == {"model": "pc105", "layout": "us"}
     assert doc["user"] == {"name": "pi", "shell": "/bin/bash", "lock_passwd": False, "passwd": PW,
                            "ssh_authorized_keys": [KEY], "sudo": None}
-    assert doc["ssh_pwauth"] is True and doc["manage_resolv_conf"] is False
-    assert doc["runcmd"][0] == ["systemctl", "enable", "--now", "ssh"]
-    assert doc["runcmd"][-1] == ["raspi-config", "nonint", "do_wifi_country", "UA"]
+    assert doc["ssh_pwauth"] is True and doc["manage_resolv_conf"] is False and "runcmd" not in doc
+    seed = fb.render(image(password_hash=PW, ssh=True, ssh_authorized_keys=[KEY]), SERIAL)
+    lines = bootcmd(seed)
+    assert lines[1] == f"if [ ! -s {fb.FIRSTBOOT_MARK} ]; then" and lines[-1] == "fi"
+    assert lines[2] == "systemctl --no-reload enable ssh"            # no --now: this runs before network.target
+    assert "raspi-config nonint do_wifi_country UA" in lines
+    assert lines[-4:] == ["sync", f"date -u +%s >{fb.FIRSTBOOT_MARK}", "sync", "fi"]   # the marker only after sync
+    # SSH also the Raspberry Pi OS way: the empty flag file sshswitch.service acts on
+    assert seed.files["ssh"] == b"" and seed.summary["files"] == ["meta-data", "ssh", "user-data"]
 
 
 def test_key_only_account_gets_passwordless_sudo():
@@ -59,8 +83,11 @@ def test_key_only_account_gets_passwordless_sudo():
                              SERIAL).files["user-data"])
     assert doc["user"]["lock_passwd"] is True and "passwd" not in doc["user"]
     assert doc["user"]["sudo"] == "ALL=(ALL) NOPASSWD:ALL" and doc["ssh_pwauth"] is False
-    assert ["sh", "-c", "echo 'op ALL=(ALL) NOPASSWD:ALL' >'/etc/sudoers.d/010_op-nopasswd'"] in doc["runcmd"]
-    assert ["sh", "-c", "chmod 0440 '/etc/sudoers.d/010_op-nopasswd'"] in doc["runcmd"]
+    lines = bootcmd(fb.render(image(user="op", ssh=True, ssh_password_login=False, ssh_authorized_keys=[KEY]), SERIAL))
+    # written next to it and renamed (sudo ignores names with a dot), so sudo never sees half a file
+    assert ("echo 'op ALL=(ALL) NOPASSWD:ALL' >'/etc/sudoers.d/010_op-nopasswd'.new && "
+            "chmod 0440 '/etc/sudoers.d/010_op-nopasswd'.new && "
+            "mv -f '/etc/sudoers.d/010_op-nopasswd'.new '/etc/sudoers.d/010_op-nopasswd'") in lines
 
 
 def test_keys_without_ssh_do_not_make_an_account():
@@ -69,15 +96,17 @@ def test_keys_without_ssh_do_not_make_an_account():
 
 
 def test_password_only_account_without_ssh():
-    doc = yaml_doc(fb.render(image(password_hash=PW), SERIAL).files["user-data"])
+    seed = fb.render(image(password_hash=PW), SERIAL)
+    doc = yaml_doc(seed.files["user-data"])
     assert doc["user"]["passwd"] == PW and doc["user"]["sudo"] is None and "ssh_authorized_keys" not in doc["user"]
-    assert "ssh_pwauth" not in doc and ["systemctl", "enable", "--now", "ssh"] not in doc["runcmd"]
+    assert "ssh_pwauth" not in doc and not any("systemctl" in ln for ln in bootcmd(seed)) and "ssh" not in seed.files
 
 
 def test_world_country_switches_the_radio_on_without_raspi_config():
     seed = fb.render(image(wifi_country="00", wifi_ssid="N", wifi_password="password1"), SERIAL)
-    doc = yaml_doc(seed.files["user-data"])
-    assert doc["runcmd"][-1] == ["nmcli", "radio", "wifi", "on"]
+    lines = bootcmd(seed)
+    assert not any("raspi-config" in ln for ln in lines)
+    assert "rfkill unblock wifi" in lines and any("WirelessEnabled=true" in ln for ln in lines)
     assert "regulatory-domain" not in seed.files["network-config"].decode()
     assert not seed.cmdline.startswith("cfg80211")          # Imager drops what is not two letters
 
@@ -159,3 +188,66 @@ def test_summary_has_no_secrets():
     text = repr(seed.summary)
     assert PW not in text and "password1" not in text and KEY not in text
     assert seed.summary["user"] == "pi" and seed.summary["sudo"] == "passwd" and seed.summary["ssh"] is True
+
+
+# ------------------------------------------------------------------ the first-boot block, run
+SH = shutil.which("sh")
+
+STUB = """#!/bin/sh
+printf '%s\\n' "$(basename "$0")${*:+ $*}" >> "$FB_CALLS"
+"""
+
+
+def _posix(p: Path) -> str:
+    return str(p).replace("\\", "/")
+
+
+def _run_block(root: Path, script: str) -> list[str]:
+    """Run the block with /var/lib and /etc under ``root`` and systemctl / rfkill / raspi-config / sync stubbed;
+    returns the stub calls."""
+    bindir = root / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name in ("systemctl", "rfkill", "raspi-config", "sync"):
+        (bindir / name).write_bytes(STUB.encode())
+        (bindir / name).chmod(0o755)
+    calls = root / "calls"
+    calls.write_bytes(b"")
+    body = script.replace("/var/lib/", _posix(root) + "/var/lib/").replace("/etc/", _posix(root) + "/etc/")
+    env = dict(os.environ, FB_CALLS=_posix(calls), PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run([SH, "-c", body], capture_output=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+    return calls.read_text().splitlines()
+
+
+@pytest.mark.skipif(SH is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_first_boot_block_runs_until_it_has_completed_once(tmp_path):
+    img = image(user="op", ssh=True, ssh_password_login=False, ssh_authorized_keys=[KEY], wifi_country="AR")
+    script = fb.firstboot_script(img)
+    root = tmp_path
+    (root / "var/lib/cloud/instance").mkdir(parents=True)
+    (root / "var/lib/systemd/rfkill").mkdir(parents=True)
+    (root / "var/lib/NetworkManager").mkdir(parents=True)
+    (root / "etc/sudoers.d").mkdir(parents=True)
+    # "<device>:wlan" cannot be a file name on Windows (":" makes an NTFS stream): checked elsewhere only
+    rfk = root / "var/lib/systemd/rfkill/platform-1001100000.mmc:wlan" if os.name != "nt" else None
+    if rfk:
+        rfk.write_text("1\n")
+    state = root / "var/lib/NetworkManager/NetworkManager.state"
+    state.write_text("[main]\nNetworkingEnabled=true\nWirelessEnabled=false\nWWANEnabled=true\n")
+    mark = root / "var/lib/cloud/instance/otp-firstboot.done"
+
+    calls = _run_block(root, script)
+    assert calls == ["systemctl --no-reload enable ssh", "rfkill unblock wifi",
+                     "raspi-config nonint do_wifi_country AR", "sync", "sync"]
+    assert (rfk is None or rfk.read_text() == "0\n") and "WirelessEnabled=true\n" in state.read_text()
+    assert (root / "etc/sudoers.d/010_op-nopasswd").read_text() == "op ALL=(ALL) NOPASSWD:ALL\n"
+    assert not (root / "etc/sudoers.d/010_op-nopasswd.new").exists()
+    assert mark.read_text().strip().isdigit()
+
+    assert _run_block(root, script) == []                     # done: every later boot leaves the board alone
+
+    # a first boot cut short leaves the marker behind empty (created, data never written): run again
+    mark.write_bytes(b"")
+    state.write_text("[main]\nWirelessEnabled=false\n")
+    assert _run_block(root, script)[0] == "systemctl --no-reload enable ssh"
+    assert "WirelessEnabled=true" in state.read_text() and mark.stat().st_size > 0

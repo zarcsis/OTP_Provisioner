@@ -797,7 +797,8 @@ def test_secure_stage3_needs_the_exported_device_key(env):
     out = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub2}}).json()
     assert out["verdict"]["ok"] is False and out["module"]["stage"] == "new"
     assert any("differs from the exported one" in n for n in out["verdict"]["notes"])
-    out = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub}}).json()
+    out = env.client.post(url, json={"ok": True, "details": {"flashed": ["root"], "device_key_pem": pub,
+                                                               "verified": [{"dev": "mmcblk0p2", "keyslot": 0}]}}).json()
     assert out["verdict"]["ok"] is True and out["module"]["stage"] == "flashed"
     assert out["module"]["otp"]["device_key_exported"] is True
 

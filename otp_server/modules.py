@@ -496,6 +496,15 @@ class ModuleService:
         if ok and self.mode_of(rec) == "secure" and not rec["device_private_pem"]:
             notes.append("the OTP device key was not exported to the server (secure mode needs it)")
             ok = False
+        verified = details.get("verified") if isinstance(details.get("verified"), list) else []
+        if ok and self.mode_of(rec) == "secure":
+            # oem cryptcheck: the board's key must open keyslot 0, the slot the station gave it (1 = recovery)
+            good = [v for v in verified if isinstance(v, dict) and isinstance(v.get("dev"), str)
+                    and v.get("keyslot") == 0 and not isinstance(v.get("keyslot"), bool)]
+            if not good or len(good) != len(verified):
+                notes.append("the page did not confirm that the board's OTP key opens keyslot 0 of its station-built "
+                             "encrypted root (oem cryptcheck); the board may not boot")
+                ok = False
         if ok:
             rec["stage"] = "flashed"
         return ok
@@ -512,14 +521,17 @@ class ModuleService:
             return {"files_served": served}
         details = result.get("details") if isinstance(result.get("details"), dict) else {}
         flashed = details.get("flashed") if isinstance(details.get("flashed"), list) else []
-        crypt_in = details.get("crypt") if isinstance(details.get("crypt"), list) else []
-        # The page may echo the container list back; passphrases must never be stored in facts.
-        crypt = [
-            {k: v for k, v in c.items() if k != "passphrase" and isinstance(v, (str, int, bool))}
-            for c in crypt_in[:16]
-            if isinstance(c, dict)
-        ]
-        return {"flashed": [x if isinstance(x, (str, int)) else _clean_text(x, 200) for x in flashed[:100]], "crypt": crypt}
+        # Only what the station asked for is kept: whatever else the page sends (a passphrase, say) is not.
+        verified_in = details.get("verified") if isinstance(details.get("verified"), list) else []
+        verified = []
+        for c in verified_in[:16]:
+            if isinstance(c, dict) and isinstance(c.get("dev"), str):
+                v = {"dev": _clean_text(c["dev"], 64)}
+                if isinstance(c.get("keyslot"), int) and not isinstance(c.get("keyslot"), bool):
+                    v["keyslot"] = c["keyslot"]
+                verified.append(v)
+        return {"flashed": [x if isinstance(x, (str, int)) else _clean_text(x, 200) for x in flashed[:100]],
+                "verified": verified}
 
     # operator overrides --------------------------------------------------------------------------
 

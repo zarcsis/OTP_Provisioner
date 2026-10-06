@@ -15,9 +15,17 @@ Differences from Imager, all on purpose:
 * the keyboard layout is always written (Imager writes it when a locale is set): Raspberry Pi OS defaults
   to the British layout, where a password typed on a US keyboard at the console comes out different
   (Shift+2 is ``"``, Shift+' is ``@``, Shift+3 is ``£``);
-* the Wi-Fi radio is switched on by ``raspi-config nonint do_wifi_country`` at the end of the first boot.
-  The image keeps Wi-Fi off until a country is set (``WirelessEnabled=false``, as pi-gen leaves it), and
-  nothing in Imager's cloud-init files undoes that when a network is configured;
+* the Wi-Fi radio is switched on by ``raspi-config nonint do_wifi_country``. The image keeps Wi-Fi off
+  until a country is set (``WirelessEnabled=false``, as pi-gen leaves it), and nothing in Imager's
+  cloud-init files undoes that when a network is configured;
+* what Imager does in ``runcmd`` (SSH, the radio) runs from ``bootcmd`` instead, guarded by a marker of our
+  own (:data:`FIRSTBOOT_MARK`) that is written only after ``sync``. A first boot cut short (the board
+  unplugged while cloud-init runs) can leave cloud-init's own per-instance markers behind as empty files
+  with their work lost; on a board flashed on 2026-10-06 it then marked ``scripts_user`` done on a boot
+  that had no user-data, so ``runcmd`` never ran. ``bootcmd`` runs on every boot (here in the init-local
+  stage, before NetworkManager starts), and our block runs until it has completed once;
+* SSH is also switched on the Raspberry Pi OS way: an empty ``ssh`` file in the boot partition, which
+  ``sshswitch.service`` turns into ``systemctl enable --now ssh`` (and deletes) on the next boot;
 * sudo: with a password the account asks for it (``sudo: null``, the ``sudo`` group); a key-only account
   (no password) gets passwordless sudo, otherwise it could not use sudo at all;
 * no account at all (no password and no SSH key): no ``user:`` section, so Raspberry Pi OS's first-boot
@@ -40,7 +48,11 @@ from typing import Any
 USER_DATA = "user-data"
 NETWORK_CONFIG = "network-config"
 META_DATA = "meta-data"
+#: Empty file: Raspberry Pi OS's sshswitch.service enables SSH when it finds it (and deletes it).
+SSH_FLAG = "ssh"
 SERIAL_PLACEHOLDER = "{serial}"
+#: Written (after sync) once the first-boot block in ``bootcmd`` has completed; per cloud-init instance.
+FIRSTBOOT_MARK = "/var/lib/cloud/instance/otp-firstboot.done"
 
 _HEX64_RE = re.compile(r"[0-9a-fA-F]{64}")
 _COUNTRY_RE = re.compile(r"[A-Z]{2}")
@@ -155,25 +167,32 @@ def user_data(img: Any, hostname: str) -> bytes:
         elif keys:
             lines += ["", "ssh_pwauth: false"]
 
-    def sh(command: str) -> str:
-        return f"  - [ sh, -c, {yaml_str(command)} ]"
+    lines += ["", "bootcmd:", "  - |", *("    " + ln for ln in firstboot_script(img).splitlines())]
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
-    run: list[str] = []
+
+def firstboot_script(img: Any) -> str:
+    """The ``bootcmd`` block: SSH on, passwordless sudo for a key-only account, the Wi-Fi radio on. Runs at
+    the start of every boot until it has completed once (see the module doc); every step can run twice."""
+    steps: list[str] = []
     if img.ssh:
-        run.append("  - [ systemctl, enable, --now, ssh ]")
-    if has_account(img) and mode == "nopasswd":
-        sudoers = f"/etc/sudoers.d/010_{img.user}-nopasswd"
-        run.append(sh(f"echo {shell_quote(img.user + ' ALL=(ALL) NOPASSWD:ALL')} >{shell_quote(sudoers)}"))
-        run.append(sh(f"chmod 0440 {shell_quote(sudoers)}"))
-    run.append("  - [ rfkill, unblock, wifi ]")
-    run.append(sh('for f in /var/lib/systemd/rfkill/*:wlan; do echo 0 > "$f"; done'))
+        steps.append("systemctl --no-reload enable ssh")
+    if has_account(img) and sudo_mode(img) == "nopasswd":
+        sudoers = shell_quote(f"/etc/sudoers.d/010_{img.user}-nopasswd")
+        steps.append(f"echo {shell_quote(img.user + ' ALL=(ALL) NOPASSWD:ALL')} >{sudoers}.new && "
+                     f"chmod 0440 {sudoers}.new && mv -f {sudoers}.new {sudoers}")
+    # Before NetworkManager starts: unblock the radio and let NetworkManager bring it up.
+    steps += ["rfkill unblock wifi",
+              'for f in /var/lib/systemd/rfkill/*:wlan; do [ -e "$f" ] && echo 0 > "$f"; done',
+              "s=/var/lib/NetworkManager/NetworkManager.state",
+              "[ -f \"$s\" ] && sed -i 's/^WirelessEnabled=.*/WirelessEnabled=true/' \"$s\""]
     country = _country(img)
     if country:
-        run.append(f"  - [ raspi-config, nonint, do_wifi_country, {yaml_str(country)} ]")
-    else:
-        run.append('  - [ nmcli, radio, wifi, "on" ]')       # bare on is true in YAML 1.1
-    lines += ["", "runcmd:", *run]
-    return ("\n".join(lines) + "\n").encode("utf-8")
+        steps.append(f"raspi-config nonint do_wifi_country {country}")
+    mark = FIRSTBOOT_MARK
+    body = "\n".join("  " + s for s in steps)
+    return (f"# OTP_Provisioner first boot: runs until it has completed once ({mark})\n"
+            f"if [ ! -s {mark} ]; then\n{body}\n  sync\n  date -u +%s >{mark}\n  sync\nfi\n")
 
 
 def network_config(img: Any) -> bytes | None:
@@ -203,6 +222,8 @@ def render(img: Any, serial: str) -> Seed:
     net = network_config(img)
     if net is not None:
         files[NETWORK_CONFIG] = net
+    if img.ssh:
+        files[SSH_FLAG] = b""
     h = hashlib.sha256(serial.encode("utf-8"))
     for name in sorted(files):
         h.update(b"\0" + name.encode("utf-8") + b"\0" + files[name])

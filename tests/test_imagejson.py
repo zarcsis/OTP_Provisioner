@@ -124,3 +124,42 @@ def test_partitionimages_list_form_and_bool_bootable():
     assert imagejson.simages(ij) == ["b.sparse", "r.sparse"]
     assert imagejson.boot_simages(ij) == ["b.sparse"]
     assert not imagejson.is_encrypted(ij)
+
+
+# ------------------------------------------------------------------ station-built LUKS containers
+def test_station_luks_turns_the_real_crypt_map_into_the_clear_shape():
+    ij = rpios_image_json(load_pmap(RPIOS_DEV / "provisionmap-crypt.json"))
+    before = json.dumps(ij, sort_keys=True)
+    new, cs = imagejson.station_luks(ij, 16 << 20)
+    assert json.dumps(ij, sort_keys=True) == before                      # the set's document is not touched
+    assert cs == [{"index": 2, "image": "root", "simage": "root.luks.sparse", "plain_simage": "root.ext4.sparse",
+                   "mname": "osroot_crypt", "label": "OSROOT_CRYPT", "uuid": SUBST["CRYPT_UUID"],
+                   "cipher": "aes-xts-plain64", "key_size": 512, "hash": "sha256", "fs_bytes": 1459617792,
+                   "expand_to_fit": True}]
+    assert imagejson.is_encrypted(new) is False and imagejson.crypt_containers(new) == []
+    # the shape of provisionmap-clear.json: one list, boot then root (expand-to-fit), same partition numbers
+    clear = load_pmap(RPIOS_DEV / "provisionmap-clear.json")
+    shape = lambda pm: [(sorted(e), [p["image"] for p in e.get("partitions", [])]) for e in pm]  # noqa: E731
+    assert shape(new["layout"]["provisionmap"]) == shape(clear)
+    root = new["layout"]["provisionmap"][1]["partitions"][1]
+    assert root["image"] == "root" and root["expand-to-fit"] is True
+    assert imagejson.simages(new) == ["boot.vfat.sparse", "root.luks.sparse"]
+    assert new["layout"]["partitionimages"]["root"]["size"] == 1459617792 + (16 << 20)
+    assert imagejson.boot_simages(new) == ["boot.vfat.sparse"]
+
+
+def test_station_luks_refuses_maps_it_cannot_build():
+    rota = load_pmap(ROTA_DEV / "provisionmap-crypt.json") if (ROTA_DEV / "provisionmap-crypt.json").is_file() else None
+    if rota is not None and any("slots" in e for e in rota if isinstance(e, dict)):
+        with pytest.raises(ValueError, match="slot"):
+            imagejson.station_luks(rpios_image_json(rota), 16 << 20)
+    pm = load_pmap(RPIOS_DEV / "provisionmap-crypt.json")
+    pm[2]["encrypted"]["luks2"]["etype"] = "partitioned"
+    with pytest.raises(ValueError, match="raw container with one partition"):
+        imagejson.station_luks(rpios_image_json(pm), 16 << 20)
+
+
+def test_station_luks_leaves_a_clear_map_alone():
+    ij = rpios_image_json(load_pmap(RPIOS_DEV / "provisionmap-clear.json"))
+    new, cs = imagejson.station_luks(ij, 16 << 20)
+    assert cs == [] and new == ij
