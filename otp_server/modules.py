@@ -50,6 +50,11 @@ FASTBOOT_VARS = (
 #: USB descriptor fields kept from ``hello`` (``facts["usb"]``).
 USB_KEYS = ("vendor_id", "product_id", "product_name", "manufacturer", "serial_number")
 
+#: The two second stages (``bootcode5.bin``) stage 1 can send. The BCM2712 boot ROM runs the plain
+#: recovery.bin only on a board whose OTP holds no key hash, and the one counter-signed with our key only
+#: on a board locked to it (usbboot secure-boot-recovery5/README.md); it refuses the other one silently.
+RECOVERY_VARIANTS = ("plain", "countersigned")
+
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _SECRET_KEYS = ("rsa_private_pem", "rsa_public_pem", "customer_key_hash", "device_secret", "device_private_pem")
 #: Largest exported device key accepted (DER of a P-256 key is ~121-138 bytes).
@@ -284,7 +289,7 @@ class ModuleService:
         scenario chosen for it, else ``provisioning.default_mode``.
         """
         r = record or {}
-        if self.is_locked(r) or bool(r.get("secure_boot_provisioned")):
+        if self.is_locked(r) or bool(r.get("secure_boot_provisioned")) or self.lock_suspected(r):
             return "secure"
         m = str(r.get("mode") or "").strip().lower()
         if m in MODES:
@@ -311,6 +316,10 @@ class ModuleService:
             if m == "open" and (self.is_locked(rec) or rec["secure_boot_provisioned"]):
                 raise ValueError(f"board {rec['serial']}: its OTP holds a key hash (secure boot is provisioned), so it "
                                  "only runs signed code; only the secure scenario is possible")
+            if m == "open" and self.lock_suspected(rec):
+                raise ValueError(f"board {rec['serial']}: its OTP probably holds this board's key hash already "
+                                 f"({self.lock_assumption(rec)['why']}); run stage 1 in the secure scenario, the "
+                                 "board's own report settles it")
             prev = rec["mode"]
             if prev == m:
                 return copy.deepcopy(rec)
@@ -430,6 +439,12 @@ class ModuleService:
             # OTP writes are permanent: once provisioned, never downgraded by a later report.
             rec["secure_boot_provisioned"] = True
 
+        if reported_hash:
+            self._resolve_lock(rec)              # the board itself said what its OTP holds
+        if result.get("second_stage_rejected"):
+            ok = self._second_stage_rejected(rec, result, notes)
+            return ok
+
         eeprom = md.get("EEPROM_UPDATE")
         if eeprom is None:
             notes.append("no EEPROM_UPDATE in metadata")
@@ -453,6 +468,16 @@ class ModuleService:
                 ok = False
         elif self.is_locked(rec) and not self.locked_to_our_key(rec):
             notes.append("warning: board OTP is locked to a different key (CUSTOMER_KEY_HASH " f"{rec['otp_key_hash']})")
+        if (not ok and expect.get("secure_boot_provision") and not reported_hash and not self.is_locked(rec)
+                and "pieeprom.bin" in self._served_names(result)):
+            # The board took program_pubkey=1 and the whole EEPROM image, then the run broke off before its
+            # report: it has most likely flashed the EEPROM and burnt our key hash into OTP. From now on its boot
+            # ROM only runs a counter-signed second stage, so the next stage 1 has to assume the lock.
+            self._suspect_lock(rec, "a secure stage 1 broke off after the board got program_pubkey=1 and the whole "
+                                    "pieeprom.bin, before its report")
+            notes.append("the board's OTP probably holds our key hash now (it got program_pubkey=1 and the whole "
+                         "EEPROM image before the run broke off): the next stage 1 assumes the lock and sends the "
+                         "counter-signed second stage; the board's own report settles it")
 
         usn = md.get("USER_SERIAL_NUM")
         if usn:
@@ -464,6 +489,65 @@ class ModuleService:
         if ok:
             rec["stage"] = _stage_max(rec["stage"], "eeprom")
         return ok
+
+    def _suspect_lock(self, rec: dict, why: str, rejected: list[str] | None = None) -> None:
+        lock = dict(rec["facts"].get("otp_lock") or {})
+        lock.update({"state": "suspected", "at": utc_now_iso(), "why": why})
+        if rejected is not None:
+            lock["rejected"] = rejected
+        rec["facts"]["otp_lock"] = lock
+        _add_event(rec, "otp_lock", f"assumed locked to our key: {why}")
+
+    @staticmethod
+    def _resolve_lock(rec: dict) -> None:
+        """The board reported its OTP key hash: assumptions and refusals are history."""
+        if rec["facts"].get("otp_lock"):
+            rec["facts"].pop("otp_lock", None)
+
+    def _second_stage_rejected(self, rec: dict, result: dict, notes: list[str]) -> bool:
+        """The page saw the boot ROM keep the second stage it was sent (no re-enumeration): the board's OTP
+        lock is not what the station assumed. Flip the assumption so the next run sends the other one."""
+        variant = str(result.get("recovery") or "").strip().lower()
+        if variant not in RECOVERY_VARIANTS:
+            notes.append("the boot ROM refused the second stage (the page did not say which one was sent)")
+            return False
+        lock = dict(rec["facts"].get("otp_lock") or {})
+        rejected = [v for v in lock.get("rejected", []) if v in RECOVERY_VARIANTS]
+        if variant not in rejected:
+            rejected.append(variant)
+        ours = rec["customer_key_hash"]
+        reported = str(rec["metadata"].get("CUSTOMER_KEY_HASH") or "").lower()
+        if len(rejected) == len(RECOVERY_VARIANTS):
+            lock.update({"state": "", "at": utc_now_iso(), "rejected": rejected,
+                         "why": "the boot ROM refused both the plain and the counter-signed second stage"})
+            rec["facts"]["otp_lock"] = lock
+            _add_event(rec, "otp_lock", "the boot ROM refused both second stages")
+            notes.append("the boot ROM refused both the plain and the counter-signed second stage: the board's OTP is "
+                         "locked to another key, or the board was not really in RPIBOOT mode (power button held while "
+                         "plugging in). Check it, then clear the state with 'modules mark-unlocked' or 'mark-locked'")
+            return False
+        if variant == "plain":
+            self._suspect_lock(rec, "the boot ROM refused the plain second stage, so its OTP holds a key hash",
+                               rejected)
+            notes.append("the boot ROM refused the plain second stage: the board's OTP holds a key hash (assumed to "
+                         "be ours). The next stage 1 sends the counter-signed second stage")
+            return False
+        if reported and reported == ours:
+            lock.update({"rejected": rejected})
+            rec["facts"]["otp_lock"] = lock
+            notes.append("the boot ROM refused the counter-signed second stage although the board reported our key "
+                         "hash before: check the USB cable and RPIBOOT mode, then try again")
+            return False
+        lock.update({"state": "", "at": utc_now_iso(), "rejected": rejected,
+                     "why": "the boot ROM refused the counter-signed second stage, so its OTP holds no key hash"})
+        rec["facts"]["otp_lock"] = lock
+        if self.locked_to_our_key(rec):        # only an operator mark says so; the board never did
+            rec["otp_key_hash"] = ""
+            rec["secure_boot_provisioned"] = rec["metadata"].get("SECURE_BOOT_PROVISION") == "success"
+        _add_event(rec, "otp_lock", "not locked: the boot ROM refused the counter-signed second stage")
+        notes.append("the boot ROM refused the counter-signed second stage: the board's OTP holds no key hash. The "
+                     "next stage 1 sends the plain second stage (and program_pubkey=1 in the secure scenario)")
+        return False
 
     @staticmethod
     def _served_names(result: dict) -> list[str]:
@@ -518,7 +602,10 @@ class ModuleService:
                     if isinstance(f, dict) and f.get("name"):
                         size = f.get("size")
                         served.append({"name": _clean_text(f["name"], 200), "size": size if isinstance(size, int) else None})
-            return {"files_served": served}
+            out: dict = {"files_served": served}
+            if result.get("second_stage_rejected"):
+                out["second_stage_rejected"] = _clean_text(result.get("recovery"), 32) or True
+            return out
         details = result.get("details") if isinstance(result.get("details"), dict) else {}
         flashed = details.get("flashed") if isinstance(details.get("flashed"), list) else []
         # Only what the station asked for is kept: whatever else the page sends (a passphrase, say) is not.
@@ -563,6 +650,7 @@ class ModuleService:
             prev = rec["otp_key_hash"] or "none"
             rec["otp_key_hash"] = rec["customer_key_hash"]
             rec["secure_boot_provisioned"] = True
+            self._resolve_lock(rec)
             text = f"operator marked OTP locked to our key {rec['customer_key_hash']} (was {prev})"
             _add_event(rec, "otp_override", f"{text}; {note}" if note else text)
             return self._save(rec)
@@ -575,6 +663,7 @@ class ModuleService:
             prev = rec["otp_key_hash"] or "none"
             rec["otp_key_hash"] = ""
             rec["secure_boot_provisioned"] = False
+            self._resolve_lock(rec)
             text = f"operator marked OTP unlocked (was {prev})"
             _add_event(rec, "otp_override", f"{text}; {note}" if note else text)
             return self._save(rec)
@@ -593,6 +682,25 @@ class ModuleService:
         ours = str(record.get("customer_key_hash") or "").strip().lower()
         return self.is_locked(record) and bool(ours) and h == ours
 
+    @staticmethod
+    def lock_assumption(record: dict) -> dict:
+        """``facts.otp_lock``: ``{"state": "suspected" | "", "why", "at", "rejected": [variant, ...]}`` -- what
+        the station assumes about the OTP lock while the board has not reported it (``{}`` when nothing)."""
+        facts = (record or {}).get("facts")
+        lock = facts.get("otp_lock") if isinstance(facts, dict) else None
+        return dict(lock) if isinstance(lock, dict) else {}
+
+    def lock_suspected(self, record: dict) -> bool:
+        """The station assumes the board OTP holds our key hash although no report said so (a secure stage 1
+        that broke off after the EEPROM was sent, or a boot ROM that refused the plain second stage)."""
+        return (not self.is_locked(record) and bool((record or {}).get("customer_key_hash"))
+                and self.lock_assumption(record).get("state") == "suspected")
+
+    def recovery_refused_both(self, record: dict) -> bool:
+        """The boot ROM refused both second stages since the board last reported its OTP."""
+        rej = self.lock_assumption(record).get("rejected") or []
+        return all(v in rej for v in RECOVERY_VARIANTS)
+
     def public_view(self, record: dict) -> dict:
         """The Module JSON of SPEC section 8. Never contains ``rsa_private_pem`` or ``device_secret``."""
         r = normalize_record(record)
@@ -603,7 +711,7 @@ class ModuleService:
             "stage_label": STAGE_LABELS.get(stage, stage),
             "mode": self.mode_of(r),
             "mode_chosen": r["mode"],
-            "mode_locked": self.is_locked(r) or r["secure_boot_provisioned"],
+            "mode_locked": self.is_locked(r) or r["secure_boot_provisioned"] or self.lock_suspected(r),
             "created": r["created"],
             "updated": r["updated"],
             "chip": r["chip"],
@@ -623,6 +731,8 @@ class ModuleService:
                 "locked": self.is_locked(r),
                 "locked_to_our_key": self.locked_to_our_key(r),
                 "secure_boot_provisioned": r["secure_boot_provisioned"],
+                "lock_suspected": self.lock_suspected(r),
+                "lock_note": self.lock_assumption(r).get("why", ""),
                 "device_key": bool(r["device_key_pem"]),
                 "device_key_fingerprint": _fingerprint(r["device_key_pem"]) if r["device_key_pem"] else "",
                 "device_key_exported": bool(r["device_private_pem"]),

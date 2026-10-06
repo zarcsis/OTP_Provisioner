@@ -42,6 +42,19 @@
     const toBase64 = (bytes) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
 
     class FlowAbort extends Error { constructor(msg) { super(msg || 'aborted by the operator'); this.name = 'FlowAbort'; } }
+    /**
+     * The boot ROM took the second stage (status 0) but kept it: it never left USB to run it. On a BCM2712 that
+     * means the OTP lock is not what the station assumed (a plain recovery.bin on a locked board, a counter-
+     * signed one on a board that is not locked to our key); the ROM stays put until the board is power-cycled.
+     */
+    class SecondStageRejected extends Error {
+        constructor(recovery) {
+            super(`the board's boot ROM refused the ${recovery ? recovery + ' ' : ''}second stage (bootcode5.bin): it took `
+                + 'the file but never left USB to run it, so its OTP lock is not what the station assumed');
+            this.name = 'SecondStageRejected';
+            this.recovery = recovery || null;
+        }
+    }
     class FlowCancelled extends Error { constructor(msg) { super(msg || 'cancelled by the operator'); this.name = 'FlowCancelled'; } }
 
     /** 8 hex (ROM) or 16 hex (gadget, last 8 used) → 8 lowercase hex; anything else → ''. */
@@ -76,6 +89,8 @@
                 fastbootTimeoutMs: 600000,   // waiting for the gadget (operator has to click)
                 pollMs: 1000,
                 needDeviceAfterMs: 6000,     // show "Select device" when no permitted device showed up by then
+                secondStageRejectMs: 15000,  // the ROM still on USB this long after taking the second stage: refused
+                busySettleMs: 12000,         // rpiboot file server: no request while the board writes the EEPROM / checks boot.img
                 buildPollMs: 3000,
                 eraseSettleMs: 3000,
                 fileServerIdleMs: 180000,    // rpiboot file server: give up when an attached board asks for nothing this long
@@ -90,6 +105,7 @@
             this.device = null;          // current USBDevice
             this.deviceKind = null;      // 'rpiboot' | 'fastboot'
             this.deviceStale = false;    // the board was handed control and re-enumerates: wait for a new USBDevice object
+            this._replugHint = null;     // what the stage card says while waiting for a board the operator has to replug
             this.probeInfo = null;
             this.running = false;
             this.aborted = false;
@@ -163,11 +179,12 @@
          * Wait for a device matching `match` (connect events, polling getDevices, or a device the operator
          * picks after onNeed). Resolves with the USBDevice.
          */
-        _waitForDevice({ match, timeoutMs, need, needAfterMs, what }) {
+        _waitForDevice({ match, timeoutMs, need, needAfterMs, what, giveUp }) {
             return new Promise((resolve, reject) => {
                 let done = false;
                 let timer = null;
                 let needTimer = null;
+                let giveUpTimer = null;
                 const waiter = {
                     match,
                     offer: (u) => { if (!done && u && match(u)) finish(resolve, u); },
@@ -178,12 +195,21 @@
                     done = true;
                     clearTimeout(timer);
                     clearTimeout(needTimer);
+                    clearTimeout(giveUpTimer);
                     this._waiters.delete(waiter);
                     if (need) this.hooks.onNeed(null, {});
                     fn(v);
                 };
                 this._waiters.add(waiter);
                 if (timeoutMs) timer = setTimeout(() => finish(reject, new Error(`timed out after ${Math.round(timeoutMs / 1000)} s waiting for ${what || 'the board'}`)), timeoutMs);
+                // giveUp = {afterMs, check: async () => bool, error: () => Error}: stop waiting when check() says so
+                if (giveUp && giveUp.afterMs) {
+                    giveUpTimer = setTimeout(async () => {
+                        let yes = false;
+                        try { yes = await giveUp.check(); } catch (e) { yes = false; }
+                        if (yes) finish(reject, giveUp.error());
+                    }, giveUp.afterMs);
+                }
                 if (need) {
                     const show = () => { if (!done) this.hooks.onNeed(need, { what }); };
                     if (!needAfterMs) show(); else needTimer = setTimeout(show, needAfterMs);
@@ -385,6 +411,7 @@
             this.running = true;
             this.aborted = false;
             this._confirmed = new Set();
+            this._replugHint = null;
             this.hooks.onBusy(true);
             this.log('info', `=== Provisioning ${this.serial}: stage${list.length > 1 ? 's' : ''} ${list.join(', ')} ===`);
             try {
@@ -429,20 +456,50 @@
 
         async _runStage(n) {
             this._setStage(n, 'running', 'starting…');
-            try {
-                if (n === 3) await this._fastbootStage();
-                else await this._rpibootStage(n);
-                return true;
-            } catch (e) {
-                let msg;
-                if (e instanceof FlowAbort || this.aborted) msg = 'aborted by the operator';
-                else if (e instanceof FlowCancelled) msg = e.message;
-                else if (isGone(e) || e instanceof DeviceGone) msg = `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (hold the power button while plugging in), click "Connect board", then "Provision" to resume from stage ${n}.`;
-                else msg = errText(e);
-                this.log('error', `Stage ${n} (${STAGE_TITLES[n]}) failed: ${msg}`);
-                this._setStage(n, 'failed', msg, e && e.verdict ? { verdict: e.verdict } : {});
-                return false;
+            let refusals = 0;
+            for (;;) {
+                try {
+                    if (n === 3) await this._fastbootStage();
+                    else await this._rpibootStage(n);
+                    return true;
+                } catch (e) {
+                    if (!this._retryAfterRefusal(n, e, refusals)) return this._stageFailed(n, e);
+                    refusals++;
+                }
             }
+        }
+
+        /**
+         * Stage 1 after the boot ROM refused its second stage: the server now assumes the other OTP lock state, so
+         * run once more with the other second stage as soon as the board is back in RPIBOOT (the operator unplugs
+         * it and plugs it in again with the power button held). Returns false when there is nothing to retry.
+         */
+        _retryAfterRefusal(n, e, refusals) {
+            if (!(e instanceof SecondStageRejected) || n !== 1 || refusals > 0 || this.aborted) return false;
+            const notes = (e.verdict && e.verdict.notes) || [];
+            if (notes.some((t) => /refused both/.test(t))) return false;
+            this.log('warn', `Stage 1: ${e.message}`);
+            for (const t of notes) this.log('info', `Stage 1: ${t}`);
+            const msg = 'the board refused the second stage: unplug it, hold the power button and plug it back in; '
+                + 'stage 1 then runs again with the other second stage';
+            this.log('warn', `Action needed: ${msg}`);
+            this._replugHint = msg;
+            this._setStage(n, 'waiting', msg, e.verdict ? { verdict: e.verdict } : {});
+            return true;
+        }
+
+        _stageFailed(n, e) {
+            let msg;
+            if (e instanceof FlowAbort || this.aborted) msg = 'aborted by the operator';
+            else if (e instanceof FlowCancelled) msg = e.message;
+            else if (isGone(e) || e instanceof DeviceGone) msg = `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (hold the power button while plugging in), click "Connect board", then "Provision" to resume from stage ${n}.`;
+            else msg = errText(e);
+            if (e instanceof SecondStageRejected && e.verdict && e.verdict.notes && e.verdict.notes.length) {
+                msg += `. ${e.verdict.notes.filter((t) => !/^page reported failure/.test(t)).join('. ')}`;
+            }
+            this.log('error', `Stage ${n} (${STAGE_TITLES[n]}) failed: ${msg}`);
+            this._setStage(n, 'failed', msg, e && e.verdict ? { verdict: e.verdict } : {});
+            return false;
         }
 
         async _manifest(n) {
@@ -470,8 +527,10 @@
         /** The board in RPIBOOT mode: the current device if still valid, else the next enumeration. */
         async _rpibootDevice(n) {
             if (this.device && this.deviceKind === 'rpiboot' && !this.deviceStale && (await this._isConnected(this.device))) return this.device;
-            this._setStage(n, 'waiting', 'waiting for the board in RPIBOOT mode…');
+            // after a refused second stage the operator's instruction (replug) stays on the card until the board is back
+            this._setStage(n, 'waiting', this._replugHint || 'waiting for the board in RPIBOOT mode…');
             const u = await this._waitRpiboot(this.deviceStale || this.deviceKind !== 'rpiboot' ? this.device : null);
+            this._replugHint = null;
             this._setDevice(u, 'rpiboot');
             return u;
         }
@@ -483,6 +542,26 @@
                 need: 'rpiboot',
                 needAfterMs: this.opt.needDeviceAfterMs,
                 what: `board ${this.serial} to re-enumerate (RPIBOOT)`,
+            });
+        }
+
+        /**
+         * After the ROM took the second stage: wait for the second stage to enumerate, but give up when the ROM
+         * device is still on USB secondStageRejectMs later (a second stage that runs makes it leave within a second
+         * or two; a refused one never does).
+         */
+        _waitSecondStage(previous, recovery) {
+            return this._waitForDevice({
+                match: (u) => isRpiboot(u) && u !== previous && this._sameBoard(u),
+                timeoutMs: this.opt.reenumTimeoutMs,
+                need: 'rpiboot',
+                needAfterMs: this.opt.needDeviceAfterMs,
+                what: `board ${this.serial} to re-enumerate as the second stage`,
+                giveUp: previous && this.opt.secondStageRejectMs ? {
+                    afterMs: this.opt.secondStageRejectMs,
+                    check: () => this._isConnected(previous),
+                    error: () => new SecondStageRejected(recovery),
+                } : null,
             });
         }
 
@@ -502,12 +581,14 @@
                 usb: this.usb,
                 idleTimeoutMs: this.opt.fileServerIdleMs,
                 retryMs: this.opt.fileServerRetryMs,
+                busySettleMs: this.opt.busySettleMs,
             });
             this.session = session;
             let out = null;
             let error = null;
             try {
-                out = await runSession(session, usb, (prev) => this._waitRpiboot(prev), {
+                out = await runSession(session, usb, (prev, o) => (o && o.secondStage
+                    ? this._waitSecondStage(prev, manifest.recovery) : this._waitRpiboot(prev)), {
                     log: (l, m) => this.log(l, m),
                     settleMs: this.opt.rpibootSettleMs,
                     onDevice: (u) => this._setDevice(u, 'rpiboot'),
@@ -521,6 +602,18 @@
             // finished): it re-enumerates and this USBDevice goes away. A run that failed before that (missing file,
             // server error, ...) leaves the board waiting in the same enumeration, and a retry must reuse it.
             this.deviceStale = !!(out || session.handedOff);
+            if (error instanceof SecondStageRejected) {
+                // Tell the server which second stage was refused: it flips what it assumes about the OTP lock.
+                const rr = await this.api.result(this.serial, n, {
+                    ok: false, metadata: {}, files_served: [], interrupted: false, error: errText(error),
+                    second_stage_rejected: true, recovery: manifest.recovery || null,
+                    expect: manifest.expect || { secure_boot_provision: false, customer_key_hash: null },
+                });
+                this._setModule(rr.module);
+                error.verdict = rr.verdict || null;
+                this.deviceStale = true;   // the refusing ROM enumeration is useless: wait for the board to come back
+                throw error;
+            }
             const r = out ? out.result : { metadata: session.metadata, filesServed: session.filesServed, interrupted: false };
             const collected = Object.keys(r.metadata || {}).length || r.filesServed.length;
             if (error && !collected) throw error;
@@ -734,6 +827,7 @@
     Flow.STAGE_INDEX = STAGE_INDEX;
     Flow.FASTBOOT_VARS = FASTBOOT_VARS;
     Flow.FlowAbort = FlowAbort;
+    Flow.SecondStageRejected = SecondStageRejected;
     Flow.FlowCancelled = FlowCancelled;
     OTP.Flow = Flow;
 })();

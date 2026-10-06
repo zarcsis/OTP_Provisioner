@@ -187,10 +187,24 @@
      * waits for the WebUSB connect event and calls step() again).
      * hooks: log, onProgress, onMetadata; usb (navigator.usb or a stand-in, used to tell a read timeout from a
      * disconnect; default navigator.usb), retryMs (1000, pause between failed reads), idleTimeoutMs (180000,
-     * give up when the file server has had no request for that long while the board stays attached).
+     * give up when the file server has had no request for that long while the board stays attached),
+     * busySettleMs (12000, see below).
+     *
+     * After pieeprom.bin, recovery.bin writes the EEPROM (and OTP) before it asks for anything again: 4 s for a
+     * signed image on a Pi 5 with rpiboot. After a signed boot.img the second stage checks it before it says Done
+     * (9-13 s). rpiboot just waits in one request (ep_read, 20 s timeout). Chrome on Windows ends a control
+     * transfer after ~5 s, and a request ended that way while the board is busy leaves it out of step: on ebbdf4fd
+     * (2026-10-06, secure scenario) recovery.bin answered one more request (USER_SERIAL_NUM) and then nothing for
+     * minutes, twice, while rpiboot.exe went through on the same board and files; after boot.img the board's last
+     * message came back garbled. So after pieeprom.bin and after any file of BUSY_FILE_BYTES or more, the page asks
+     * for nothing for busySettleMs; the board's request just waits for it (and a board that leaves USB meanwhile
+     * cuts the pause short).
      * `handedOff` is true once the device of the current step has been handed control (the whole second stage
      * was written to the ROM, or the file server received a request): that USBDevice is about to go away.
      */
+    /** A served file at least this big keeps the board busy before its next request (see RpiBootSession). */
+    const BUSY_FILE_BYTES = 1 << 20;
+
     class RpiBootSession {
         constructor(bootDir, hooks) {
             hooks = hooks || {};
@@ -201,6 +215,7 @@
             this.usb = hooks.usb !== undefined ? hooks.usb : (typeof navigator !== 'undefined' && navigator.usb) || null;
             this.retryMs = hooks.retryMs || 1000;
             this.idleTimeoutMs = hooks.idleTimeoutMs || 180000;
+            this.busySettleMs = typeof hooks.busySettleMs === 'number' ? hooks.busySettleMs : 12000;
             this.metadata = {};
             this.metadataOrder = [];
             this.filesServed = [];
@@ -349,7 +364,13 @@
                 this.log('debug', `← ${COMMAND_NAMES[command] || 'cmd ' + command}: ${fname || '(empty)'}`);
 
                 this.handedOff = true; // the board runs the second stage and moves on from here
-                if (fname.length === 0) { await dev.epWrite(null); break; }   // "Done can also just be null filename"
+                if (fname.length === 0) {
+                    // "Done can also just be null filename". rpiboot does not check this last ep_write either: the
+                    // board may already be on its way off USB (a gadget it was handed starts).
+                    if (command < 0 || command > 2) this.log('warn', `Garbled request from the board (command ${command}, no file name): taken as Done, as rpiboot does`);
+                    try { await dev.epWrite(null); } catch (e) { this.log('debug', `The reply to Done did not go through (${(e && e.message) || e}); the board is leaving USB`); }
+                    break;
+                }
 
                 if (fname[0] === '*' && command !== 2) {
                     this.addMetadata(fname.slice(1), metadataIndex++);
@@ -387,6 +408,13 @@
                             this.filesServed.push({ name: fname, size: total, origin: current.origin });
                             current = null;
                             if (sent !== total) throw new Error('Failed to write complete file to USB device');
+                            const eeprom = /^pieeprom\.bin$/i.test(fname);
+                            if ((eeprom || total >= BUSY_FILE_BYTES) && this.busySettleMs > 0) {
+                                const s = Math.round(this.busySettleMs / 1000);
+                                this.log('info', eeprom ? `The board writes the EEPROM now (and the OTP, with program_pubkey): next request in ${s} s`
+                                    : `The board checks and starts ${fname} now: next request in ${s} s`);
+                                await this._pause(this.busySettleMs);
+                            }
                         } else {
                             this.log('debug', `No file ${fname} found`);
                             await dev.epWrite(null);
@@ -477,7 +505,7 @@
             }
             if (r.kind === 'file-server-done') return { result: r, usb, serial };
             log('info', 'Waiting for the board to re-enumerate as the second stage…');
-            usb = await waitNext(usb);
+            usb = await waitNext(usb, { secondStage: true });   // the ROM was just handed the second stage
             session.handedOff = false; // nothing was handed to the new enumeration yet
             if (opts.onDevice) opts.onDevice(usb);
         }

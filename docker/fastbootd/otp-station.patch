@@ -14,6 +14,10 @@ the daemon in it only does what that page needs:
   eeprom-* and the other fwcrypto operations are refused;
 * oem cryptcheck <blkdev>: checks that the LUKS key the board derives from OTP opens the container
   (crypt_activate_by_passphrase without a name), so no decrypted device is ever created;
+* oem fwcrypto init and cryptcheck ask the firmware again instead of trusting the key status cached at
+  fastbootd's start: the otp-keyexport helper generates a blank slot's key later in the same boot (and
+  READ-locks it), and the stale cache made "fwcrypto init" try to generate it again ("Failed to provision
+  key: Unrecognized error code", ebbdf4fd, 2026-10-06);
 * USB only: "-i usb+tcp" from run_fastboot is ignored (the TCP data plane flashes and erases);
 * debian/gen-version.sh: OTP_FASTBOOTD_SUFFIX puts the build above the upstream version.
 
@@ -43,7 +47,7 @@ index 9b1632b..cf0f993 100755
  mapfile -t COMMITS < <(git rev-list ${BASELINE_COMMIT}^..HEAD 2>/dev/null || true)
  
 diff --git a/fastboot/device/commands.cpp b/fastboot/device/commands.cpp
-index e199e01..b686d13 100644
+index e199e01..95c5c57 100644
 --- a/fastboot/device/commands.cpp
 +++ b/fastboot/device/commands.cpp
 @@ -213,7 +213,6 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
@@ -54,7 +58,21 @@ index e199e01..b686d13 100644
          {FB_VAR_IPV4_ADDRESS, {GetIpv4Address, nullptr}},
          {FB_VAR_IPV4_GATEWAY, {GetIpv4Gateway, nullptr}},
          {FB_VAR_IPV4_NETMASK, {GetIpv4Netmask, nullptr}},
-@@ -1895,6 +1894,56 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
+@@ -1740,6 +1739,13 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
+             // strings to tell "the key is there" apart from "I failed to
+             // put one there."
+             auto status = crypto.GetCachedProvisioningStatus();
++            if (!(status && *status)) {
++                // OTP_Provisioner: the cache dates from fastbootd's start. The otp-keyexport helper generates the
++                // key of a blank slot after that, in the same boot (the station exports it before this), and has
++                // READ-locked it, so ProvisionKey() would fail with a code that is not KEY_NOT_BLANK. Ask again.
++                crypto.RefreshProvisioningStatus();
++                status = crypto.GetCachedProvisioningStatus();
++            }
+             if (status && *status) {
+                 return device->WriteOkay("Key already provisioned");
+             }
+@@ -1895,6 +1901,58 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
          return device->WriteOkay("eeprom-read: " + std::to_string(image.size()) +
                                   " bytes staged for upload");
      }
@@ -78,6 +96,8 @@ index e199e01..b686d13 100644
 +        }
 +        const std::string block_device = "/dev/" + args[2];
 +
++        // The key may have been generated after fastbootd started (otp-keyexport): do not trust the startup cache.
++        rpi::RpiFwCrypto::RefreshProvisioningStatus();
 +        std::string luks_key = generateLuksKeyFromPartition(block_device);
 +        if (luks_key.empty()) {
 +            return device->WriteFail("Cannot generate LUKS key - unsupported device type");
@@ -111,7 +131,7 @@ index e199e01..b686d13 100644
  } //namespace anonymous
  
  bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args) {
-@@ -1909,56 +1958,37 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
+@@ -1909,56 +1967,37 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
  
      // device->WriteInfo(message);
      std::vector<std::string> split_args = android::base::Split(args[0], " ");
@@ -198,7 +218,7 @@ index e199e01..b686d13 100644
      return device->WriteFail("Unknown OEM command.");
  }
  
-@@ -2082,10 +2112,22 @@ bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& ar
+@@ -2082,10 +2121,22 @@ bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& ar
      return device->WriteStatus(FastbootResult::FAIL, "Unable to set slot");
  }
  

@@ -264,8 +264,15 @@ switch is disabled for it). A board that already runs the gadget can be connecte
 If the cable is pulled, the page says which stage failed, and **Provision** resumes from there. Only one
 program may claim the USB interface: close `rpiboot`, `fastboot` and other tabs of the page.
 
-* **Long silences in stage 1 are normal.** recovery.bin can stay silent for longer than WinUSB's fixed ~5 s
-  transfer timeout while it writes the EEPROM or OTP (Chrome reports that as `NetworkError`). The page's
+* **Long silences in stages 1 and 2 are normal.** recovery.bin can stay silent for longer than WinUSB's fixed
+  ~5 s transfer timeout while it writes the EEPROM or OTP, and so can the second stage while it checks a signed
+  `boot.img` (9-13 s; Chrome reports a timeout as `NetworkError`). After `pieeprom.bin` and after any file of
+  1 MiB or more the page therefore asks for nothing for 12 s (`busySettleMs`; a board that leaves USB cuts the
+  pause short): rpiboot waits in one request for up to 20 s, and a request Chrome ended after 5 s while the board
+  was busy left it out of step on a Pi 5 in the secure scenario (recovery.bin: one more answer, then silence for
+  minutes, while rpiboot.exe went through on the same board and files 4 s after `pieeprom.bin`; after `boot.img`:
+  a garbled last message). Like rpiboot, the page does not check its reply to the final Done (the gadget may
+  already be starting). Otherwise the page's
   rpiboot file server retries every second for as long as the board is attached. It stops only when the board
   really left USB (disconnect event, device closed, or gone from `getDevices()`; the result is kept as
   interrupted with the metadata collected so far) or when an attached board asks for nothing for 180 s.
@@ -484,10 +491,25 @@ More rules of the secure scenario:
   assignment of the key is in `[all]` (or before the first section header) with exactly that value; otherwise
   every assignment is removed and the value is appended under a trailing `[all]`. Unsigned: any `SIGNED_BOOT`
   other than `0`, in any section, is removed with a note. Set `SIGNED_BOOT` only through the scenario.
-* **OTP burnt but the stage-1 report lost.** Run `python -m otp_server modules mark-locked <serial>`: it records
-  `otp_key_hash = customer_key_hash` and `secure_boot_provisioned = true`, so all later stages are served signed.
-  It never generates a key. `modules mark-unlocked <serial>` undoes it. When a server is running both send
-  the change through it (`POST /api/modules/{serial}/otp`).
+* **OTP burnt but the stage-1 report lost: the station works it out.** The BCM2712 boot ROM runs the plain
+  `recovery.bin` only while the OTP holds no key hash, and the one counter-signed with our key only once it holds
+  ours (usbboot `secure-boot-recovery5/README.md`); the wrong one it takes with status 0 and then keeps, silently.
+  So the station keeps an assumption in the record (`facts.otp_lock`, shown on the page as "probably locked …"):
+  * a secure stage 1 that broke off after the board got `program_pubkey=1` and the whole `pieeprom.bin`, with no
+    `CUSTOMER_KEY_HASH` in its report, makes the next stage 1 assume the lock (counter-signed second stage, no
+    second `program_pubkey`; the Open scenario is refused meanwhile);
+  * the page notices a refused second stage: the ROM is still on USB 15 s after taking it (a second stage that
+    runs makes it leave within a second or two). It reports which one was refused, the server flips the
+    assumption, the stage card asks to unplug the board and plug it back in with the power button held, and
+    stage 1 runs once more by itself with the other second stage;
+  * the board's own report (`CUSTOMER_KEY_HASH`) replaces the assumption; stages 2 and 3 never run on an
+    assumption. A board that refuses both second stages stops stage 1 with the reason (OTP locked to another
+    key, or not really in RPIBOOT mode).
+
+  This happened to ebbdf4fd on 2026-10-06. The manual override stays: `python -m otp_server modules mark-locked
+  <serial>` records `otp_key_hash = customer_key_hash` and `secure_boot_provisioned = true`, so all later stages
+  are served signed; it never generates a key. `modules mark-unlocked <serial>` undoes it. Both also clear the
+  assumption. When a server is running both send the change through it (`POST /api/modules/{serial}/otp`).
 * A board whose OTP is **locked to our key** always gets signed files: a counter-signed `bootcode5.bin`, a
   signed EEPROM, a `boot.sig` for the gadget, and a boot partition re-signed per board in stage 3.
 * A board **locked to a different key** is refused (HTTP 409, "board OTP is locked to a different key").

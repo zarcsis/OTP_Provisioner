@@ -128,8 +128,12 @@
         };
     }
 
-    /** Boot ROM: after the 4-byte status read it calls onBooted() (the board re-enumerates). */
-    function romDevice({ serial, retcode, onBooted }) {
+    /**
+     * Boot ROM: after the 4-byte status read it calls onBooted() (the board re-enumerates). accepts(bytes): the
+     * signature check of the second stage it was sent; false = a refusal as a real BCM2712 does it: status 0, then
+     * nothing (the ROM stays on USB and never runs it; `refused` is set).
+     */
+    function romDevice({ serial, retcode, onBooted, accepts }) {
         const d = rpiBase({ iSerial: 3, serial });
         d.kind = 'rom';
         d.controlTransferIn = async function (setup, length) {
@@ -140,7 +144,11 @@
                 this.events.push({ t: 'read', len: want });
                 if (want === 4) {
                     const b = new Uint8Array(4); new DataView(b.buffer).setInt32(0, retcode || 0, true);
-                    if (onBooted) setTimeout(onBooted, 5);
+                    const sent = new Uint8Array(this.bulk.reduce((a, c) => a + c.byteLength, 0));
+                    let at = 0;
+                    for (const c of this.bulk) { sent.set(c, at); at += c.byteLength; }
+                    if (accepts && !accepts(sent)) this.refused = true;
+                    else if (onBooted) setTimeout(onBooted, 5);
                     return { status: 'ok', data: new DataView(b.buffer) };
                 }
             }
@@ -544,7 +552,8 @@
     class MockBoard {
         constructor(hub, opts) {
             this.hub = hub;
-            this.o = Object.assign({ serial: 'a7eb274c', keyHash: 'ab'.repeat(32), program: true, fsSerial: '', fastboot: {}, stage1Timeouts: null }, opts || {});
+            // romAccepts(bytes): the boot ROM's check of the second stage (see romDevice); null = accept anything
+            this.o = Object.assign({ serial: 'a7eb274c', keyHash: 'ab'.repeat(32), program: true, fsSerial: '', fastboot: {}, stage1Timeouts: null, romAccepts: null }, opts || {});
             this.boots = 0;
             this.history = [];
             this.fb = null;
@@ -556,7 +565,7 @@
             }, delay || 5);
         }
         powerOnRom() {
-            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom) });
+            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), accepts: this.o.romAccepts });
             this.history.push('rom');
             this.hub.plug(rom);
             return rom;
@@ -596,7 +605,7 @@
             this._replace(rom, fs, 5);
         }
         _reboot(fs) {
-            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom) });
+            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), accepts: this.o.romAccepts });
             this._replace(fs, rom, 10);
         }
         _gadget(fs) {
@@ -749,7 +758,13 @@
             const notes = [];
             let ok = !!body.ok;
             if (body.interrupted) notes.push('run was interrupted'); // otp_server/modules.py record_result
-            if (n === 1) {
+            if (n === 1 && body.second_stage_rejected) {
+                // otp_server/modules.py _second_stage_rejected: flip what the station assumes about the OTP lock
+                ok = false;
+                this.lockAssumed = body.recovery === 'plain';
+                notes.push(this.lockAssumed ? 'the boot ROM refused the plain second stage: the board\'s OTP holds a key hash (assumed to be ours). The next stage 1 sends the counter-signed second stage'
+                    : 'the boot ROM refused the counter-signed second stage: the board\'s OTP holds no key hash');
+            } else if (n === 1) {
                 Object.assign(m.metadata, body.metadata || {});
                 if ((body.metadata || {}).EEPROM_UPDATE !== 'success') { ok = false; notes.push('no EEPROM_UPDATE in metadata'); }
                 const program = !!(body.expect && body.expect.secure_boot_provision);

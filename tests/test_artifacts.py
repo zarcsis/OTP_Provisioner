@@ -533,6 +533,34 @@ def test_stage1_locked_to_our_key(make_env, chosen):
     assert "counter-signed" in m["files"][0]["origin"]
 
 
+def test_stage1_after_an_interrupted_secure_run_assumes_the_lock(make_env):
+    env = make_env()
+    rec = env.board(mode="secure")
+    m0 = env.arts.stage_manifest(SERIAL, 1)
+    assert m0["recovery"] == "plain" and m0["expect"]["secure_boot_provision"] is True
+    # the board took program_pubkey=1 and the whole EEPROM, then the report never came (ebbdf4fd, 2026-10-06)
+    env.modules.record_result(SERIAL, 1, {
+        "ok": False, "interrupted": True, "metadata": {}, "expect": m0["expect"],
+        "files_served": [{"name": "config.txt", "size": 72}, {"name": "pieeprom.sig", "size": 80},
+                         {"name": "pieeprom.bin", "size": 2097152}]})
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["recovery"] == "countersigned" and m["mode"] == "signed" and m["irreversible"] == []
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}   # no second program_pubkey
+    assert any("probably holds our key hash" in n for n in m["notes"])
+    assert base_env(env.docker.runs_of("stage1.sh")[-1])["SIGN_RECOVERY"] == "1"
+    # stages 2 and 3 still wait for the board's own report
+    with pytest.raises(NotReady, match="run stage 1 first"):
+        env.arts.stage_manifest(SERIAL, 2)
+    # the boot ROM refuses the counter-signed one too after the plain one: stage 1 stops and says why
+    for variant in ("countersigned", "plain"):
+        env.modules.record_result(SERIAL, 1, {"ok": False, "files_served": [], "second_stage_rejected": True,
+                                              "recovery": variant})
+    with pytest.raises(NotReady, match="refused both"):
+        env.arts.stage_manifest(SERIAL, 1)
+    env.modules.mark_unlocked(SERIAL)
+    assert env.arts.stage_manifest(SERIAL, 1)["recovery"] == "plain"
+
+
 def test_stage1_jtag_lock_follows_the_scenario(make_env):
     env = make_env(provisioning={"jtag_lock": True})
     env.board()                                           # open: jtag_lock does not apply
@@ -1328,6 +1356,16 @@ def test_fastbootd_patch_allows_what_the_page_sends():
     assert top == {"download", "upload", "getvar", "shutdown", "reboot", "erase", "flash", "oem"}
     # shutdown powers off for real (upstream only paused the daemon)
     assert 'execlp("systemctl", "systemctl", "poweroff", nullptr);' in cmds
+    # fwcrypto init and cryptcheck do not trust the key status cached at startup: otp-keyexport generates a blank
+    # slot's key later in the same boot (ebbdf4fd, 2026-10-06: "Failed to provision key: Unrecognized error code")
+    assert ("            if (!(status && *status)) {\n" in cmds and
+            "                crypto.RefreshProvisioningStatus();\n"
+            "                status = crypto.GetCachedProvisioningStatus();\n"
+            "            }\n"
+            "            if (status && *status) {\n"
+            '                return device->WriteOkay("Key already provisioned");\n' in cmds)
+    check = cmds.split("static bool oem_cmd_cryptcheck(", 1)[1].split("generateLuksKeyFromPartition(", 1)[0]
+    assert "rpi::RpiFwCrypto::RefreshProvisioningStatus();" in check
 
     js = (REAL_REPO / "js" / "fastboot.js").read_text(encoding="utf-8")
     sent_oem = set(re.findall(r"this\.oem\([`']([a-z-]+)", js))

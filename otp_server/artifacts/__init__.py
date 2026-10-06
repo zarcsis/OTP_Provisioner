@@ -129,10 +129,20 @@ class Artifacts:
                            "hash yet: run stage 1 first (signed EEPROM + program_pubkey)")
         secrets_fn = lambda: self.modules.secrets_for(serial)  # noqa: E731
         if stage == 1:
-            plan = self.stage1.plan(record, locked_to_ours=ours, secure=secure)
+            if self.modules.recovery_refused_both(record):
+                raise NotReady(f"board {serial}: its boot ROM refused both the plain and the counter-signed second "
+                               "stage. Its OTP is locked to another key, or it was not in RPIBOOT mode (power button "
+                               "held while plugging in). Check the board, then 'python -m otp_server modules "
+                               f"mark-unlocked {serial}' (or mark-locked) to try again")
+            # A lock the station only assumes (the board has not reported it yet) changes the second stage only:
+            # stages 2 and 3 still wait for the board's own report.
+            assumed = not ours and self.modules.lock_suspected(record)
+            plan = self.stage1.plan(record, locked_to_ours=ours or assumed, secure=secure)
             self.stage1.ensure(plan, serial, secrets_fn)
             files = self.stage1.files(plan)
-            return self.stage1.manifest(plan, record, files, base_url), {f.name: f.path for f in files}
+            manifest = self.stage1.manifest(plan, record, files, base_url,
+                                            assumed_lock=self.modules.lock_assumption(record).get("why", "") if assumed else "")
+            return manifest, {f.name: f.path for f in files}
         if stage == 2:
             return self.gadget.stage2(record, signed=ours, secure=secure, secrets_fn=secrets_fn, base_url=base_url)
         if stage == 3:

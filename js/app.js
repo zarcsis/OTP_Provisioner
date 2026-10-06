@@ -312,7 +312,9 @@
         const live = flow.module && flow.module.serial === m.serial;
         const sec = m.secrets || {};
         const otp = m.otp || {};
-        const otpText = otp.locked ? (otp.locked_to_our_key ? 'locked to this board\'s key' : 'LOCKED TO A DIFFERENT KEY') : 'not locked (OTP key hash empty)';
+        const otpText = otp.locked ? (otp.locked_to_our_key ? 'locked to this board\'s key' : 'LOCKED TO A DIFFERENT KEY')
+            : otp.lock_suspected ? `probably locked to this board's key (not confirmed yet: ${otp.lock_note || 'see events'})`
+                : 'not locked (OTP key hash empty)';
         const modeText = m.mode ? `${m.mode}${m.mode_chosen ? '' : ' (default)'}${m.mode_locked ? ' · OTP locked: secure only' : ''}` : '';
         const events = (m.events || []).slice(-8).reverse();
         box.replaceChildren(

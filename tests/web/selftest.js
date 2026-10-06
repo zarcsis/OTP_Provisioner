@@ -112,6 +112,49 @@
 
         // ================================================================ T4 rpiboot session with mock devices
         section = 'rpiboot';
+        {
+            // after pieeprom.bin the page asks for nothing while recovery.bin writes the EEPROM (a request Chrome
+            // ends after ~5 s on Windows left recovery.bin silent on ebbdf4fd; rpiboot waits up to 20 s instead)
+            const lines = [];
+            const fsE = T.fsDevice({ serial: 'a7eb274c', script: [
+                { cmd: 0, name: 'pieeprom.bin' }, { cmd: 1, name: 'pieeprom.bin' },
+                { cmd: 0, name: '*EEPROM_UPDATE*success' }, { cmd: 2, name: '' },
+            ] });
+            const readAt = [];
+            const inner = fsE.controlTransferIn.bind(fsE);
+            fsE.controlTransferIn = async (setup, len) => { if (setup.requestType === 'vendor') readAt.push(Date.now()); return inner(setup, len); };
+            const sE = new OTP.rpiboot.RpiBootSession(stage1, { log: (l, m) => lines.push(l + ': ' + m), busySettleMs: 300 });
+            const dE = new OTP.rpiboot.RpiDevice(fsE);
+            const rE = await sE.step(dE);
+            eq(rE.kind + ':' + rE.metadata.EEPROM_UPDATE, 'file-server-done:success', 'busySettleMs: the run completes');
+            assert(readAt.length >= 3 && readAt[2] - readAt[1] >= 280, 'no request for busySettleMs after pieeprom.bin', JSON.stringify(readAt.map((t) => t - readAt[0])));
+            assert(lines.some((l) => /writes the EEPROM now.*next request in 0 s/.test(l)), 'the pause is logged', lines.join(' | '));
+            const sD = new OTP.rpiboot.RpiBootSession(stage1, {});
+            eq(sD.busySettleMs, 12000, 'busySettleMs defaults to 12 s');
+        }
+        {
+            // after a big boot.img the board checks it before Done; its last message can come back garbled and the
+            // reply to it fail while the gadget starts (ebbdf4fd, stage 2): rpiboot ignores that last ep_write too
+            const lines = [];
+            const big = new Uint8Array((1 << 20) + 16).fill(7);
+            const dirB = OTP.BootDir.fromEntries('b', [{ path: 'bootcode5.bin', file: mk('bootcode5.bin', new Uint8Array(100)) },
+                { path: 'boot.img', file: mk('boot.img', big) }]);
+            const fsB = T.fsDevice({ serial: 'a7eb274c', script: [{ cmd: 0, name: 'boot.img' }, { cmd: 1, name: 'boot.img' }, { cmd: -597934592, name: '' }] });
+            const readAt = [];
+            const innerIn = fsB.controlTransferIn.bind(fsB);
+            fsB.controlTransferIn = async (setup, len) => { if (setup.requestType === 'vendor') readAt.push(Date.now()); return innerIn(setup, len); };
+            const innerOut = fsB.controlTransferOut.bind(fsB);
+            let outs = 0;
+            fsB.controlTransferOut = async (setup) => {
+                if (++outs >= 3) throw new DOMException('A transfer error has occurred.', 'NetworkError');   // the Done reply
+                return innerOut(setup);
+            };
+            const sB = new OTP.rpiboot.RpiBootSession(dirB, { log: (l, m) => lines.push(l + ': ' + m), busySettleMs: 300 });
+            const rB = await sB.step(new OTP.rpiboot.RpiDevice(fsB));
+            eq(rB.kind + ':' + rB.filesServed.map((f) => f.name).join(','), 'file-server-done:boot.img', 'a failed reply to the last (garbled) Done is not a failure');
+            assert(readAt.length >= 3 && readAt[2] - readAt[1] >= 280, 'no request for busySettleMs after a file of 1 MiB or more', JSON.stringify(readAt.map((t) => t - readAt[0])));
+            assert(lines.some((l) => /checks and starts boot\.img now/.test(l)) && lines.some((l) => /Garbled request/.test(l)), 'both are logged', lines.join(' | '));
+        }
         const logLines = [];
         const hooks = { log: (l, m) => logLines.push(l + ': ' + m) };
         const rom = T.romDevice({ serial: 'a7eb274c' });
@@ -859,7 +902,7 @@
             });
             return { files, m1, m2, m3, m1open, m3open };
         }
-        const FLOW_OPTS = { reenumTimeoutMs: 20000, fastbootTimeoutMs: 20000, pollMs: 25, needDeviceAfterMs: 150, buildPollMs: 60, eraseSettleMs: 10, fileServerRetryMs: 20, rpibootSettleMs: 20 };
+        const FLOW_OPTS = { reenumTimeoutMs: 20000, fastbootTimeoutMs: 20000, pollMs: 25, needDeviceAfterMs: 150, buildPollMs: 60, eraseSettleMs: 10, fileServerRetryMs: 20, rpibootSettleMs: 20, busySettleMs: 20 };
         function makeFlow(api, hub, ev, extraOpts) {
             let flow = null;
             flow = new OTP.Flow({
@@ -1020,6 +1063,74 @@
 
         // ================================================================ T10 Flow: failure paths
         section = 'flow-errors';
+        {
+            // ebbdf4fd, 2026-10-06: a secure stage 1 broke off after the board had burnt our key hash, and the station
+            // still sent the plain second stage. The ROM takes it (status 0) and keeps it; the page notices the ROM
+            // never leaves USB, the server flips its assumption, the operator replugs the board, stage 1 runs again
+            // with the counter-signed second stage and the board reports its OTP.
+            const { files, m1 } = await buildServerFiles();
+            const plainBc = T.bytesOf(1000, 41);                          // m1's bootcode5.bin
+            const csBc = T.bytesOf(1000, 47);
+            const csUrl = '/api/modules/a7eb274c/stage/1/files/cs/bootcode5.bin';
+            files.set(csUrl, csBc);
+            const m1plain = Object.assign({}, m1, { recovery: 'plain' });
+            const m1cs = Object.assign({}, m1, {
+                recovery: 'countersigned', irreversible: [], expect: { secure_boot_provision: false, customer_key_hash: null },
+                files: [{ name: 'bootcode5.bin', size: csBc.byteLength, sha256: await sha(csBc), url: csUrl, origin: 'test' }, ...m1.files.slice(1)],
+            });
+            let api = null;
+            api = new T.FakeApi({ files, manifests: { 1: () => (api.lockAssumed ? m1cs : m1plain), 2: null, 3: null } });
+            const hub = new T.MockHub();
+            const same = (a, b) => a.byteLength === b.byteLength && a.every((x, i) => x === b[i]);
+            // the ROM gets the boot message, then the file: it runs only the counter-signed bootcode5.bin
+            const board = new T.MockBoard(hub, { serial: 'a7eb274c', keyHash: KEYHASH,
+                romAccepts: (b) => b.byteLength >= csBc.byteLength && same(b.subarray(b.byteLength - csBc.byteLength), csBc) });
+            const rom = board.powerOnRom();
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { secondStageRejectMs: 300 });
+            await flow.connectBoard();
+            const run = flow.provision([1]);
+            // the operator: once the page asks, unplug the stuck board and plug it back in with the button held
+            const t0 = Date.now();
+            while (!(flow.stages[1].state === 'waiting' && /refused the second stage/.test(flow.stages[1].detail)) && Date.now() - t0 < 10000) await T.sleep(20);
+            eq(rom.refused, true, 'refusal: the ROM kept the plain second stage (status 0, never left USB)');
+            assert(/unplug it, hold the power button and plug it back in/.test(flow.stages[1].detail), 'the page asks for a replug', flow.stages[1].detail);
+            const r1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
+            eq(r1 && `${r1[3].second_stage_rejected}:${r1[3].recovery}:${r1[3].ok}`, 'true:plain:false', 'the refusal is reported with the second stage that was sent');
+            hub.unplug(rom);
+            await T.sleep(50);
+            board.powerOnRom();
+            const ok = await run;
+            eq(ok, true, 'stage 1 then succeeds with the counter-signed second stage');
+            if (!ok) results.push('  refusal flow log:\n    ' + ev.logs.slice(-15).join('\n    '));
+            const rs = api.calls.filter((c) => c[0] === 'result' && c[2] === 1);
+            eq(rs.length, 2, 'two stage-1 results: the refusal and the run');
+            eq(rs[1] && rs[1][3].ok && rs[1][3].metadata.CUSTOMER_KEY_HASH, KEYHASH, '… and the board reports its OTP key hash');
+            eq(ev.confirms.length, 1, 'no second confirmation: the counter-signed run burns nothing');
+            assert(ev.logs.some((l) => /refused the plain second stage/.test(l)), 'the server\'s explanation is logged');
+        }
+        {
+            // the other second stage is refused too: no endless retry, the stage fails with the server's reason
+            const { files, m1 } = await buildServerFiles();
+            let api = null;
+            api = new T.FakeApi({ files, manifests: { 1: () => Object.assign({}, m1, { recovery: api.lockAssumed ? 'countersigned' : 'plain' }), 2: null, 3: null } });
+            const hub = new T.MockHub();
+            const board = new T.MockBoard(hub, { romAccepts: () => false });
+            let rom = board.powerOnRom();
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { secondStageRejectMs: 200 });
+            await flow.connectBoard();
+            const run = flow.provision([1]);
+            const t0 = Date.now();
+            while (!(flow.stages[1].state === 'waiting' && /refused/.test(flow.stages[1].detail)) && Date.now() - t0 < 10000) await T.sleep(20);
+            hub.unplug(rom);
+            await T.sleep(50);
+            rom = board.powerOnRom();
+            eq(await run, false, 'refused twice → stage 1 fails (one automatic retry only)');
+            eq(flow.stages[1].state, 'failed', 'stage 1 failed');
+            assert(/refused the countersigned second stage/.test(flow.stages[1].detail), 'the failure names the refused second stage', flow.stages[1].detail);
+            eq(api.calls.filter((c) => c[0] === 'result' && c[2] === 1).map((c) => c[3].recovery).join(','), 'plain,countersigned', 'both refusals reported');
+        }
         {
             const { files, m2, m3 } = await buildServerFiles();
             const api = new T.FakeApi({ files, manifests: { 1: { ready: false, reason: 'board OTP is locked to a different key (CUSTOMER_KEY_HASH 1234…)', job: null }, 2: m2, 3: m3 } });

@@ -234,6 +234,94 @@ def test_stage1_secure_boot(module_service):
     assert v["ok"] is True and rec["secure_boot_provisioned"] is True
 
 
+# ---------------------------------------------------------------------- an OTP lock the board has not reported
+SECURE_SERVED = [{"name": "config.txt", "size": 72}, {"name": "pieeprom.sig", "size": 80},
+                 {"name": "pieeprom.bin", "size": 2097152}]
+
+
+def _interrupted_secure_run(ms, serial="a7eb274c", served=SECURE_SERVED):
+    rec = ms.require(serial)
+    expect = {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]}
+    return ms.record_result(serial, 1, s1({}, ok=False, expect=expect, interrupted=True, files_served=served))
+
+
+def test_an_interrupted_secure_stage1_after_the_eeprom_assumes_the_lock(module_service):
+    ms = module_service
+    ms.hello("a7eb274c")
+    ms.set_mode("a7eb274c", "secure")
+    # ebbdf4fd, 2026-10-06: program_pubkey=1 and the whole EEPROM went out, the report never came back
+    rec, v = _interrupted_secure_run(ms)
+    assert v["ok"] is False and any("probably holds our key hash" in n for n in v["notes"])
+    assert ms.lock_suspected(rec) and not ms.is_locked(rec) and not ms.locked_to_our_key(rec)
+    assert ms.lock_assumption(rec)["state"] == "suspected" and "pieeprom.bin" in ms.lock_assumption(rec)["why"]
+    assert rec["events"][-2]["kind"] == "otp_lock" and rec["events"][-1]["kind"] == "stage1"
+    view = ms.public_view(rec)
+    assert view["otp"]["lock_suspected"] is True and view["otp"]["lock_note"] and view["mode_locked"] is True
+    assert ms.mode_of(rec) == "secure"
+    with pytest.raises(ValueError, match="probably holds"):
+        ms.set_mode("a7eb274c", "open")
+    # the board reports its OTP at the next stage 1 (counter-signed second stage, no program_pubkey): settled
+    rec, v = ms.record_result("a7eb274c", 1, s1(md_ok(CUSTOMER_KEY_HASH=rec["customer_key_hash"])))
+    assert v["ok"] is True and ms.locked_to_our_key(rec) and not ms.lock_suspected(rec)
+    assert "otp_lock" not in rec["facts"]
+
+
+@pytest.mark.parametrize("served, mode", [
+    (SECURE_SERVED[:1], "secure"),                       # the board never got the EEPROM: nothing was written
+    (SECURE_SERVED, "open"),                             # no program_pubkey: OTP untouched
+])
+def test_other_broken_runs_assume_nothing(module_service, served, mode):
+    ms = module_service
+    ms.hello("a7eb274c")
+    ms.set_mode("a7eb274c", mode)
+    rec = ms.require("a7eb274c")
+    expect = ({"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]} if mode == "secure"
+              else None)
+    rec, v = ms.record_result("a7eb274c", 1, s1({}, ok=False, expect=expect, interrupted=True, files_served=served))
+    assert v["ok"] is False and not ms.lock_suspected(rec) and "otp_lock" not in rec["facts"]
+
+
+def test_a_refused_second_stage_flips_the_assumption(module_service):
+    ms = module_service
+    ms.hello("a7eb274c")
+    ms.set_mode("a7eb274c", "secure")
+
+    def refused(variant):
+        return ms.record_result("a7eb274c", 1, s1({}, ok=False, error="refused", files_served=[],
+                                                  second_stage_rejected=True, recovery=variant))
+
+    rec, v = refused("plain")                         # the ROM wants a counter-signed second stage: locked
+    assert v["ok"] is False and ms.lock_suspected(rec) and any("refused the plain" in n for n in v["notes"])
+    assert rec["facts"]["stage1"]["second_stage_rejected"] == "plain"
+    rec, v = refused("countersigned")                 # ... but not to our key either: both refused
+    assert not ms.lock_suspected(rec) and ms.recovery_refused_both(rec)
+    assert any("refused both" in n for n in v["notes"])
+    rec = ms.mark_unlocked("a7eb274c")                # the operator checked the board: start over
+    assert not ms.recovery_refused_both(rec) and "otp_lock" not in rec["facts"]
+
+    rec, v = _interrupted_secure_run(ms)              # assumed locked ...
+    rec, v = refused("countersigned")                 # ... the ROM says no: plain + program_pubkey next time
+    assert not ms.lock_suspected(rec) and not ms.recovery_refused_both(rec)
+    assert any("holds no key hash" in n for n in v["notes"]) and ms.mode_of(rec) == "secure"
+    _, v = refused("bogus")
+    assert any("did not say which" in n for n in v["notes"])
+
+
+def test_a_refused_countersigned_stage_undoes_only_an_operator_mark(module_service):
+    ms = module_service
+    ms.hello("a7eb274c")
+    rec = ms.mark_locked("a7eb274c")                   # the operator's guess, never confirmed by the board
+    rec, _ = ms.record_result("a7eb274c", 1, s1({}, ok=False, files_served=[], second_stage_rejected=True,
+                                                recovery="countersigned"))
+    assert not ms.is_locked(rec) and rec["secure_boot_provisioned"] is False
+    # the board itself reported our key hash: a refusal does not overrule that
+    ours = rec["customer_key_hash"]
+    ms.record_result("a7eb274c", 1, s1(md_ok(CUSTOMER_KEY_HASH=ours, SECURE_BOOT_PROVISION="success")))
+    rec, v = ms.record_result("a7eb274c", 1, s1({}, ok=False, files_served=[], second_stage_rejected=True,
+                                                recovery="countersigned"))
+    assert ms.locked_to_our_key(rec) and any("USB cable" in n for n in v["notes"])
+
+
 def test_stage1_warns_when_locked_to_foreign_key(module_service):
     module_service.hello("a7eb274c")
     _, v = module_service.record_result("a7eb274c", 1, s1(md_ok(CUSTOMER_KEY_HASH="cd" * 32)))
@@ -300,7 +388,7 @@ def test_public_view(module_service):
     assert view["secrets"] == {"rsa_key": True, "customer_key_hash": rec["customer_key_hash"], "device_secret": True,
                                "rsa_key_fingerprint": public_key_fingerprint(rec["rsa_public_pem"])}
     assert view["otp"] == {"customer_key_hash": ZERO_HASH, "locked": False, "locked_to_our_key": False,
-                           "secure_boot_provisioned": False, "device_key": True,
+                           "secure_boot_provisioned": False, "lock_suspected": False, "lock_note": "", "device_key": True,
                            "device_key_fingerprint": public_key_fingerprint(EC_PEM),
                            "device_key_exported": False}
     assert view["events"][-1]["kind"] == "device_key"

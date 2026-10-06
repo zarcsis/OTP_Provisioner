@@ -345,7 +345,8 @@ class Stage1Builder:
             self.hashes.stage_file("config.txt", plan.dir / "config.txt", "generated"),
         ]
 
-    def manifest(self, plan: Stage1Plan, record: dict, files: list[StageFile], base_url: str) -> dict:
+    def manifest(self, plan: Stage1Plan, record: dict, files: list[StageFile], base_url: str,
+                 assumed_lock: str = "") -> dict:
         serial = str(record.get("serial") or "")
         irreversible = []
         if plan.program_pubkey:
@@ -357,6 +358,9 @@ class Stage1Builder:
             notes.append("unsigned EEPROM update; OTP is not changed in this stage")
         elif plan.program_pubkey:
             notes.append("signed EEPROM; program_pubkey=1 locks this board to its key (IRREVERSIBLE)")
+        elif assumed_lock:
+            notes.append(f"the board's OTP probably holds our key hash already ({assumed_lock}): signed EEPROM and "
+                         "counter-signed recovery; if the boot ROM refuses it, the next run sends the plain one")
         else:
             notes.append("board OTP is already locked to our key: signed EEPROM and counter-signed recovery")
         notes.extend(plan.warnings)
@@ -366,6 +370,8 @@ class Stage1Builder:
             "title": "EEPROM & OTP",
             "ready": True,
             "mode": plan.mode,
+            # which second stage bootcode5.bin is (the page reports it back when the boot ROM refuses it)
+            "recovery": "countersigned" if plan.sign_recovery else "plain",
             "files": [f.to_dict(file_url(base_url, serial, 1, f.name)) for f in files],
             "config_txt": plan.config_txt,
             "irreversible": irreversible,
