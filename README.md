@@ -29,10 +29,11 @@ In every scenario a board goes through the same three stages:
 | 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with our build of rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` + `docker/fastbootd` | `gadget` |
 | 3 · Image | Page drives rpi-fastbootd: (secure) device key export → stage-3 manifest again (the server encrypts the root for the board) → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / (secure) `oem cryptcheck` / `idpdone`) → `shutdown` (the board powers off). | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants | `flashed` |
 
-Status: the open scenario has provisioned a real Pi 5 end to end (stages 1-3). **The secure scenario has not
-been run on a real board yet** (the signed boot chain, the device key export, the encrypted image), and
-neither has an image with Wi-Fi, account and SSH settings: those are checked in the built root filesystem,
-not on a board.
+Status: both scenarios have provisioned a real Pi 5 end to end (stages 1-3, board `ebbdf4fd`, 2026-10-06):
+the open one with Wi-Fi, account and SSH set up at first boot, and the secure one with the signed boot
+chain, the locked OTP, the exported device key, the station-built encrypted root (`oem cryptcheck` →
+keyslot 0) and the power-off at the end. The notes on what the first secure run needed are in CLAUDE.md
+("What went wrong").
 
 ## Requirements
 
