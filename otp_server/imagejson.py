@@ -200,6 +200,70 @@ def simage_partition_size(image_json: dict, simage: str) -> int | None:
 #: Suffix of the simage a station-built LUKS container gets in place of its plain file system's.
 STATION_LUKS_SUFFIX = ".luks.sparse"
 
+#: LUKS2 parameters of the container a custom image's root goes into (as rpi-image-gen's crypt map has them).
+CUSTOM_LUKS = {"key_size": 512, "cipher": "aes-xts-plain64", "label": "OSROOT_CRYPT", "hash": "sha256", "etype": "raw"}
+
+
+def custom_image_json(facts: dict, *, name: str, version: str, luks: dict | None = None) -> dict:
+    """The IDP document of an operator's own image, from what ``custom-image.sh`` found in it
+    (``custom.json``: the MBR, the two partitions, the boot and root sparse images).
+
+    Clear (``luks`` None): the image as it is -- the same disk identifier (``PARTUUID``s in its fstab and
+    cmdline.txt keep working), each partition as large as in the image, the first one at the image's own
+    offset (``image-palign-bytes``), nothing grown. Crypt (``luks`` = ``{"uuid", "mname"}``): the root as
+    an encrypted block the station fills per board (:func:`station_luks`), growing to fill the card.
+    """
+    disk = facts.get("disk") or {}
+    parts = facts.get("partitions") or []
+    if disk.get("label") != "dos" or len(parts) != 2:
+        raise ValueError("custom.json: expected an MBR image with two partitions")
+    p1, p2 = parts
+    boot, root = facts.get("boot") or {}, facts.get("root") or {}
+    first = int(p1["start"]) * 512
+    align = first if first and first % (1024 * 1024) == 0 and first <= 64 * 1024 * 1024 else 4 * 1024 * 1024
+    boot_size = int(boot["bytes"])
+    root_size = int(root["fs_bytes"]) if luks else int(p2["sectors"]) * 512
+    images = {
+        "boot": {"name": "boot", "in-partition-table": "true", "size": boot_size,
+                 "mountpoint": boot.get("mountpoint") or "/boot/firmware", "partition-type": f"0x{int(p1['type'], 16):X}",
+                 "image": "boot.vfat", "bootable": "true", "type": "vfat", "fs_label": p1.get("fs_label") or "",
+                 "fs_uuid": p1.get("fs_uuid") or "", "simage": str(boot["simage"])},
+        "root": {"name": "root", "in-partition-table": "true", "size": root_size, "mountpoint": "/",
+                 "partition-type": "0x83", "image": "root.ext4", "type": "ext4", "fs_label": p2.get("fs_label") or "",
+                 "fs_uuid": p2.get("fs_uuid") or "", "simage": str(root["simage"])},
+    }
+    if luks:
+        pmap = [{"attributes": {"PMAPversion": "1.3.0", "system_type": "flat"}},
+                {"partitions": [{"image": "boot", "comment": "the image's boot partition"}]},
+                {"encrypted": {"expand-to-fit": True,
+                               "luks2": dict(CUSTOM_LUKS, uuid=str(luks["uuid"]), mname=str(luks["mname"])),
+                               "partitions": [{"image": "root", "comment": "the image's root file system, encrypted",
+                                               "expand-to-fit": True}]}}]
+    else:
+        pmap = [{"attributes": {"PMAPversion": "1.2.0", "system_type": "flat"}},
+                {"partitions": [{"image": "boot", "comment": "the image's boot partition"},
+                                {"image": "root", "comment": "the image's root file system"}]}]
+    return {
+        "IGversion": "2.2.0",
+        "IGmeta": {"IGconf_device_class": "pi5", "IGconf_device_storage_type": "sd", "IGconf_device_sector_size": 512,
+                   "IGconf_device_variant": "none", "IGconf_image_version": str(version)},
+        "attributes": {"image-name": str(name), "image-size": int(disk.get("bytes") or 0) or boot_size + root_size,
+                       "image-palign-bytes": f"{align // (1024 * 1024)}M"},
+        "layout": {"partitiontable": {"label": "dos", "id": str(disk.get("id") or "")},
+                   "partitionimages": images, "provisionmap": pmap},
+    }
+
+
+def partition_order(image_json: dict) -> list[str]:
+    """Partition names (``partitionimages`` keys) in disk order, as the provisionmap lists them (top level
+    and inside encrypted containers); only flat maps."""
+    out: list[str] = []
+    for ref in _walk_refs(provisionmap(image_json)):
+        name = str(ref.get("image") or "")
+        if name and name not in out:
+            out.append(name)
+    return out
+
 
 def station_luks(image_json: dict, data_offset: int) -> tuple[dict, list[dict]]:
     """The image.json a board gets when the station builds its LUKS containers, and those containers.

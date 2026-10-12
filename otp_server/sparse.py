@@ -112,6 +112,88 @@ def sparse_info(path: str | Path) -> dict:
     }
 
 
+def data_chunks(path: str | Path) -> tuple[int, int, list[tuple[int, int, int, int, bytes]]]:
+    """``(block_size, total_blocks, [(first_block, blocks, type, payload offset, fill word)])`` of the RAW
+    and FILL chunks of a sparse file (DONT_CARE and CRC32 are not listed; the fill word is ``b""`` for RAW).
+    The file is assumed valid (:func:`sparse_info`)."""
+    p = Path(path)
+    out = []
+    with open(p, "rb") as f:
+        (_magic, _major, _minor, file_hdr_sz, chunk_hdr_sz, blk_sz, total_blks, total_chunks,
+         _checksum) = _FILE_HDR.unpack(f.read(FILE_HEADER_SIZE))
+        pos = file_hdr_sz
+        block = 0
+        for _ in range(total_chunks):
+            f.seek(pos)
+            ctype, _res, csz, tsz = _CHUNK_HDR.unpack(f.read(CHUNK_HEADER_SIZE))
+            payload = pos + chunk_hdr_sz
+            if ctype == CHUNK_RAW:
+                out.append((block, csz, ctype, payload, b""))
+            elif ctype == CHUNK_FILL:
+                f.seek(payload)
+                out.append((block, csz, ctype, payload, f.read(4)))
+            if ctype != CHUNK_CRC32:
+                block += csz
+            pos += tsz
+    return blk_sz, total_blks, out
+
+
+def expand(paths: Iterable[str | Path], chunk: int = 4 * 1024 * 1024) -> Iterable[bytes]:
+    """The image the pieces of one sparse image describe, as raw bytes in pieces of at most ``chunk``:
+    what fastbootd would write, with every block no piece writes (DONT_CARE) as zeros."""
+    regions = []
+    blk_sz = total = None
+    for path in paths:
+        b, t, chunks = data_chunks(path)
+        if blk_sz is None:
+            blk_sz, total = b, t
+        elif (b, t) != (blk_sz, total):
+            raise SparseError(f"{Path(path).name} describes another image than the first piece")
+        regions += [(first, n, kind, off, fill, Path(path)) for first, n, kind, off, fill in chunks]
+    if blk_sz is None:
+        return
+    regions.sort(key=lambda r: r[0])
+    zero = bytes(min(chunk, 1 << 20))
+    handles: dict[Path, object] = {}
+
+    def zeros(n: int):
+        while n > 0:
+            k = min(n, len(zero))
+            yield zero[:k]
+            n -= k
+
+    pos = 0                                       # bytes produced so far
+    try:
+        for first, n, kind, off, fill, path in regions:
+            start = first * blk_sz
+            if start < pos:
+                raise SparseError(f"{path.name}: overlapping chunks at block {first}")
+            yield from zeros(start - pos)
+            length = n * blk_sz
+            if kind == CHUNK_RAW:
+                f = handles.get(path) or handles.setdefault(path, open(path, "rb"))
+                f.seek(off)
+                left = length
+                while left:
+                    data = f.read(min(left, chunk))
+                    if not data:
+                        raise SparseError(f"{path.name}: truncated RAW chunk")
+                    left -= len(data)
+                    yield data
+            else:
+                unit = fill * (min(length, chunk) // 4)
+                left = length
+                while left:
+                    k = min(left, len(unit))
+                    yield unit[:k]
+                    left -= k
+            pos = start + length
+        yield from zeros(total * blk_sz - pos)
+    finally:
+        for f in handles.values():
+            f.close()
+
+
 def check_pieces(paths: Iterable[str | Path]) -> dict:
     """Validate the pieces of one (possibly split) sparse image.
 

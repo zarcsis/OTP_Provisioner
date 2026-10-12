@@ -273,7 +273,7 @@
 
         /** Probe a device (ROM / second stage / fastboot gadget) and fetch or create its server record. */
         async attach(u) {
-            if (!this.api || !this.api.available) throw new Error('the server is not reachable: use "Advanced (manual)" below');
+            if (!this.api || !this.api.available) throw new Error('the server is not reachable: start it with "python server.py" and reload');
             if (this.running) throw new Error('a provisioning run is in progress');
             this._rejectedFastboot = null;   // an explicit "Connect board" starts a fresh selection
             for (const n of [1, 2, 3]) this._setStage(n, 'idle', '');
@@ -298,7 +298,7 @@
                 } finally {
                     await dev.close();
                 }
-                if (!dev.chip || dev.chip.name !== 'BCM2712') throw new Error(`${dev.chip ? dev.chip.name : 'unknown chip'}: the server flow provisions Raspberry Pi 5 / CM5 (BCM2712) only; use Advanced (manual)`);
+                if (!dev.chip || dev.chip.name !== 'BCM2712') throw new Error(`${dev.chip ? dev.chip.name : 'unknown chip'}: the station provisions Raspberry Pi 5 / CM5 (BCM2712) only`);
                 const serial = normalizeSerial(dev.serial || u.serialNumber);
                 if (!serial) throw new Error(`the board reported no usable USB serial ("${dev.serial || u.serialNumber || ''}")`);
                 const body = {

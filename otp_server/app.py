@@ -171,8 +171,8 @@ class Services:
 
     # ------------------------------------------------------------------ image settings (the page's form)
     #: Fields of POST /api/image besides the two passwords.
-    IMAGE_FIELDS = ("name", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
-                    "wifi_ssid", "wifi_country", "wifi_hidden")
+    IMAGE_FIELDS = ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
+                    "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")
 
     def image_settings(self) -> dict:
         """The ``image.*`` settings for the page: no password or hash, only whether they are set; plus the time
@@ -228,7 +228,7 @@ class Services:
                 raise StoreError(self.settings_error or "the settings sheet could not be read back")
         log.info("image settings saved: %s", ", ".join(sorted(updates)))
         want = self.cfg.builds.auto if self.auto_build is None else self.auto_build
-        if want and self.artifacts is not None and "name" in changed:
+        if want and self.artifacts is not None and ("name" in changed or "custom" in changed):
             threading.Thread(target=self.run_auto_build, name="image-settings-build", daemon=True).start()
         return {**self.image_settings(), "saved": sorted(updates)}
 
@@ -286,6 +286,16 @@ class Services:
             st.setdefault(t, _missing_artifact(t, "unknown"))
         return st
 
+    def custom_images_status(self) -> list[dict]:
+        """The uploaded custom OS images (never raises: an empty list when they cannot be read)."""
+        if self.artifacts is None or not hasattr(self.artifacts, "custom_images"):
+            return []
+        try:
+            return list(self.artifacts.custom_images())
+        except Exception:
+            log.exception("custom image status failed")
+            return []
+
     def jobs_status(self) -> list[dict]:
         """The running job, else the last one, for every target that has jobs (newest first)."""
         if self.jobs is None:
@@ -320,6 +330,7 @@ class Services:
             "docker": self.docker_status(),
             "usb_driver": self.usb_driver_status(),
             "artifacts": self.artifacts_status(),
+            "custom_images": self.custom_images_status(),
             "jobs": self.jobs_status(),
         }
 

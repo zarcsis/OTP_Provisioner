@@ -52,8 +52,19 @@
                 <button id="btn-image-revert" class="small push" disabled>Revert</button>
                 <button id="btn-image-save" class="small primary" disabled>Save</button>
             </div>
-            <p class="hint">The image is Raspberry Pi OS Lite, the same for every board. Stage 3 writes these settings to each board's boot partition (cloud-init files, as Raspberry Pi Imager does), so saving applies them to the boards flashed from then on, without a rebuild. Only a new image name rebuilds the image.</p>
+            <p class="hint">Stage 3 writes the same image to every board: the station's Raspberry Pi OS Lite (built here), or an image of your own uploaded below. The settings under it go to each board's boot partition as cloud-init files (as Raspberry Pi Imager does), so saving applies them to the boards flashed from then on, without a rebuild; an uploaded image without cloud-init boots with its own configuration instead.</p>
             <form id="image-form" class="form" autocomplete="off">
+                <h3>Source</h3>
+                <label class="field"><span>Image</span><select name="custom" title="What stage 3 writes to the boards"></select></label>
+                <div id="custom-note" class="hint"></div>
+                <div id="custom-images" class="custom-images"></div>
+                <div class="row">
+                    <button type="button" id="btn-custom-upload" class="small" data-own="1" title="A raw .img with a FAT boot partition and an ext4 root (Raspberry Pi OS). Prepared on the station for both scenarios: as it is (open) and unlocking an encrypted root with the board's OTP key (secure)">Upload .img…</button>
+                    <input type="file" id="custom-file" accept=".img" class="hidden" data-own="1">
+                    <button type="button" id="btn-custom-cancel" class="small hidden" data-own="1">Cancel</button>
+                    <span id="custom-upload-status" class="muted"></span>
+                </div>
+                <div class="progress hidden" id="custom-upload-progress"><div></div></div>
                 <h3>System</h3>
                 <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63" placeholder="pi5-{serial}" title="{serial} = the board's 8-hex serial"></label>
                 <label class="field"><span>Time zone</span><select name="timezone"></select></label>
@@ -86,8 +97,8 @@
                 <div class="checks">
                     <label class="check"><input type="checkbox" name="wifi_hidden"> hidden network</label>
                 </div>
-                <h3>Image</h3>
-                <label class="field"><span>Name</span><input type="text" name="name" class="mono" spellcheck="false" maxlength="64"></label>
+                <h3>Station image</h3>
+                <label class="field"><span>Name</span><input type="text" name="name" class="mono" spellcheck="false" maxlength="64" title="Name of the station's Raspberry Pi OS Lite image (a new name rebuilds it)"></label>
             </form>
             <ul id="image-warnings" class="image-warnings"></ul>
             <div id="image-status" class="hint"></div>
@@ -112,8 +123,7 @@
             </ol>
             <div id="offline-box" class="callout offline hidden">
                 <div><b>The server is not reachable.</b> Provisioning needs it (it holds the board secrets and builds every
-                    file). Start it with <code>python server.py</code> and reload, or use the manual mode with local directories.</div>
-                <button id="btn-open-advanced" class="small">Open Advanced (manual)</button>
+                    file). Start it with <code>python server.py</code> and reload.</div>
             </div>
             <div id="steps" class="steps"></div>
             <div id="need-box" class="callout hidden"></div>
@@ -154,78 +164,6 @@
     </div>
 </main>
 
-<details id="advanced" class="advanced">
-    <summary>Advanced (manual) · local boot directories and manual fastboot, works without the server</summary>
-    <div class="layout advanced-layout">
-        <div class="col-left">
-            <section class="panel" id="devices-panel">
-                <h2>Boards on USB</h2>
-                <div class="row">
-                    <button id="btn-pick-device" class="primary">Select device…</button>
-                    <button id="btn-refresh-devices">Refresh</button>
-                    <label class="check"><input type="checkbox" id="chk-autoprobe" checked> probe stage on select</label>
-                </div>
-                <p class="hint">Raspberry Pi 5 in RPIBOOT mode (hold the power button while connecting USB-C) enumerates as
-                    <code>0a5c:2712</code> "BCM2712 Boot". Chrome lists a device only after you have granted it once.</p>
-                <ul id="device-list" class="device-list"></ul>
-            </section>
-
-            <section class="panel" id="detail-panel">
-                <h2>Selected device</h2>
-                <div id="device-detail"><p class="muted">No device selected.</p></div>
-            </section>
-        </div>
-
-        <div class="col-right">
-            <nav class="stages" id="stage-nav">
-                <button data-stage="stage-1" class="active">1 · EEPROM &amp; OTP</button>
-                <button data-stage="stage-2">2 · Gadget / agent</button>
-                <button data-stage="stage-3">3 · Image (fastboot / IDP)</button>
-            </nav>
-
-            <section class="stage panel" id="stage-1"></section>
-            <section class="stage panel hidden" id="stage-2"></section>
-
-            <section class="stage panel hidden" id="stage-3">
-                <h2>Stage 3 · Write the image over fastboot (IDP)</h2>
-                <p class="blurb">With the fastboot gadget running (USB <code>18d1:4e40</code>, interface <code>ff/42/03</code>,
-                    rpi-fastbootd), stage <code>image.json</code> from an rpi-image-gen output directory; the board creates
-                    its partitions and LUKS2 containers itself, then the station flashes each sparse image the board asks for
-                    (<code>oem idpgetblk</code>). Sparse files above <code>max-download-size</code> (256 MiB) are refused here;
-                    the server splits them.</p>
-                <div class="row">
-                    <button id="fb-pick" class="primary">Select fastboot device…</button>
-                    <button id="fb-getvar" disabled>getvar:all</button>
-                    <span id="fb-device" class="muted">no fastboot device selected</span>
-                </div>
-                <div class="table-wrap short"><table class="list" id="fb-vars"><tbody></tbody></table></div>
-                <h3>IDP image</h3>
-                <div class="row">
-                    <button id="fb-pick-dir">Choose image directory…</button>
-                    <span id="fb-dir" class="muted">image.json + sparse images (rpi-image-gen output directory)</span>
-                    <input type="file" id="fb-dir-input" webkitdirectory class="hidden">
-                </div>
-                <div class="row">
-                    <label class="check"><input type="checkbox" id="fb-opt-erase"> <code>erase:mmcblk0</code> first</label>
-                    <label class="check"><input type="checkbox" id="fb-opt-fwcrypto"> <code>oem fwcrypto init</code> first (IRREVERSIBLE; needed for encrypted images)</label>
-                </div>
-                <div class="row">
-                    <button id="fb-run-idp" class="danger" disabled>Provision (IDP)</button>
-                    <button id="fb-abort" disabled>Abort</button>
-                </div>
-                <h3>Manual</h3>
-                <div class="row">
-                    <input type="text" id="fb-part" class="mono" placeholder="partition / block device, e.g. mmcblk0">
-                    <input type="file" id="fb-file">
-                    <button id="fb-flash" disabled>flash</button>
-                    <button id="fb-reboot" disabled>reboot</button>
-                </div>
-                <div class="progress"><div id="fb-progress"></div></div>
-                <div class="progress-label" id="fb-progress-label"></div>
-            </section>
-        </div>
-    </div>
-</details>
 
 <dialog id="confirm-dialog">
     <h2>Irreversible operation</h2>

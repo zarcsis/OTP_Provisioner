@@ -1,0 +1,64 @@
+#!/bin/sh
+# otp-growroot - grow the encrypted root to the whole storage device, once. Installed by the OTP
+# provisioning station (otp-growroot.service).
+#
+# A board flashed by the station (fastboot IDP) already has a root partition up to the end of the card; a
+# board flashed from the station's image file with Raspberry Pi Imager has the partition the file had. In
+# both cases the LUKS2 mapping and the ext4 file system inside are as small as the image. Steps: the root
+# partition up to the end of the disk (when it is the last partition), the dm-crypt mapping up to the end
+# of the partition (cryptsetup resize; the volume key is in the kernel keyring, else the crypttab keyscript
+# gives the passphrase), the ext4 file system up to the end of the mapping (resize2fs, online). Done once:
+# /var/lib/otp-station/root-grown.
+set -eu
+
+DONE=/var/lib/otp-station/root-grown
+log() { echo "otp-growroot: $*"; }
+finish() { mkdir -p "${DONE%/*}"; : > "$DONE"; exit 0; }
+
+dev=$(findmnt -n -o SOURCE /)
+case "$dev" in
+    /dev/mapper/*) ;;
+    *) log "the root file system is on $dev, not on a dm-crypt mapping: nothing to do"; finish ;;
+esac
+name=${dev#/dev/mapper/}
+part=$(cryptsetup status "$name" | awk '$1 == "device:" { print $2 }')
+[ -b "$part" ] || { log "cannot find the device under $name"; exit 1; }
+pname=$(basename "$(readlink -f "$part")")
+
+# 1. The partition, when the card is larger than the image and nothing follows the root partition.
+if [ -e "/sys/class/block/$pname/partition" ]; then
+    disk=$(basename "$(readlink -f "/sys/class/block/$pname/..")")
+    num=$(cat "/sys/class/block/$pname/partition")
+    start=$(cat "/sys/class/block/$pname/start")
+    size=$(cat "/sys/class/block/$pname/size")
+    total=$(cat "/sys/class/block/$disk/size")
+    label=$(sfdisk --dump "/dev/$disk" 2>/dev/null | awk -F': *' '$1 == "label" { print $2 }')
+    last=$total
+    if [ "$label" = gpt ]; then
+        sfdisk --relocate gpt-bak-std "/dev/$disk" >/dev/null 2>&1 || true
+        last=$((total - 33))
+    fi
+    later=0
+    for p in /sys/class/block/"$disk"/"$disk"*; do
+        [ -e "$p/start" ] || continue
+        [ "$(cat "$p/start")" -gt "$start" ] && later=1
+    done
+    want=$(( (last - start) / 2048 * 2048 ))
+    if [ "$later" = 0 ] && [ "$want" -gt "$size" ]; then
+        log "partition $num of /dev/$disk: $size -> $want sectors"
+        echo "$start,$want" | sfdisk --no-reread --no-tell-kernel -N "$num" "/dev/$disk" >/dev/null
+        resizepart "/dev/$disk" "$num" "$want"
+    fi
+fi
+
+# 2. The dm-crypt mapping.
+if ! cryptsetup resize "$name" </dev/null 2>/dev/null; then
+    ks=$(awk -v n="$name" '$1 == n { print $4 }' /etc/crypttab | tr ',' '\n' | sed -n 's/^keyscript=//p')
+    [ -n "$ks" ] && [ -x "$ks" ] || { log "cryptsetup resize needs the passphrase and /etc/crypttab names no keyscript"; exit 1; }
+    CRYPTTAB_NAME=$name CRYPTTAB_SOURCE=$part "$ks" | cryptsetup resize --key-file=- "$name"
+fi
+
+# 3. The file system.
+resize2fs "$dev"
+log "done: $(df -h / | awk 'NR == 2 { print $2 }') root file system"
+finish

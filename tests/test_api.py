@@ -39,7 +39,7 @@ OTP_KEYS = {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_pro
             "lock_note", "device_key", "device_key_fingerprint", "device_key_exported"}
 JOB_KEYS = {"id", "target", "title", "status", "started", "finished", "rc", "error", "lines"}
 STATUS_KEYS = {"version", "google", "google_ready", "settings", "config", "storage", "docker", "usb_driver",
-               "artifacts", "jobs"}
+               "artifacts", "custom_images", "jobs"}
 SIGN_IN_FIRST = "sign in to Google first"
 
 

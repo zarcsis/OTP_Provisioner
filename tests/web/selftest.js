@@ -69,15 +69,16 @@
         eq(OTP.duid.decodeC40('0'), '', 'zero word stops');
         eq(OTP.duid.decodeC40('10000'), null, 'zero low half → invalid (C semantics)');
 
-        // ================================================================ T3 BootDir (local entries)
+        // ================================================================ T3 BootDir (an in-memory directory)
         section = 'bootdir';
         const chip = OTP.CHIPS[0x2712];
-        const mk = (name, bytes) => new File([bytes], name);
-        const stage2 = OTP.BootDir.fromEntries('msd', [
-            { path: 'bootfiles.bin', file: mk('bootfiles.bin', bootfiles) },
-            { path: 'config.txt', file: mk('config.txt', msdConfig) },
-            { path: 'boot.img', file: mk('boot.img', new Uint8Array(70000).fill(7)) },
-        ]);
+        /** A BootDir over {relative path: bytes}, the way fromManifest() reads (by name, null when absent). */
+        const dirOf = (name, files) => new OTP.BootDir(name, async (rel) => (files[rel] ? files[rel].slice() : null));
+        const stage2 = dirOf('msd', {
+            'bootfiles.bin': bootfiles,
+            'config.txt': msdConfig,
+            'boot.img': new Uint8Array(70000).fill(7),
+        });
         let r = await stage2.resolve('bootcode5.bin', chip);
         eq(r && r.origin, 'bootfiles.bin:2712/bootcode5.bin', 'resolve second stage from tar');
         eq(r && r.data.byteLength, bc5.byteLength, 'second stage bytes from tar');
@@ -86,28 +87,20 @@
         r = await stage2.resolve('../etc/passwd', chip);
         assert(r && r.denied, 'resolve denies ..');
         eq(await stage2.resolve('missing.txt', chip), null, 'resolve missing → null');
-        eq((await stage2.validate()).length, 0, 'validate: tar directory ok');
-        const cfg = await stage2.configTxt();
-        eq(cfg.keys.boot_ramdisk, '1', 'config.txt boot_ramdisk=1');
-        eq(cfg.keys.uart_2ndstage, '1', 'config.txt uart_2ndstage=1');
-        const overlayDir = OTP.BootDir.fromEntries('ov', [
-            { path: 'bootfiles.bin', file: mk('bootfiles.bin', bootfiles) },
-            { path: '2712/config.txt', file: mk('config.txt', enc.encode('x=1\n')) },
-        ]);
+        const overlayDir = dirOf('ov', { 'bootfiles.bin': bootfiles, '2712/config.txt': enc.encode('x=1\n') });
         r = await overlayDir.resolve('config.txt', chip);
         eq(r && r.origin, 'ov/2712/config.txt (bootfiles.bin overlay)', 'overlay <dir>/2712/config.txt wins over the tar');
-        const stage1 = OTP.BootDir.fromEntries('sb', [
-            { path: 'bootcode5.bin', file: mk('bootcode5.bin', new Uint8Array(1000).fill(1)) },
-            { path: 'pieeprom.bin', file: mk('pieeprom.bin', new Uint8Array(2048).fill(2)) },
-            { path: 'pieeprom.sig', file: mk('pieeprom.sig', enc.encode('deadbeef\nts: 1\n')) },
-            { path: 'config.txt', file: mk('config.txt', enc.encode('uart_2ndstage=1\n#program_pubkey=1\nprogram_pubkey=1\n# program_jtag_lock=1\nrecovery_reboot=0\n')) },
-        ]);
-        eq((await stage1.validate()).length, 0, 'validate: bootcode5.bin directory ok');
-        const c1 = await stage1.configTxt();
-        eq(c1.keys.program_pubkey, '1', 'stage1 config program_pubkey=1 (commented copy ignored)');
-        eq(c1.keys.program_jtag_lock, undefined, 'stage1 config commented program_jtag_lock ignored');
-        const empty = OTP.BootDir.fromEntries('e', [{ path: 'readme.txt', file: mk('readme.txt', enc.encode('x')) }]);
-        eq((await empty.validate()).length, 1, 'validate: no bootcode → problem');
+        const stage1 = dirOf('sb', {
+            'bootcode5.bin': new Uint8Array(1000).fill(1),
+            'pieeprom.bin': new Uint8Array(2048).fill(2),
+            'pieeprom.sig': enc.encode('deadbeef\nts: 1\n'),
+            'config.txt': enc.encode('uart_2ndstage=1\nprogram_pubkey=1\n'),
+        });
+        r = await stage1.resolve('bootcode5.bin', chip);
+        eq(r && r.origin, 'sb/bootcode5.bin', 'no bootfiles.bin: the top-level file');
+        const empty = dirOf('e', { 'readme.txt': enc.encode('x') });
+        for (const gone of ['fromEntries', 'fromFileList', 'fromDirectoryHandle']) eq(typeof OTP.BootDir[gone], 'undefined', `BootDir.${gone} (manual mode) is gone`);
+        eq(OTP.IRREVERSIBLE_KEYS, undefined, 'the manual config.txt check (IRREVERSIBLE_KEYS) is gone');
         eq(await sha(enc.encode('abc')), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'sha256 helper');
 
         // ================================================================ T4 rpiboot session with mock devices
@@ -137,8 +130,7 @@
             // reply to it fail while the gadget starts (ebbdf4fd, stage 2): rpiboot ignores that last ep_write too
             const lines = [];
             const big = new Uint8Array((1 << 20) + 16).fill(7);
-            const dirB = OTP.BootDir.fromEntries('b', [{ path: 'bootcode5.bin', file: mk('bootcode5.bin', new Uint8Array(100)) },
-                { path: 'boot.img', file: mk('boot.img', big) }]);
+            const dirB = dirOf('b', { 'bootcode5.bin': new Uint8Array(100), 'boot.img': big });
             const fsB = T.fsDevice({ serial: 'a7eb274c', script: [{ cmd: 0, name: 'boot.img' }, { cmd: 1, name: 'boot.img' }, { cmd: -597934592, name: '' }] });
             const readAt = [];
             const innerIn = fsB.controlTransferIn.bind(fsB);
@@ -376,104 +368,17 @@
             assert(!openedC && Date.now() - tA < 600, 'settle: abort cuts the pause short and nothing is opened', `${Date.now() - tA} ms, opened=${openedC}`);
         }
 
-        // ================================================================ T5 app manual panels
-        section = 'app-manual';
+        // ================================================================ T5 no manual mode
+        section = 'no-manual';
         const app = OTP.app;
-        assert(app && app.panels.length === 2, 'two boot panels');
+        assert(app && app.flow, 'the page exposes its flow');
         eq(OTP.registry, undefined, 'registry.js (localStorage) is gone');
-        const p2 = app.panels[1];
-        await p2.loadDir(stage2);
-        const rows = [...p2.filesTable.querySelectorAll('tbody tr')];
-        eq(rows.length, 4, 'stage 2 expected-file rows');
-        eq(rows[0].querySelector('td.status').textContent, '✓', 'bootcode5.bin found (tar)');
-        eq(rows[3].querySelector('td.status').textContent, 'optional, absent', 'boot.sig optional');
-        assert(p2.otherFiles.textContent.includes('2712/bootcode5.bin'), 'tar contents listed');
-        assert(rows[0].lastChild.textContent.length === 64, 'sha256 column filled');
-        eq(p2.irreversible.length, 0, 'stage 2 msd config has no irreversible keys');
-        const p1 = app.panels[0];
-        await p1.loadDir(stage1);
-        eq(p1.irreversible.map((f) => f.key).join(','), 'program_pubkey', 'stage 1 irreversible keys detected');
-        assert(p1.otpRequested, 'otpRequested');
-        assert(p1.flagsBox.textContent.includes('IRREVERSIBLE'), 'irreversible flag rendered');
-        let v = p1.verdict({ metadata: { EEPROM_UPDATE: 'success', SECURE_BOOT_PROVISION: 'success', CUSTOMER_KEY_HASH: 'AB' }, filesServed: [] });
-        assert(v.ok, 'stage 1 verdict ok', v.notes.join('|'));
-        p1.keyHashInput.value = 'ab';
-        v = p1.verdict({ metadata: { EEPROM_UPDATE: 'success', SECURE_BOOT_PROVISION: 'success', CUSTOMER_KEY_HASH: 'AB' }, filesServed: [] });
-        assert(v.ok && v.notes.some((n) => /matches/.test(n)), 'key hash match (case-insensitive)', v.notes.join('|'));
-        p1.keyHashInput.value = 'cd';
-        v = p1.verdict({ metadata: { EEPROM_UPDATE: 'success', SECURE_BOOT_PROVISION: 'success', CUSTOMER_KEY_HASH: 'AB' }, filesServed: [] });
-        assert(!v.ok, 'key hash mismatch → not ok');
-        p1.keyHashInput.value = '';
-        v = p1.verdict({ metadata: { EEPROM_UPDATE: 'success' }, filesServed: [] });
-        assert(!v.ok && v.notes.some((n) => /SECURE_BOOT_PROVISION = missing/.test(n)), 'OTP requested but not confirmed → not ok', v.notes.join('|'));
-        v = p2.verdict({ metadata: {}, filesServed: [{ name: 'boot.img' }], interrupted: true });
-        assert(v.ok && v.notes.length === 2, 'stage 2 verdict ok with interruption note');
-        eq(p1.btnRun.disabled, true, 'run disabled without a device');
-
-        // #14: the irreversible-key check reads the config.txt the file server will serve (BootDir.resolve)
-        function makeTar(members) {
-            const parts = [];
-            for (const [name, data] of Object.entries(members)) {
-                const h = new Uint8Array(512);
-                h.set(enc.encode(name), 0);
-                h.set(enc.encode(data.byteLength.toString(8).padStart(11, '0') + '\0'), 124);
-                h[156] = 0x30;
-                h.set(enc.encode('ustar\0'), 257);
-                const body = new Uint8Array(Math.ceil(data.byteLength / 512) * 512);
-                body.set(data);
-                parts.push(h, body);
-            }
-            parts.push(new Uint8Array(1024));
-            const out = new Uint8Array(parts.reduce((a, b) => a + b.byteLength, 0));
-            let o = 0;
-            for (const b of parts) { out.set(b, o); o += b.byteLength; }
-            return out;
+        eq(document.getElementById('advanced'), null, 'no "Advanced (manual)" section');
+        for (const id of ['btn-open-advanced', 'stage-nav', 'device-list', 'fb-pick', 'fb-run-idp', 'fb-reboot', 'fb-flash']) {
+            eq(document.getElementById(id), null, `#${id} is gone`);
         }
-        const stage1Files = () => [
-            { path: 'bootcode5.bin', file: mk('bootcode5.bin', new Uint8Array(1000).fill(1)) },
-            { path: 'pieeprom.bin', file: mk('pieeprom.bin', new Uint8Array(2048).fill(2)) },
-            { path: 'pieeprom.sig', file: mk('pieeprom.sig', enc.encode('deadbeef\nts: 1\n')) },
-            { path: 'config.txt', file: mk('config.txt', enc.encode('uart_2ndstage=1\nrecovery_reboot=1\n')) },
-        ];
-        {
-            const ov = OTP.BootDir.fromEntries('ov1', [...stage1Files(),
-                { path: 'bootfiles.bin', file: mk('bootfiles.bin', bootfiles) },
-                { path: '2712/config.txt', file: mk('config.txt', enc.encode('program_pubkey=1\nprogram_jtag_lock=1\n')) }]);
-            await p1.loadDir(ov);
-            eq(p1.irreversible.map((f) => f.key).join(','), 'program_pubkey,program_jtag_lock', 'manual: the 2712/config.txt overlay (what is served) is checked, not the top-level file');
-            assert(p1.otpRequested, 'manual: overlay program_pubkey → OTP requested');
-            assert(p1.flagsBox.textContent.includes('ov1/2712/config.txt'), 'manual: the served config.txt is named', p1.flagsBox.textContent);
-            assert(/ov1\/config\.txt differs and is NOT served/.test(p1.flagsBox.textContent), 'manual: the shadowed top-level config.txt is flagged', p1.flagsBox.textContent);
-        }
-        {
-            const tarDir = OTP.BootDir.fromEntries('tm1', [...stage1Files(),
-                { path: 'bootfiles.bin', file: mk('bootfiles.bin', makeTar({ '2712/bootcode5.bin': new Uint8Array(900).fill(5), '2712/config.txt': enc.encode('program_pubkey=1\n') })) }]);
-            await p1.loadDir(tarDir);
-            eq(p1.irreversible.map((f) => f.key).join(','), 'program_pubkey', 'manual: the bootfiles.bin member 2712/config.txt is checked');
-            const prep = await p1.prepareRun(chip);
-            eq(prep.cfg && prep.cfg.origin, 'bootfiles.bin:2712/config.txt', 'manual: prepareRun resolves the same config.txt as the file server');
-        }
-        {
-            // the bytes that were checked are the bytes the board receives, even if the file changes after the check
-            const disk = {
-                'bootcode5.bin': new Uint8Array(1000).fill(1),
-                'config.txt': enc.encode('uart_2ndstage=1\n'),
-                '2712/config.txt': enc.encode('program_pubkey=1\n'),
-            };
-            const md = new OTP.BootDir('mut1', async (rel) => (disk[rel] ? disk[rel].slice() : null));
-            await p1.loadDir(md);
-            const prep = await p1.prepareRun(chip);
-            eq(prep.flags.map((f) => f.key).join(','), 'program_pubkey', 'manual: prepareRun flags from the served file');
-            disk['2712/config.txt'] = enc.encode('program_jtag_lock=1\nrevoke_devkey=1\n');
-            md._cache.clear();
-            const fsC = T.fsDevice({ serial: 'a7eb274c', script: [{ cmd: 0, name: 'config.txt' }, { cmd: 1, name: 'config.txt' }, { cmd: 2, name: 'done' }] });
-            const sc = new OTP.rpiboot.RpiBootSession(md, { log: () => {} });
-            await sc.step(new OTP.rpiboot.RpiDevice(fsC));
-            eq(dec.decode(fsC.bulk.length ? fsC.bulk[0] : new Uint8Array(0)), 'program_pubkey=1\n', 'manual: the file server sends the confirmed config.txt bytes (pinned)');
-            const p2711 = await p1.prepareRun(OTP.CHIPS[0x2711]);
-            eq(p2711.cfg && p2711.cfg.origin, 'mut1/config.txt', 'manual: prepareRun follows the selected device\'s chip');
-            eq(p1.irreversible.length, 0, 'manual: flags re-derived for that chip');
-        }
+        for (const k of ['panels', 'state', 'runBootDir', 'waitForDevice', 'BootRunPanel']) eq(app[k], undefined, `OTP.app.${k} is gone`);
+        assert(!/Advanced|manual mode/i.test(document.body.textContent), 'the page no longer mentions a manual mode');
 
         // ================================================================ T6 fastboot basics (scripted replies)
         section = 'fastboot';
@@ -487,14 +392,15 @@
                 async transferIn() { const x = replies.shift(); if (x === undefined) throw new Error('no reply'); return { status: 'ok', data: new DataView(enc.encode(x).buffer) }; },
             };
         }
-        const fbu = mockFb(['INFOversion: 0.4', 'INFOmax-download-size: 0x1000', 'OKAY', 'OKAY0x1000', 'DATA00000010', 'OKAY', 'INFOwriting', 'OKAY', 'FAILnope']);
+        const fbu = mockFb(['INFOv1', 'INFOv2', 'OKAY', 'OKAY0x1000', 'DATA00000010', 'OKAY', 'INFOwriting', 'OKAY', 'FAILnope']);
         const fbc = new OTP.fastboot.FastbootClient(fbu);
         await fbc.open();
         eq(fbc.inEp + ':' + fbc.outEp, '1:2', 'endpoints');
-        const vars = await fbc.getvarAll();
-        eq(vars['max-download-size'], '0x1000', 'getvar:all parsed');
-        await fbc.flash('mmcblk0', new Uint8Array(16));
-        eq(fbu.sent.join('|'), 'getvar:all|getvar:max-download-size|download:00000010|<16 bytes>|flash:mmcblk0', 'flash command sequence');
+        eq(await fbc.getvarText('product'), 'v1\nv2', 'getvar: INFO lines joined');
+        await fbc.download(new Uint8Array(16));
+        await fbc.command('flash:mmcblk0');
+        eq(fbu.sent.join('|'), 'getvar:product|getvar:max-download-size|download:00000010|<16 bytes>|flash:mmcblk0', 'download + flash command sequence');
+        for (const gone of ['getvarAll', 'flash', 'provisionIdp']) eq(typeof fbc[gone], 'undefined', `FastbootClient.${gone} (manual mode) is gone`);
         const fbErr = await throwsLike(() => fbc.command('oem nope'), /FAIL nope/, 'FAIL → FastbootError');
         eq(fbErr && fbErr.name, 'FastbootError', 'error class');
         const big = new OTP.fastboot.FastbootClient(mockFb(['OKAY0x10']));
@@ -831,8 +737,6 @@
             eq(fetched.filter((u) => u.endsWith('/boot.img')).length, 1, 'each file is fetched once');
             eq(await bd.resolve('boot.sig', chip), null, 'a name outside the manifest → null, no fetch');
             eq(fetched.some((u) => u.endsWith('boot.sig')), false, '… nothing fetched for it');
-            eq((await bd.validate()).length, 0, 'validate: bootfiles.bin present');
-            eq((await bd.listTop()).map((e) => e.name).join(','), 'bootfiles.bin,config.txt,boot.img', 'listTop from the manifest');
             const bad = OTP.BootDir.fromManifest({ stage: 1, files: [{ name: 'config.txt', size: 3, sha256: '00'.repeat(32), url: '/x/config.txt' }] }, { fetchBytes: async () => enc.encode('abc') });
             await throwsLike(() => bad.resolve('config.txt', chip), /SHA-256 mismatch/, 'sha256 mismatch → error');
             const short = OTP.BootDir.fromManifest({ stage: 1, files: [{ name: 'config.txt', size: 5, url: '/x/config.txt' }] }, { fetchBytes: async () => enc.encode('abc') });
@@ -1813,6 +1717,133 @@
             }
             await app.loadImageSettings();
             eq(status.textContent, '', 'a successful load clears the error');
+        }
+
+        section = 'page-custom';
+        {
+            await fakeReset();
+            app.img.loaded = null;
+            await app.loadImageSettings();
+            const form = document.getElementById('image-form');
+            const sel = form.elements.namedItem('custom');
+            const rows = () => [...document.querySelectorAll('#custom-images .custom-row')];
+            const upStatus = document.getElementById('custom-upload-status');
+            const note = document.getElementById('custom-note');
+            eq(sel.options.length, 2, 'Image list: the station image and the uploaded one');
+            eq(`${sel.options[0].value}|${sel.value}`, '|', 'the station image is chosen (image.custom is empty)');
+            assert(/^Custom: os\.img · 6\.00 GiB · Debian GNU\/Linux 12/.test(sel.options[1].textContent), 'an uploaded image shows its name, size and OS', sel.options[1].textContent);
+            eq(rows().length, 1, 'one row per uploaded image');
+            const r0 = rows()[0].textContent;
+            assert(/os\.img/.test(r0) && /ready/.test(r0) && /open ✓ · secure ✓/.test(r0) && /no cloud-init/.test(r0), 'the row: name, state, both scenarios, no cloud-init', r0);
+            eq(note.textContent, '', 'the station image: no note');
+            const sent = [];
+            const realSave = OTP.api.saveImageSettings;
+            OTP.api.saveImageSettings = (b) => { sent.push(JSON.parse(JSON.stringify(b))); return realSave.call(OTP.api, b); };
+            try {
+                sel.value = '3d0c4b7e6a514f2e';
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                assert(/os\.img has no cloud-init: the settings below are not written to it/.test(note.textContent), 'an image without cloud-init: the note says the settings do not apply', note.textContent);
+                document.getElementById('btn-image-save').click();
+                await until(() => sent.length === 1 && !app.img.saving, 3000, 'save image.custom');
+                deq(sent[0], { custom: '3d0c4b7e6a514f2e' }, 'Save sends only image.custom');
+                await until(() => /Stage 3 now writes os\.img\./.test(document.getElementById('image-status').textContent), 3000, 'saved message');
+                await app.refreshStatus();
+                assert(/stage 3 writes it/.test(rows()[0].textContent), 'the chosen image is marked', rows()[0].textContent);
+                eq(rows()[0].querySelector('button.danger-outline').disabled, true, 'the image stage 3 writes cannot be deleted');
+
+                // upload: the raw file is the body of PUT /api/custom-images; the list grows, the choice is kept
+                const mbr = new Uint8Array(8192);
+                mbr[510] = 0x55; mbr[511] = 0xaa;
+                await app.uploadCustom(new File([mbr], 'field-os.img'));
+                assert(/field-os\.img uploaded: the station now prepares it for both scenarios/.test(upStatus.textContent), 'the upload is reported', upStatus.textContent);
+                await until(() => rows().length === 2, 3000, 'the new row');
+                const r1 = rows()[0].textContent;
+                assert(/field-os\.img/.test(r1) && /preparing/.test(r1) && /Log/.test(r1), 'the new image is being prepared (with its job log)', r1);
+                eq(rows()[0].querySelector('button.danger-outline').disabled, true, 'an image being prepared cannot be deleted');
+                eq(`${sel.options.length}:${sel.value}`, '3:3d0c4b7e6a514f2e', 'the list has the new image, the choice stays');
+                await app.uploadCustom(new File([mbr], 'again.img'));
+                assert(/is already on the station/.test(upStatus.textContent), 'the same bytes again: already on the station', upStatus.textContent);
+                await app.uploadCustom(new File([new Uint8Array([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 1, 2])], 'os.img.xz'));
+                assert(/^Upload failed: the file is xz-compressed/.test(upStatus.textContent), 'a compressed file is refused with the reason', upStatus.textContent);
+                eq(document.getElementById('custom-upload-progress').classList.contains('hidden'), true, 'the progress bar is hidden after an upload');
+
+                // back to the station image, then os.img can go
+                sel.value = '';
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                document.getElementById('btn-image-save').click();
+                await until(() => sent.length === 2 && !app.img.saving, 3000, 'save image.custom = ""');
+                deq(sent[1], { custom: '' }, 'the station image again: image.custom = ""');
+                await app.refreshStatus();
+                const osRow = rows().find((r) => /os\.img/.test(r.querySelector('.custom-title').textContent) && !/field/.test(r.textContent));
+                const realConfirm = window.confirm;
+                window.confirm = () => true;
+                try {
+                    osRow.querySelector('button.danger-outline').click();
+                    await until(() => rows().length === 1, 3000, 'deleted');
+                } finally {
+                    window.confirm = realConfirm;
+                }
+                eq(sel.options.length, 2, 'a deleted image leaves the list');
+            } finally {
+                OTP.api.saveImageSettings = realSave;
+            }
+            await fakeReset();
+            app.img.loaded = null;
+            await app.loadImageSettings();
+        }
+
+        section = 'page-imager';
+        {
+            await fakeReset();
+            app.srv.modules = await OTP.api.modules();
+            const box = () => document.querySelector('#board-detail .imager');
+            app.srv.viewSerial = 'a7eb274c';
+            app.renderBoard();
+            assert(!box() || box().classList.contains('hidden'), 'a board not locked to its key: no image file section');
+            app.srv.viewSerial = '5e21c09a';
+            app.renderBoard();
+            assert(box() && !box().classList.contains('hidden'), 'a board locked to its key, key exported, card known: the section is shown');
+            const sel = box().querySelector('select');
+            eq([...sel.options].map((o) => o.value).join(','), ',3d0c4b7e6a514f2e', 'sources: the station image and the uploaded one');
+            eq(sel.value, '', 'the source follows image.custom (the station image)');
+            const sentBefore = (await counts())['POST modules/*'] || 0;
+            [...box().querySelectorAll('button')].find((b) => b.textContent === 'Prepare').click();
+            await until(() => app.imager.busy, 2000, 'preparing');
+            assert(/Preparing/.test(box().textContent), 'the button says it is preparing');
+            await until(() => /still being prepared/.test(box().textContent), 3000, 'the 409 reason is shown');
+            await until(() => app.imager.result, 9000, 'the image file is ready');
+            eq(((await counts())['POST modules/*'] || 0) - sentBefore, 2, 'asked twice: 409 with a running job, then ready');
+            const dl = [...box().querySelectorAll('button')].find((b) => /^Download /.test(b.textContent));
+            assert(dl && /5e21c09a-deb13-arm64-min-secure\.img \(5\.50 GiB\)/.test(dl.textContent), 'Download names the file and its size', dl && dl.textContent);
+            assert(/Use custom/.test(box().textContent), 'the server notes are listed', box().textContent);
+            assert(!/null/.test(document.getElementById('board-detail').textContent), 'no "null" text where an optional part is empty (board card, image file section)', document.getElementById('board-detail').textContent);
+            app.renderBoard();
+            eq(app.imager.result && app.imager.result.name, '5e21c09a-deb13-arm64-min-secure.img', 'a re-render (every poll) keeps the result');
+            sel.value = '3d0c4b7e6a514f2e';
+            sel.dispatchEvent(new Event('change'));
+            eq(app.imager.result, null, 'another source: the prepared file is forgotten');
+            const noKey = JSON.parse(JSON.stringify(app.srv.modules.find((x) => x.serial === '5e21c09a')));
+            noKey.serial = '0badc0de';
+            noKey.otp.device_key_exported = false;
+            app.srv.modules.push(noKey);
+            app.srv.viewSerial = '0badc0de';
+            app.renderBoard();
+            assert(/Run stage 3 once in the secure scenario first/.test(box().textContent), 'locked but the key not exported: says what to do', box().textContent);
+            assert(!/null/.test(box().textContent), 'no "null" text in the section', box().textContent);
+            noKey.events = [];
+            app.renderBoard();
+            assert(!/null/.test(document.getElementById('board-detail').textContent), 'a board without events: no "null" text', document.getElementById('board-detail').textContent);
+            for (const kind of ['rpiboot', 'fastboot']) {
+                app.showNeed(kind, {});
+                assert(!/null/.test(document.getElementById('need-box').textContent), `"Action needed" (${kind}) has no "null" text`, document.getElementById('need-box').textContent);
+            }
+            app.showNeed(null);
+            assert(!/null/.test(document.getElementById('server-badges').textContent), 'server badges: no "null" text');
+            eq([...box().querySelectorAll('button')].find((b) => b.textContent === 'Prepare').disabled, true, 'Prepare is disabled then');
+            app.srv.viewSerial = null;
+            await fakeReset();
+            app.srv.modules = await OTP.api.modules();
+            app.renderBoard();
         }
     } catch (e) {
         results.push('EXCEPTION: ' + ((e && e.stack) || e));

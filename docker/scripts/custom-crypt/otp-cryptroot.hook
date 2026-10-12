@@ -1,0 +1,21 @@
+#!/bin/sh
+# initramfs-tools hook, installed by the OTP provisioning station as /etc/initramfs-tools/hooks/otp-cryptroot:
+# what the otp-hwkey keyscript needs in the initramfs besides cryptsetup (cryptsetup-initramfs copies the
+# keyscript itself): rpi-fw-crypto and its libraries, the device-mapper and kernel crypto modules.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+copy_exec /usr/bin/rpi-fw-crypto
+
+# Only the modules this kernel has (most of the crypto may be built in).
+for m in dm-mod dm-crypt af_alg algif_skcipher algif_hash xts aes_generic aes-arm64 aes-neon-blk aes-neon-bs \
+         aes-ce-blk aes-ce-cipher sha256_generic sha256-arm64; do
+    if modinfo -k "$version" "$m" >/dev/null 2>&1; then
+        manual_add_modules "$m"
+    fi
+done

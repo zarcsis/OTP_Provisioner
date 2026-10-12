@@ -315,10 +315,11 @@ def h_boot_slot(call):
     assert (Path(call["mounts"]["/in"].source) / s).is_file()
     assert ("/keys" in call["mounts"]) == signed
     seed = Path(call["mounts"]["/seed"].source)
-    call["seed"] = {f.name: f.read_bytes() for f in (seed / "files").iterdir()}
+    call["seed"] = {f.name: f.read_bytes() for f in (seed / "files").iterdir()} if (seed / "files").is_dir() else {}
     call["cmdline"] = (seed / "cmdline.append").read_text(encoding="utf-8").strip()
     make_sparse(out / s, [("raw", 1), ("dc", 31)])
-    (out / "slot.json").write_text(json.dumps({"simage": s, "signed": signed, "cmdline": "console=tty1 " + call["cmdline"],
+    (out / "slot.json").write_text(json.dumps({"simage": s, "signed": signed, "key_locked": signed,
+                                               "cmdline": "console=tty1 " + call["cmdline"],
                                                "seed": sorted(call["seed"]),
                                                "pieces": [{"file": s, "size": (out / s).stat().st_size}]}),
                                    encoding="utf-8")
@@ -1112,7 +1113,7 @@ def test_stage3_open_manifest(make_env):
     runs = env.docker.runs[n_runs:]
     assert [r["args"][:1] for r in runs] == [["boot-slot.sh"]]
     r = runs[0]
-    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "0", "MAX_PIECE": "268435456"}
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "0", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": ""}
     assert Path(r["mounts"]["/in"].source) == clear_dir and "/keys" not in r["mounts"]
     assert r["mounts"]["/seed"].readonly and not Path(r["mounts"]["/seed"].source).exists()   # removed after the run
     assert sorted(r["seed"]) == ["meta-data", "user-data"]                 # no Wi-Fi network: no network-config
@@ -1251,7 +1252,7 @@ def test_stage3_signed_resigns_boot_slot(make_env, chosen):
     assert m["mode"] == "signed" and m["scenario"] == "secure" and m["image"]["variant"] == "crypt"
     assert m["fwcrypto_init"] is True and m["key_export"] == KEY_EXPORT
     r = env.docker.runs_of("boot-slot.sh")[0]
-    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "1", "MAX_PIECE": "268435456"}
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "1", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": ""}
     assert sorted(r["seed"]) == ["meta-data", "user-data"]               # first-boot files on signed boards too
     crypt_set = env.current("crypt")["set"]
     assert Path(r["mounts"]["/in"].source) == env.image_root / crypt_set

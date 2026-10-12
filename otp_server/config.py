@@ -65,6 +65,7 @@ DEFAULTS: dict[str, Any] = {
     #: partition for its first boot (everything else; :mod:`otp_server.firstboot`).
     "image": {
         "name": "rpios-trixie-arm64-lite",
+        "custom": "",
         "hostname": "pi5-{serial}",
         "timezone": "Europe/Kyiv",
         "keyboard": "us",
@@ -152,6 +153,9 @@ class ImageCfg:
     wifi_password: str
     wifi_country: str
     wifi_hidden: bool
+    #: The custom OS image stage 3 writes instead of the station's (the id of an image uploaded on the page;
+    #: "" = the station image). :mod:`otp_server.artifacts.custom`.
+    custom: str = ""
 
 
 @dataclass
@@ -550,6 +554,7 @@ def parse_image(img: Mapping) -> ImageCfg:
         wifi_password=_checked("image.wifi_password", imageconfig.check_wifi_password, wifi_password),
         wifi_country=_checked("image.wifi_country", imageconfig.check_country, text("wifi_country")),
         wifi_hidden=_bool(img.get("wifi_hidden"), "image.wifi_hidden"),
+        custom=_checked("image.custom", imageconfig.check_custom, text("custom")),
     )
 
 

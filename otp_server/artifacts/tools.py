@@ -74,10 +74,11 @@ class ToolsImage:
                 Mount.bind(Path(self.cfg.repo_root) / "external", "/ext", readonly=True)]
 
     def run_script(self, script: str, args: Sequence[str] = (), *, mounts: Sequence[Mount] = (),
-                   env: dict[str, str] | None = None, log: LogFn | None = None) -> int:
-        """Run ``otp-run <script> [args]`` in the tools image (raises DockerError on failure)."""
+                   env: dict[str, str] | None = None, log: LogFn | None = None, privileged: bool = False) -> int:
+        """Run ``otp-run <script> [args]`` in the tools image (raises DockerError on failure). ``privileged``
+        only for scripts that loop-mount and chroot (custom-image.sh)."""
         return self.docker.run(self.tag, [script, *args], mounts=[*self.standard_mounts(), *mounts],
-                               env=env, log=log, check=True)
+                               env=env, log=log, check=True, privileged=privileged)
 
     def status(self, job: Any = None) -> dict:
         """Artifact status dict (SPEC §8) for target ``tools``."""

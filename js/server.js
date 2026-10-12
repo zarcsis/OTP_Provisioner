@@ -8,8 +8,7 @@
  * ({ready:false, reason, job}) so the caller can wait for a build.
  *
  * OTP.api.available is false when the page is opened from file:// or the
- * server did not answer /api/status; the page then offers only the manual
- * (advanced) mode.
+ * server did not answer /api/status; the page then only says how to start it.
  */
 (function () {
     'use strict';
@@ -107,6 +106,44 @@
             imageSettings() { return request('GET', '/api/image'); },
             /** Save changed image settings; password/wifi_password: "" removes, a string sets. */
             saveImageSettings(body) { return request('POST', '/api/image', body); },
+            /** The uploaded custom OS images (also in /api/status as custom_images). */
+            customImages() { return request('GET', '/api/custom-images'); },
+            prepareCustomImage(id, force) { return request('POST', `/api/custom-images/${enc(id)}/prepare`, { force: !!force }); },
+            deleteCustomImage(id) { return request('DELETE', `/api/custom-images/${enc(id)}`); },
+            /**
+             * Upload a raw .img (a File) as the request body, with progress: onProgress(sent, total).
+             * Resolves {image, new, job}; rejects with ApiError. Returns {promise, abort()}.
+             */
+            uploadCustomImage(file, onProgress) {
+                const XHR = opts.XMLHttpRequest || window.XMLHttpRequest;
+                const xhr = new XHR();
+                const promise = new Promise((resolve, reject) => {
+                    xhr.open('PUT', `${base}/api/custom-images?name=${enc(file.name || 'custom.img')}`);
+                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                    xhr.setRequestHeader('Accept', 'application/json');
+                    if (xhr.upload && onProgress) xhr.upload.onprogress = (e) => onProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+                    xhr.onload = () => {
+                        let data = null;
+                        try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch (e) { data = { detail: String(xhr.responseText).slice(0, 500) }; }
+                        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+                        else reject(new ApiError(xhr.status, detailOf(data), data));
+                    };
+                    xhr.onerror = () => reject(new ApiError(0, 'the upload failed (connection lost)'));
+                    xhr.onabort = () => reject(new ApiError(0, 'the upload was cancelled'));
+                    xhr.send(file);
+                });
+                return { promise, abort: () => xhr.abort() };
+            },
+            /**
+             * Prepare the image file of a locked board for Raspberry Pi Imager; source: "" = the station image,
+             * a custom image id, or null (the image.custom setting). Resolves the summary ({ready:true, name,
+             * size, url, notes}) or the 409 body ({ready:false, reason, job}) while a part is being built.
+             */
+            async imagerImage(serial, source) {
+                const r = await request('POST', `/api/modules/${enc(serial)}/imager-image`, { source: source === undefined ? null : source }, { allow: [409] });
+                if (r && r.ready === undefined) r.ready = true;
+                return r;
+            },
             identify(body) { return request('POST', '/api/fastboot/identify', body); },
             builds() { return request('GET', '/api/builds'); },
             startBuild(target, force) { return request('POST', `/api/builds/${enc(target)}`, { force: !!force }); },

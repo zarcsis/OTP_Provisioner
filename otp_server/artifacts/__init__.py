@@ -15,6 +15,9 @@ that board and stage named (path + sha256), never a re-resolved newer artifact. 
 directories are kept (gadget builds are versioned, image sets and per-board dirs are content-keyed), so
 a pinned path stays valid; if it changed or vanished anyway, the download is refused (NotReady) and the
 page has to restart the stage.
+
+The image file for Raspberry Pi Imager (``imager_image``, a board locked to our key) is pinned the same
+way: the file the page downloads is assembled from exactly the pieces the preparing call named.
 """
 from __future__ import annotations
 
@@ -67,6 +70,7 @@ class Artifacts:
         self.gadget = GadgetBuilder(cfg, docker, jobs, self.tools, self.hashes)
         self.image = ImageBuilder(cfg, docker, jobs, self.tools, self.hashes)
         self._pins: OrderedDict[tuple[str, int], dict[str, tuple[Path, str]]] = OrderedDict()
+        self._imager: OrderedDict[str, dict] = OrderedDict()
         self._pins_lock = threading.Lock()
         try:
             for p in sweep_stale_temp(Path(cfg.work_dir)):
@@ -96,7 +100,8 @@ class Artifacts:
         return self.jobs.submit(target, TITLES[target], fn, dedupe=True)
 
     def auto_build(self) -> list:
-        """Start what is missing: tools image, gadget, the OS images (both variants)."""
+        """Start what is missing: tools image, gadget, the OS images (both variants), and the preparation of
+        the custom image the settings name (``image.custom``) when it is on this station."""
         started = []
         if not self.tools.ready():
             started.append(self.start_build("tools"))
@@ -104,7 +109,20 @@ class Artifacts:
             started.append(self.start_build("gadget"))
         if self.image.missing_variants():
             started.append(self.start_build("image"))
+        cid = str(getattr(self.cfg.image, "custom", "") or "")
+        if cid and self.custom.info(cid) is not None and self.custom.missing(cid) \
+                and self.jobs.active(f"custom:{cid}") is None and not self.custom.errors(cid):
+            started.append(self.custom.start_prepare(cid))
         return started
+
+    # ------------------------------------------------------------------ custom images
+    @property
+    def custom(self) -> Any:
+        """The uploaded custom OS images (:class:`otp_server.artifacts.custom.CustomImages`)."""
+        return self.image.custom
+
+    def custom_images(self) -> list[dict]:
+        return self.custom.status()
 
     # ------------------------------------------------------------------ stages
     def _board(self, record: dict) -> bool:
@@ -171,6 +189,51 @@ class Artifacts:
         with self._pins_lock:
             for k in [k for k in self._pins if k[0] == key]:
                 del self._pins[k]
+            self._imager.pop(key, None)
+
+    # ------------------------------------------------------------------ the image file for Raspberry Pi Imager
+    def imager_image(self, serial: str, source: str | None = None) -> dict:
+        """Prepare the disk image file of a board locked to our key (signed boot partition, LUKS2 root keyed to
+        its OTP key and SD card) from the station image (``source`` "") or a custom one (its id; None = the
+        ``image.custom`` setting). Returns ``{"ready": true, "name", "size", "url", "notes", ...}``; raises
+        NotReady while a part is being built or the board is not ready for it."""
+        record = self.modules.require(serial)
+        serial = str(record.get("serial") or serial)
+        if not self._board(record):
+            raise NotReady(f"board {serial} is not locked to its key: the image file is for a board that went through "
+                           "the secure scenario (stage 1 locks it, stage 3 exports its OTP device key)")
+        summary, plan, paths = self.image.imager_image(record, source=source,
+                                                       secrets_fn=lambda: self.modules.secrets_for(serial))
+        shas = summary.get("shas") or {}
+        key = _pin_key(serial, 0)[0]
+        with self._pins_lock:
+            self._imager[key] = {"name": summary["name"], "plan": plan,
+                                 "files": {n: (Path(p), shas.get(n, "")) for n, p in paths.items()}}
+            self._imager.move_to_end(key)
+            while len(self._imager) > 64:
+                self._imager.popitem(last=False)
+        out = {k: v for k, v in summary.items() if k != "shas"}
+        out.update(ready=True, url=f"/api/modules/{serial}/imager-image/{summary['name']}")
+        return out
+
+    def imager_file(self, serial: str, name: str) -> Any:
+        """The :class:`~otp_server.diskimage.DiskPlan` the last :meth:`imager_image` of this board prepared;
+        FileNotFoundError for another name, NotReady when a piece changed since (prepare it again)."""
+        key = _pin_key(serial, 0)[0]
+        with self._pins_lock:
+            entry = self._imager.get(key)
+        if entry is None:
+            raise NotReady(f"the image file of {serial} has not been prepared (or the server restarted): prepare it again")
+        if entry["name"] != name:
+            raise FileNotFoundError(f"{name} is not the image file prepared for {serial}")
+        for n, (path, sha) in entry["files"].items():
+            try:
+                same = path.is_file() and (not sha or self.hashes.sha256(path) == sha)
+            except OSError:
+                same = False
+            if not same:
+                raise NotReady(f"{n} changed after the image file was prepared; prepare it again")
+        return entry["plan"]
 
     def stage_file(self, serial: str, stage: int, name: str) -> Path:
         """Path of a file named in the last manifest issued for this board and stage.

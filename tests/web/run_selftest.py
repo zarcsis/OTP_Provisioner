@@ -191,11 +191,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._json(405, {"detail": "read-only"})
 
-    def do_PUT(self) -> None:
+    def _api_body(self, method: str) -> None:
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        body = self.rfile.read(n) if n else b""
+        if urllib.parse.urlsplit(self.path).path.startswith("/api/"):
+            self._api(method, self.path, body)
+            return
         self._json(405, {"detail": "read-only"})
 
-    do_DELETE = do_PUT
-    do_PATCH = do_PUT
+    def do_PUT(self) -> None:
+        self._api_body("PUT")
+
+    def do_DELETE(self) -> None:
+        self._api_body("DELETE")
+
+    def do_PATCH(self) -> None:
+        self._json(405, {"detail": "read-only"})
 
 
 def demo_inject(state: str) -> str:

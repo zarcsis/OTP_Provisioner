@@ -188,7 +188,7 @@ def test_setting_defaults_are_defaults_without_bootstrap():
     assert "paths.work" not in keys
     assert "paths.droneos" not in keys and "builds.image.config" not in keys     # retired
     assert [k for k in keys if k.startswith("image.")] == [
-        "image.name", "image.hostname", "image.timezone", "image.keyboard", "image.user", "image.password_hash",
+        "image.name", "image.custom", "image.hostname", "image.timezone", "image.keyboard", "image.user", "image.password_hash",
         "image.ssh",
         "image.ssh_password_login", "image.ssh_authorized_keys", "image.wifi_ssid", "image.wifi_password",
         "image.wifi_country", "image.wifi_hidden"]

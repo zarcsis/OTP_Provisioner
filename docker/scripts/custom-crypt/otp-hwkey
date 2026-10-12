@@ -1,0 +1,47 @@
+#!/bin/sh
+# otp-hwkey - cryptsetup keyscript (crypttab "keyscript="), installed by the OTP provisioning station.
+#
+# Prints the passphrase of the board's encrypted root: the 64 lowercase hex characters of
+# HMAC-SHA256(the board's OTP device key, the storage card's CID + "\n"), computed by the firmware
+# (rpi-fw-crypto, key-id 1; the key itself never reaches Linux). The station built the LUKS2 container
+# with the same derivation (the CID as the fastboot gadget reported it), so only this board with this
+# card opens it. Same derivation as rpi-image-gen's "hwkey" keyscript, with the CID read from sysfs
+# instead of block-device-id (not packaged for every release): block-device-id prints that sysfs text.
+#
+# Runs in the initramfs (busybox or klibc sh); CRYPTTAB_SOURCE is the LUKS device, e.g. /dev/mmcblk0p2.
+set -e
+
+dev=${CRYPTTAB_SOURCE:-/dev/mmcblk0p2}
+if [ -L "$dev" ]; then
+    dev=$(readlink -f "$dev")
+fi
+name=${dev##*/}
+disk=$name
+if [ -e "/sys/class/block/$name/partition" ]; then
+    parent=$(readlink -f "/sys/class/block/$name/..")
+    disk=${parent##*/}
+fi
+if [ ! -r "/sys/class/block/$disk/device/cid" ]; then
+    echo "otp-hwkey: $dev is not on an SD/eMMC card (no /sys/class/block/$disk/device/cid)" >&2
+    exit 1
+fi
+cid=$(cat "/sys/class/block/$disk/device/cid")
+# The message goes through a regular file, never a pipe: rpi-fw-crypto 20251002 (bookworm) sizes its
+# input with fseek/ftell, fails on a pipe without a word, and cryptsetup is left with an empty key.
+msg=/run/otp-hwkey.$$
+printf '%s\n' "$cid" > "$msg"
+rc=0
+key=$(rpi-fw-crypto hmac --in "$msg" --key-id 1 --outform hex) || rc=$?
+rm -f "$msg"
+good=0
+if [ "$rc" -eq 0 ] && [ ${#key} -eq 64 ]; then
+    good=1
+fi
+case "$key" in
+    *[!0-9a-f]*) good=0 ;;
+esac
+if [ "$good" -ne 1 ]; then
+    echo "otp-hwkey: rpi-fw-crypto hmac --key-id 1 failed (exit $rc, ${#key} characters; is the OTP device key provisioned?)" >&2
+    exit 1
+fi
+printf '%s' "$key"

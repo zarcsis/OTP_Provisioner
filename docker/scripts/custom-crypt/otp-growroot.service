@@ -1,0 +1,13 @@
+[Unit]
+Description=Grow the encrypted root to the whole storage device (OTP provisioning station)
+ConditionPathExists=!/var/lib/otp-station/root-grown
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/otp-growroot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

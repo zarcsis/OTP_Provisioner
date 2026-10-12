@@ -12,6 +12,8 @@
 #   android-sdk-libsparse-utils      simg2img, img2simg, simg2simg, simg_dump
 #   cryptsetup-bin, python3-cryptography   root-luks.sh: the board's LUKS2 container (header + AES-XTS)
 #   jq, zstd, tar, gawk, sed, grep   JSON manifests, rpi-image-gen deploy artefacts, bootfiles.bin
+#   fdisk, e2fsprogs, mount          custom-image.sh: an uploaded .img (sfdisk, dumpe2fs, debugfs, e2fsck,
+#                                    resize2fs, loop mounts for the arm64 chroot of its secure variant)
 #
 # Build (context = docker/):
 #   docker build -t otp-tools:latest -f docker/tools.Dockerfile docker/
@@ -37,11 +39,13 @@ RUN apt-get update \
         file jq zstd mtools dosfstools \
         android-sdk-libsparse-utils \
         cryptsetup-bin python3-cryptography \
+        fdisk e2fsprogs mount util-linux \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c "import Cryptodome.PublicKey.RSA, Cryptodome.Signature.pkcs1_15" \
     && python3 -c "from cryptography.hazmat.primitives.ciphers import modes; modes.XTS" \
-    && for t in simg2img img2simg simg2simg simg_dump mcopy mdir mkfs.fat strings xxd jq zstd cryptsetup; do \
+    && for t in simg2img img2simg simg2simg simg_dump mcopy mdir mkfs.fat fsck.fat strings xxd jq zstd cryptsetup \
+                sfdisk blkid dumpe2fs debugfs e2fsck resize2fs losetup mount chroot; do \
            command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; \
        done
 

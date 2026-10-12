@@ -16,6 +16,15 @@ and partition map (``config_hash``).
 The image is the same for every board. Stage 3 serves each board its own boot partition
 (``boot-slot.sh``): the image's, with the board's first-boot files (:mod:`otp_server.firstboot`: account,
 SSH, Wi-Fi, host name, time zone as cloud-init files) and, on a board locked to our key, re-signed.
+
+Instead of the station image, stage 3 can write an operator's own image (``image.custom``, uploaded on the
+page; :mod:`otp_server.artifacts.custom` prepares its clear and crypt sets). Such an image gets the
+first-boot files only when it has cloud-init; on a signed board its own boot partition keeps every file and
+gains boot.img + boot.sig (``INPLACE=1``).
+
+For a board whose OTP is locked to our key and whose device key the station holds, :meth:`imager_image`
+assembles the same signed boot partition and encrypted root as one disk image file for Raspberry Pi
+Imager (written to that board's SD card in a card reader: the root is keyed to the card's CID).
 """
 from __future__ import annotations
 
@@ -25,6 +34,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import diskimage
 from .. import firstboot
 from .. import imageconfig
 from .. import imagejson
@@ -33,6 +43,7 @@ from ..docker import Mount
 from .common import (NotReady, StageFile, TempFiles, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
                      git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, rmtree,
                      write_json)
+from .custom import CustomImages
 
 WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key the LUKS root is bound to; "
                 "a copy is exported to the station); it can never be changed or erased")
@@ -72,6 +83,7 @@ class ImageBuilder:
         self.jobs = jobs
         self.tools = tools
         self.hashes = hashes
+        self.custom = CustomImages(cfg, docker, jobs, tools, hashes)
 
     # ------------------------------------------------------------------ paths / identity
     @property
@@ -410,19 +422,56 @@ class ImageBuilder:
         return base
 
     # ------------------------------------------------------------------ stage 3
+    def source_set(self, variant: str, source: str | None = None) -> tuple[Path, dict, dict]:
+        """``(set dir, manifest, source)`` of the image a board gets: ``source`` is "" for the station image
+        or a custom image id; None = the ``image.custom`` setting. The third item says which:
+        ``{"kind": "station" | "custom", "id", "name", "cloud_init"}``. NotReady while it is not there."""
+        variant = check_variant(variant)
+        scenario = "secure" if variant == "crypt" else "open"
+        src = str(getattr(self.cfg.image, "custom", "") or "") if source is None else str(source or "")
+        if src:
+            set_dir, man = self.custom.servable_set(src, variant)
+            return set_dir, man, {"kind": "custom", "id": src, "name": str(man.get("name") or src),
+                                  "cloud_init": bool(man.get("cloud_init"))}
+        cur = self.published_set(variant)
+        if cur is None:
+            raise NotReady(f"the OS image for the {scenario} scenario ({variant}) is not built yet",
+                           self.jobs.active("image"))
+        set_dir, man = cur
+        why = self.rebuild_reason(man, variant)
+        if why is not None:
+            raise NotReady(why, self.jobs.active("image"))
+        return set_dir, man, {"kind": "station", "id": "", "name": str(man.get("name") or ""), "cloud_init": True}
+
+    @staticmethod
+    def _seed_for(img_cfg: Any, serial: str, source: dict) -> firstboot.Seed:
+        """The board's first-boot files: the station's cloud-init seed, or nothing for an image without
+        cloud-init (it boots with the configuration it was made with)."""
+        if source.get("cloud_init", True):
+            return firstboot.render(img_cfg, serial)
+        return firstboot.Seed(files={}, cmdline="", instance_id="", summary={"applied": False})
+
     def _board_boot(self, record: dict, set_dir: Path, simage: str, pieces: list[dict], *, signed: bool,
-                    seed: firstboot.Seed, secrets_fn) -> list[StageFile]:
+                    seed: firstboot.Seed, secrets_fn, custom: bool = False) -> list[StageFile]:
         """The board's own boot slot pieces (boot-slot.sh), via a quick build: the image's boot partition
         with the board's first-boot files and cmdline additions, re-signed with the board key when
-        ``signed``."""
+        ``signed``. ``custom``: an operator's image -- signed, its own boot partition keeps its files
+        (``INPLACE=1``) and boot.img leaves out what a Pi 5 never loads (``PRUNE=pi5``); unsigned and
+        without first-boot files, its boot partition is served as it is."""
         serial = str(record.get("serial") or "")
         if len(pieces) != 1:
             raise NotReady(f"boot partition image {simage} is split into {len(pieces)} pieces; "
                            "a split boot image is not supported")
+        if not signed and not seed.files and not seed.cmdline:
+            return [StageFile(str(p["name"]), set_dir / str(p["name"]), int(p["size"]), str(p["sha256"]),
+                              f"image {set_dir.name}") for p in pieces]
         khash = str(record.get("customer_key_hash") or "") if signed else ""
         max_piece = int(self.cfg.provisioning.max_piece_size)
+        inplace = "1" if custom and signed else "0"
+        prune = "pi5" if custom and signed else ""
         fp = fingerprint("stage3-boot", set_dir.name, simage, [p.get("sha256") for p in pieces], signed, khash,
-                         seed.digest(), self.tools.hash(), self.tools.script_hash(BOOT_SCRIPT), max_piece)
+                         seed.digest(), self.tools.hash(), self.tools.script_hash(BOOT_SCRIPT), max_piece,
+                         inplace, prune)
         out_dir = Path(self.cfg.work_dir) / "modules" / serial / "stage3" / fp
         seed_files = {f"files/{name}": data for name, data in seed.files.items()}
         seed_files["cmdline.append"] = (seed.cmdline + "\n").encode("utf-8")
@@ -432,7 +481,8 @@ class ImageBuilder:
                 return
             self.tools.ensure(job.log)
             part = fresh_partial(out_dir)
-            env = {"SIMAGE": simage, "SIGN": "1" if signed else "0", "MAX_PIECE": str(max_piece)}
+            env = {"SIMAGE": simage, "SIGN": "1" if signed else "0", "MAX_PIECE": str(max_piece),
+                   "INPLACE": inplace, "PRUNE": prune}
             mounts = [Mount.bind(set_dir, "/in", readonly=True), Mount.bind(part, "/out")]
             with TempFiles(self.cfg.work_dir, seed_files) as sdir:
                 mounts.append(Mount.bind(sdir, "/seed", readonly=True))
@@ -450,6 +500,9 @@ class ImageBuilder:
                 raise RuntimeError(f"{BOOT_SCRIPT} reported no pieces")
             if bool(res.get("signed")) != signed:
                 raise RuntimeError(f"{BOOT_SCRIPT} made a {'signed' if res.get('signed') else 'unsigned'} slot")
+            if signed and res.get("key_locked") is not True:
+                raise RuntimeError(f"{BOOT_SCRIPT} did not lock the OTP device key (lock_device_private_key=1) "
+                                   "in the signed boot.img")
             if sorted(res.get("seed") or []) != sorted(seed.files):
                 raise RuntimeError(f"{BOOT_SCRIPT} wrote first-boot files {res.get('seed')}, expected "
                                    f"{sorted(seed.files)}")
@@ -466,7 +519,8 @@ class ImageBuilder:
         require_quick_build(self.jobs, f"stage3:{serial}", f"Stage 3 boot partition for {serial}", build,
                             lambda: is_complete(out_dir), f"the boot partition of {serial} ({simage})")
         res = read_json(out_dir / "slot.json")
-        what = (f"{simage} with this board's first-boot files"
+        extra = " with this board's first-boot files" if seed.files else ""
+        what = (f"{simage}{extra}"
                 + (", re-signed with the board key (boot.img + boot.sig)" if signed else ""))
         return [self.hashes.stage_file(str(p["file"]), out_dir / str(p["file"]), what)
                 for p in res.get("pieces") or []]
@@ -581,14 +635,8 @@ class ImageBuilder:
         serial = str(record.get("serial") or "")
         variant = "crypt" if secure else "clear"
         scenario = "secure" if secure else "open"
-        cur = self.published_set(variant)
-        if cur is None:
-            raise NotReady(f"the OS image for the {scenario} scenario ({variant}) is not built yet",
-                           self.jobs.active("image"))
-        set_dir, man = cur
-        why = self.rebuild_reason(man, variant)
-        if why is not None:
-            raise NotReady(why, self.jobs.active("image"))
+        set_dir, man, source = self.source_set(variant)
+        custom = source["kind"] == "custom"
         ij = imagejson.load(set_dir / "image.json")
         disk = imagejson.storage_device(ij)
         encrypted = imagejson.is_encrypted(ij)
@@ -597,7 +645,7 @@ class ImageBuilder:
                            f"{scenario} scenario needs {'an encrypted' if secure else 'a clear'} image; rebuild it",
                            self.jobs.active("image"))
         prov = self.cfg.provisioning
-        origin = f"image {man.get('set', set_dir.name)}"
+        origin = f"{'custom ' if custom else ''}image {man.get('set', set_dir.name)}"
         msim: dict = man.get("simages") or {}
         order = [s for s in imagejson.simages(ij) if s in msim] + [s for s in msim if s not in imagejson.simages(ij)]
         missing = [s for s in imagejson.simages(ij) if s not in msim]
@@ -612,17 +660,18 @@ class ImageBuilder:
         if not boots:
             raise NotReady(f"image set {set_dir.name} has no boot partition image for the first-boot files; "
                            "rebuild the image")
-        seed = firstboot.render(self.cfg.image, serial)
+        seed = self._seed_for(self.cfg.image, serial, source)
         for b in boots:
-            parts[b] = self._board_boot(record, set_dir, b, msim[b], signed=signed, seed=seed, secrets_fn=secrets_fn)
-        fb = seed.summary
-        notes.append(f"first boot (cloud-init, files in the boot partition): host name {fb['hostname']}, "
-                     + (f"user {fb['user']}" if fb["user"] else "the Raspberry Pi OS wizard asks for a user")
-                     + f", SSH {'on' if fb['ssh'] else 'off'}, "
-                     + (f"Wi-Fi {fb['wifi_ssid']!r}" if fb["wifi_ssid"] else "no Wi-Fi network")
-                     + f" ({fb['wifi_country']}), {fb['timezone']}")
+            parts[b] = self._board_boot(record, set_dir, b, msim[b], signed=signed, seed=seed, secrets_fn=secrets_fn,
+                                        custom=custom)
+        if custom:
+            osname = (man.get("os") or {}).get("pretty_name") or ""
+            notes.append(f"custom image {source['name']}{' (' + osname + ')' if osname else ''}, uploaded to the station")
+        notes.append(_firstboot_note(seed))
         if signed:
             notes.append("board OTP is locked to our key: boot partition re-signed for this board")
+            notes.append("lock_device_private_key=1 in the signed config.txt: the running OS cannot read the OTP "
+                         "device key (hmac and sign, which unlock the root, still work)")
         ijm = man.get("image_json") or {}
         ij_path = set_dir / "image.json"
         ij_sf: StageFile | None = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
@@ -682,7 +731,8 @@ class ImageBuilder:
             "image": {"name": man.get("name", ""), "version": man.get("version", ""),
                       "set": man.get("set", set_dir.name), "built": man.get("built"),
                       "variant": variant, "device_class": man.get("device_class", ""),
-                      "storage_type": man.get("storage_type", ""), "encrypted": encrypted},
+                      "storage_type": man.get("storage_type", ""), "encrypted": encrypted,
+                      "source": source["kind"], "custom": source["id"]},
             "storage_device": disk,
             "pending": pending,
             "image_json": _entry(ij_sf, file_url(base_url, serial, 3, "image.json")) if ij_sf else None,
@@ -699,6 +749,106 @@ class ImageBuilder:
             "notes": notes,
         }
         return manifest, paths
+
+    def imager_image(self, record: dict, *, source: str, secrets_fn) -> tuple[dict, "diskimage.DiskPlan", dict[str, Path]]:
+        """The disk image file of a locked board: ``(summary, plan, {file name: path})``.
+
+        What stage 3 would write in the secure scenario, as one file Raspberry Pi Imager writes to the card:
+        the partition table of the image set (its disk identifier and partition alignment), the board's
+        signed boot partition, its LUKS2 root (keyslot 0 = the board's OTP key + the card's CID). The caller
+        has checked that the board is locked to our key. NotReady while the station lacks the device key or
+        the card's CID (both come from one stage 3 run), or while a part is being built.
+        """
+        serial = str(record.get("serial") or "")
+        set_dir, man, src = self.source_set("crypt", source)
+        custom = src["kind"] == "custom"
+        ij = imagejson.load(set_dir / "image.json")
+        if not imagejson.is_encrypted(ij):
+            raise NotReady(f"image set {set_dir.name} is not an encrypted (crypt) set")
+        if not (secrets_fn() or {}).get("device_private_pem"):
+            raise NotReady(f"the station does not hold the OTP device key of {serial} yet: run stage 3 once in the "
+                           "secure scenario (it exports the key and records the SD card)")
+        msim: dict = man.get("simages") or {}
+        boots = [b for b in imagejson.boot_simages(ij) if b in msim]
+        if len(boots) != 1:
+            raise NotReady(f"image set {set_dir.name} has {len(boots)} boot partition images, expected one")
+        seed = self._seed_for(self.cfg.image, serial, src)
+        boot_files = self._board_boot(record, set_dir, boots[0], msim[boots[0]], signed=True, seed=seed,
+                                      secrets_fn=secrets_fn, custom=custom)
+        luks = self._station_luks(record, set_dir, ij, msim, secrets_fn)
+        if luks is None:
+            raise NotReady(f"the station does not hold the OTP device key of {serial} yet")
+        board_ij = luks["image"]
+        files = {boots[0]: boot_files, **luks["parts"]}
+        images = imagejson.partition_images(board_ij)
+        layout = []
+        for name in imagejson.partition_order(board_ij):
+            attrs = images.get(name) or {}
+            simage = str(attrs.get("simage") or "")
+            if simage not in files:
+                raise NotReady(f"image set {set_dir.name}: no pieces for partition {name!r} ({simage})")
+            ptype = str(attrs.get("partition-type") or ("0xC" if attrs.get("type") == "vfat" else "0x83"))
+            try:
+                code = int(ptype, 16)
+            except ValueError:
+                raise NotReady(f"partition {name!r} has no MBR partition type ({ptype!r})") from None
+            layout.append((code, int(attrs.get("size") or 0), [f.path for f in files[simage]],
+                           False))
+        table = (board_ij.get("layout") or {}).get("partitiontable") or {}
+        if str(table.get("label") or "dos") != "dos":
+            raise NotReady("the image file is made for MBR images only")
+        try:
+            disk_id = int(str(table.get("id") or "0"), 16)
+            align = diskimage.parse_size((board_ij.get("attributes") or {}).get("image-palign-bytes") or "4M")
+            plan = diskimage.DiskPlan.build(disk_id, align, layout)
+        except (ValueError, sparse.SparseError) as exc:
+            raise NotReady(f"cannot lay out the image file: {exc}") from None
+        img_name = imageconfig.check_image_name(re_name(src["name"] if custom else str(man.get("name") or "image")))
+        name = f"{serial}-{img_name}-secure.img"
+        cid = str(((record.get("facts") or {}).get("fastboot") or {}).get("mmc-cid") or "").strip().lower()
+        paths = {f.name: f.path for pl in files.values() for f in pl}
+        shas = {f.name: f.sha256 for pl in files.values() for f in pl}
+        summary = {
+            "name": name, "size": plan.size, "source": src["kind"], "custom": src["id"],
+            "image": {"name": man.get("name", ""), "set": man.get("set", set_dir.name), "version": man.get("version", "")},
+            "disk_id": f"0x{plan.disk_id:08x}", "mmc_cid": cid,
+            "partitions": [{"start": p.start, "size": p.size, "type": f"0x{p.type:02x}", "content": p.content}
+                           for p in plan.partitions],
+            "firstboot": seed.summary if seed.files else {"applied": False},
+            "notes": [
+                f"for board {serial} and the SD card it had at stage 3 (CID {cid}): on any other card the board "
+                "cannot unlock the root file system",
+                "signed boot partition (boot.img + boot.sig, lock_device_private_key=1 in its config.txt) and the "
+                "LUKS2 root container: only ciphertext and signed boot files leave the station",
+                _firstboot_note(seed),
+                "Raspberry Pi Imager: Choose OS → Use custom → this file; answer No to OS customisation (the boot "
+                "files are signed; cloud-init files come from the station)",
+                "the root partition, its LUKS2 mapping and the file system grow to the whole card at the first boot "
+                "(otp-growroot)",
+            ],
+            "shas": shas,
+        }
+        return summary, plan, paths
+
+
+def re_name(name: str) -> str:
+    """An image name usable in a file name (letters, digits, '.', '_', '-'), from an upload's file name."""
+    stem = re.sub(r"\.img$", "", str(name), flags=re.I)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "image"
+    return stem[:64]
+
+
+def _firstboot_note(seed: firstboot.Seed) -> str:
+    """One line on what the board's first boot gets from the station."""
+    fb = seed.summary or {}
+    if not seed.files:
+        return ("this image has no cloud-init: the station's first-boot settings (account, SSH, Wi-Fi, host name) are "
+                "not written; the board boots with the configuration the image was made with")
+    return (f"first boot (cloud-init, files in the boot partition): host name {fb['hostname']}, "
+            + (f"user {fb['user']}" if fb["user"] else "the Raspberry Pi OS wizard asks for a user")
+            + f", SSH {'on' if fb['ssh'] else 'off'}, "
+            + (f"Wi-Fi {fb['wifi_ssid']!r}" if fb["wifi_ssid"] else "no Wi-Fi network")
+            + f" ({fb['wifi_country']}), {fb['timezone']}")
 
 
 def _entry(f: StageFile, url: str) -> dict:

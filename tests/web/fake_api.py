@@ -6,7 +6,9 @@ page makes around a run: the scenario choice (POST /api/modules/{serial}/mode), 
 hand-over (POST /api/modules/{serial}/device-key) and stage manifests (stage 3 names the gadget's key
 export paths for a secure board; stages 2 and 3 of a secure board answer 409 until its OTP holds its key
 hash, like otp_server/artifacts). Whole provisioning runs are exercised in JS with an in-page fake
-(tests/web/mocks.js).
+(tests/web/mocks.js). Custom OS images: the list (in /api/status too), an upload (PUT, the raw body), prepare
+and delete; the image file for Raspberry Pi Imager of a locked board answers 409 with a running job first,
+then the summary.
 
 Test hooks (run_selftest.py): :func:`set_status_overrides` merges into /api/status (e.g. a signed-out
 Google state), :func:`counts` tells how often each endpoint was hit, :func:`reset` restores everything.
@@ -75,7 +77,7 @@ def _module(serial: str, stage: str, label: str, updated: str, *, locked: bool =
                 "secure_boot_provisioned": locked, "device_key": device_key,
                 "device_key_fingerprint": "9c0d7e21f4a3b58c6d2e1f0a9b8c7d6e" if device_key else "",
                 "device_key_exported": exported},
-        "metadata": {}, "facts": {},
+        "metadata": {}, "facts": {"fastboot": {"mmc-cid": "035344534333324780b6e2a8d9012d00"}} if exported else {},
         "events": events or [{"t": "2026-09-30T09:12:44Z", "kind": "hello", "note": "created"}],
     }
 
@@ -104,18 +106,37 @@ _COUNTS: Counter = Counter()
 
 #: The image.* settings (otp_server.config.ImageCfg) behind GET/POST /api/image; secrets as the server keeps them.
 _INITIAL_IMAGE: dict[str, Any] = {
-    "name": "deb13-arm64-min", "hostname": "pi5", "timezone": "Europe/Kyiv", "keyboard": "us", "user": "pi", "password_hash": "",
+    "name": "deb13-arm64-min", "custom": "", "hostname": "pi5", "timezone": "Europe/Kyiv", "keyboard": "us", "user": "pi", "password_hash": "",
     "ssh": False, "ssh_password_login": True, "ssh_authorized_keys": [], "wifi_ssid": "", "wifi_password": "",
     "wifi_country": "UA", "wifi_hidden": False,
 }
 IMAGE: dict[str, Any] = copy.deepcopy(_INITIAL_IMAGE)
-IMAGE_FIELDS = ("name", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login", "ssh_authorized_keys",
-                "wifi_ssid", "wifi_country", "wifi_hidden")
+IMAGE_FIELDS = ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
+                "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")
+
+
+def _custom(cid: str, name: str, size: int, *, ready: bool = True, cloud_init: bool = False, error: str = "") -> dict:
+    """otp_server.artifacts.custom.CustomImages.status() of one uploaded image."""
+    v = {"ready": ready, "set": f"x-{cid[:4]}" if ready else "", "built": "2026-10-12T08:20:00Z" if ready else None,
+         "detail": "" if ready else "not prepared", "error": "" if ready else error}
+    return {"id": cid, "name": name, "size": size, "sha256": cid + "0" * 48, "uploaded": "2026-10-12T08:00:00Z",
+            "layout": {"label": "dos", "id": "0x8a438930", "bytes": size, "partitions": []},
+            "os": {"pretty_name": "Debian GNU/Linux 12 (bookworm)", "cloud_init": cloud_init} if ready else {},
+            "cloud_init": cloud_init if ready else None, "variants": {"clear": dict(v), "crypt": dict(v)},
+            "ready": ready, "selected": False, "job": None}
+
+
+_INITIAL_CUSTOM: list[dict[str, Any]] = [_custom("3d0c4b7e6a514f2e", "os.img", 6_442_450_944)]
+CUSTOM: list[dict[str, Any]] = copy.deepcopy(_INITIAL_CUSTOM)
+#: Calls of POST /api/modules/{serial}/imager-image per board (the first answers 409 with a running job).
+_IMAGER_CALLS: Counter = Counter()
 
 
 def reset() -> None:
     """Back to the canned state (modules, status overrides, request counts, image settings)."""
     MODULES[:] = copy.deepcopy(_INITIAL_MODULES)
+    CUSTOM[:] = copy.deepcopy(_INITIAL_CUSTOM)
+    _IMAGER_CALLS.clear()
     _STATUS_OVERRIDES.clear()
     _COUNTS.clear()
     IMAGE.clear()
@@ -136,8 +157,9 @@ def image_view() -> dict[str, Any]:
     """otp_server.app.Services.image_settings: no password or hash, only whether they are set."""
     i = IMAGE
     sudo = "passwd" if i["password_hash"] else ("nopasswd" if i["ssh"] and i["ssh_authorized_keys"] else "wizard")
-    view = {k: copy.deepcopy(i[k]) for k in ("name", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
-                                             "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")}
+    view = {k: copy.deepcopy(i[k]) for k in ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh",
+                                             "ssh_password_login", "ssh_authorized_keys", "wifi_ssid", "wifi_country",
+                                             "wifi_hidden")}
     view.update(password_set=bool(i["password_hash"]), wifi_password_set=bool(i["wifi_password"]), sudo=sudo)
     warnings = []
     if not i["password_hash"] and not (i["ssh"] and i["ssh_authorized_keys"]):
@@ -167,6 +189,8 @@ def _save_image(data: Any) -> tuple[int, Any]:
         return 400, {"detail": f"config image.timezone: time zone {changed['timezone']!r} is not in the image's tzdata"}
     if changed.get("wifi_country") is not None and str(changed["wifi_country"]).strip().upper() not in {c for c, _ in ch["countries"]}:
         return 400, {"detail": f"config image.wifi_country: Wi-Fi country {changed['wifi_country']!r} is not in wireless-regdb"}
+    if changed.get("custom") and not any(c["id"] == changed["custom"] for c in CUSTOM):
+        return 400, {"detail": f"config image.custom: no custom image {changed['custom']!r} on this station"}
     if data.get("password") is not None:
         changed["password_hash"] = ("$6$fakesalt$" + "x" * 86) if data["password"] else ""
     if data.get("wifi_password") is not None:
@@ -219,9 +243,53 @@ def status() -> dict[str, Any]:
         "usb_driver": {"platform": "windows", "rpiboot": True, "fastboot": False,
                        "detail": "WinUSB is not bound to 18d1:4e40 yet (wdi-simple -v 0x18d1 -p 0x4e40)"},
         "artifacts": _ARTIFACTS,
+        "custom_images": [dict(c, selected=c["id"] == IMAGE["custom"]) for c in CUSTOM],
         "jobs": list(_JOBS.values()),
     }
     return _merge(s, _STATUS_OVERRIDES)
+
+
+def _new_job(target: str, title: str, status: str = "queued") -> dict:
+    job = {"id": "f00d%04d" % (len(_JOBS) + int(time.time()) % 1000), "target": target, "title": title,
+           "status": status, "started": None, "finished": None, "rc": None, "error": "", "lines": 0}
+    _JOBS[job["id"]] = job
+    return job
+
+
+def _upload(query: str, body: bytes) -> tuple[int, Any]:
+    """PUT /api/custom-images?name=...: the raw image; a compressed file is refused like the server does."""
+    from urllib.parse import parse_qs
+
+    name = (parse_qs(query).get("name") or ["custom.img"])[0]
+    if body.startswith(b"\xfd7zXZ\x00"):
+        return 400, {"detail": "the file is xz-compressed: unpack it and upload the .img inside"}
+    cid = hashlib.sha256(body).hexdigest()[:16]
+    old = next((c for c in CUSTOM if c["id"] == cid), None)
+    if old is not None:
+        return 200, {"image": {"id": cid, "name": old["name"], "size": old["size"]}, "new": False, "job": None}
+    job = _new_job(f"custom:{cid}", f"Prepare custom image {name}", "running")
+    c = _custom(cid, name, len(body), ready=False)
+    c["job"] = job
+    CUSTOM.insert(0, c)
+    return 200, {"image": {"id": cid, "name": name, "size": len(body), "sha256": cid + "0" * 48}, "new": True, "job": job}
+
+
+def _imager(m: dict, data: dict) -> tuple[int, Any]:
+    """POST /api/modules/{serial}/imager-image: 409 + a running job the first time, then the summary."""
+    if not m["otp"]["locked_to_our_key"]:
+        return 409, {"ready": False, "job": None, "reason": f"board {m['serial']} is not locked to its key"}
+    _IMAGER_CALLS[m["serial"]] += 1
+    if _IMAGER_CALLS[m["serial"]] == 1:
+        return 409, {"ready": False, "reason": f"the encrypted root of {m['serial']} (root.luks.sparse) is still being prepared",
+                     "job": {"id": "c0ffee01", "target": f"stage3:{m['serial']}", "title": "Stage 3 encrypted root",
+                             "status": "running", "started": _now(), "finished": None, "rc": None, "error": "", "lines": 3}}
+    src = data.get("source")
+    custom = next((c for c in CUSTOM if c["id"] == src), None)
+    name = f"{m['serial']}-{(custom['name'][:-4] if custom else IMAGE['name'])}-secure.img"
+    return 200, {"ready": True, "name": name, "size": 5_905_580_032, "source": "custom" if custom else "station",
+                 "custom": src or "", "url": f"/api/modules/{m['serial']}/imager-image/{name}",
+                 "mmc_cid": m["facts"]["fastboot"]["mmc-cid"], "disk_id": "0x8a438930",
+                 "notes": [f"for board {m['serial']} and the SD card it had at stage 3", "Raspberry Pi Imager: Choose OS → Use custom"]}
 
 
 def _google_problem(s: dict) -> str:
@@ -324,7 +392,7 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
     rest = parts[1:]
     _COUNTS[f"{method} {'/'.join(rest[:1] + (['*'] if len(rest) > 1 else []))}"] += 1
     try:
-        data = json.loads(body) if body else {}
+        data = json.loads(body) if body and method != "PUT" else {}
     except ValueError:
         return 400, {"detail": "body is not JSON"}
     if method == "GET" and rest == ["status"]:
@@ -335,7 +403,7 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
                               "settings": {"ok": False, "error": "not signed in to Google"}})
         return 200, {"ok": True}
     st = status()
-    if rest[:1] in (["modules"], ["builds"], ["fastboot"], ["image"]) and st.get("google_ready") is False:
+    if rest[:1] in (["modules"], ["builds"], ["fastboot"], ["image"], ["custom-images"]) and st.get("google_ready") is False:
         return 401, {"detail": _google_problem(st)}
     if method == "GET" and rest == ["image"]:
         return 200, image_view()
@@ -343,6 +411,24 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
         return _save_image(data)
     if method == "GET" and rest == ["modules"]:
         return 200, sorted(MODULES, key=lambda m: m["updated"], reverse=True)
+    if method == "GET" and rest == ["custom-images"]:
+        return 200, status()["custom_images"]
+    if method == "PUT" and rest == ["custom-images"]:
+        return _upload(path.split("?", 1)[1] if "?" in path else "", body)
+    if method == "POST" and len(rest) == 3 and rest[0] == "custom-images" and rest[2] == "prepare":
+        c = next((x for x in CUSTOM if x["id"] == rest[1]), None)
+        if c is None:
+            return 404, {"detail": f"no custom image {rest[1]!r}"}
+        c["job"] = _new_job(f"custom:{c['id']}", f"Prepare custom image {c['name']}", "running")
+        return 200, {"job": c["job"]}
+    if method == "DELETE" and len(rest) == 2 and rest[0] == "custom-images":
+        c = next((x for x in CUSTOM if x["id"] == rest[1]), None)
+        if c is None:
+            return 404, {"detail": f"no custom image {rest[1]!r}"}
+        if IMAGE["custom"] == c["id"]:
+            return 400, {"detail": "the image is the one stage 3 writes (image.custom): choose another image first"}
+        CUSTOM.remove(c)
+        return 200, {"ok": True}
     if len(rest) >= 2 and rest[0] == "modules" and rest[1] != "hello":
         m = _find(rest[1])
         if m is None:
@@ -353,6 +439,8 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
             return _set_mode(m, data.get("mode"))
         if method == "POST" and rest[2:] == ["device-key"]:
             return _device_key(m, data if isinstance(data, dict) else {})
+        if method == "POST" and rest[2:] == ["imager-image"]:
+            return _imager(m, data if isinstance(data, dict) else {})
         if method == "GET" and len(rest) == 4 and rest[2] == "stage" and rest[3] in ("1", "2", "3"):
             n = int(rest[3])
             if n in (2, 3) and m["mode"] == "secure" and not (m["otp"]["locked"] and m["otp"]["locked_to_our_key"]):

@@ -37,6 +37,7 @@ IMAGE_USER = "pi"
 IMAGE_USER_GROUPS = "adm,dialout,cdrom,audio,users,video,games,plugdev,input,gpio,spi,i2c,netdev,render"
 
 _IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_CUSTOM_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -61,6 +62,14 @@ _SAMPLE_SERIAL = "0123abcd"
 def check_image_name(v: str) -> str:
     if not _IMAGE_NAME_RE.fullmatch(v):
         raise ValueError(f"image name {v!r}: letters, digits, '.', '_' and '-' only (up to 64)")
+    return v
+
+
+def check_custom(v: str) -> str:
+    """The id of an uploaded custom image (16 lowercase hex, the start of its sha256), or "" (the station image)."""
+    v = v.strip().lower()
+    if v and not _CUSTOM_ID_RE.fullmatch(v):
+        raise ValueError(f"custom image {v!r}: the id of an uploaded image (16 hex digits), or empty for the station image")
     return v
 
 
@@ -150,6 +159,7 @@ def public_view(img: Any) -> dict:
     """The settings without secrets (status, manifests, logs)."""
     return {
         "name": img.name,
+        "custom": getattr(img, "custom", ""),
         "hostname": img.hostname,
         "timezone": img.timezone,
         "keyboard": img.keyboard,

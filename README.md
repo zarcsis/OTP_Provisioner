@@ -19,7 +19,7 @@ is provisioned in one of two **scenarios**, picked on the page per board (both a
 | --- | --- | --- |
 | Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`) |
 | Stage 2 · Fastboot gadget | the gadget built by this server | the same gadget, `boot.sig` once the board is locked |
-| Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**; the **server builds the board's LUKS2 container** holding the root file system (`IGconf_image_pmap=crypt` image, keyslot 0 = the board's key) and the board writes that ciphertext raw, then proves its key opens it (`oem cryptcheck`, nothing is decrypted on the board); the boot partition carries the board's first-boot files and is re-signed per board |
+| Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**; the **server builds the board's LUKS2 container** holding the root file system (`IGconf_image_pmap=crypt` image, keyslot 0 = the board's key) and the board writes that ciphertext raw, then proves its key opens it (`oem cryptcheck`, nothing is decrypted on the board); the boot partition carries the board's first-boot files and is re-signed per board, with `lock_device_private_key=1` in the signed `config.txt` (the running OS cannot read the OTP key) |
 
 In every scenario a board goes through the same three stages:
 
@@ -27,7 +27,11 @@ In every scenario a board goes through the same three stages:
 | --- | --- | --- | --- |
 | 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, …) and reboots straight back into RPIBOOT (`set_reboot_order=0x3`, `recovery_reboot=1`). | `external/usbboot/rpi-eeprom` firmware, packed by `docker/scripts/stage1.sh` | `eeprom` |
 | 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with our build of rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` + `docker/fastbootd` | `gadget` |
-| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → stage-3 manifest again (the server encrypts the root for the board) → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / (secure) `oem cryptcheck` / `idpdone`) → `shutdown` (the board powers off). | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants | `flashed` |
+| 3 · Image | Page drives rpi-fastbootd: (secure) device key export → stage-3 manifest again (the server encrypts the root for the board) → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / (secure) `oem cryptcheck` / `idpdone`) → `shutdown` (the board powers off). | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants; or an operator's own image uploaded on the page (see "Custom OS images") | `flashed` |
+
+A board whose OTP is locked to its key can also be flashed **without the station**: its card gets an image
+file the station assembles for that board and card (signed boot partition, encrypted root), written with
+Raspberry Pi Imager (see "The image file for Raspberry Pi Imager").
 
 Status: both scenarios have provisioned a real Pi 5 end to end (stages 1-3, board `ebbdf4fd`, 2026-10-06):
 the open one with Wi-Fi, account and SSH set up at first boot, and the secure one with the signed boot
@@ -152,6 +156,8 @@ Build artifacts live **outside the repo**, in the work directory. The default is
 <work>/artifacts/gadget/<key>[-r<N>]/  built gadget + build-info.json (newest complete version served)
 <work>/artifacts/image/<set>/          IDP set: image.json, sparse pieces, manifest.json
 <work>/artifacts/image/current-clear.json, current-crypt.json   which set stage 3 serves per variant
+<work>/artifacts/custom/<id>/          an uploaded image: source.img, upload.json, its clear and crypt sets
+                                       (<variant>-<fingerprint>/), current-<variant>.json, error-<variant>.json
 <work>/modules/<serial>/stage{1,2}/<fp>/    per-board signed files (secure scenario only)
 <work>/modules/<serial>/stage3/<fp>/   the board's boot partition (first-boot files; re-signed on secure boards)
 <work>/modules/<serial>/luks/<fp>/     secure: the board's LUKS2 container (root.luks.sparse.N) + its image.json
@@ -229,14 +235,92 @@ worksheet. Open and secure boards get the same settings.
   `/boot/firmware`, and no `apt`/`dpkg` leftovers of the build (recommends are installed again, as on
   Raspberry Pi OS). The differences from the official image: no Pi 3/4 kernel, `cryptsetup` added (the
   secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, and on the
-  **secure** (crypt) image `rpi-eeprom-update.service` is off: that bootloader is signed for the board,
-  and only the station updates it.
+  **secure** (crypt) image `rpi-eeprom-update.service` is off (that bootloader is signed for the board,
+  and only the station updates it) and `otp-growroot.service` grows the encrypted root to the whole card at
+  the first boot (the partition when it ends before the card does, the LUKS2 mapping, the ext4 inside).
 * **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: the Pi 5 device, the
   `image-rpios` layout, the image name and the station layers) and mounts it read-only at `/cfg` for the
   build. `image/example.yaml` is that config for the default name (a test keeps it in sync).
 * **Building by hand** (Linux with Docker): `image/build.sh --docker -c image/example.yaml` or your own
   config; `image/build.sh --help` lists the options. `IGconf_*=value` words after the options are passed to
   rpi-image-gen; `builds.image.overrides` does the same for the station.
+
+## Custom OS images
+
+Instead of the station's Raspberry Pi OS Lite, stage 3 can write **an image of your own**: in the **OS image**
+panel, **Upload .img…** sends a raw disk image to the station (the same file you would flash with Raspberry Pi
+Imager), the station prepares it, and the **Image** list chooses what stage 3 writes (`image.custom` = the
+image's id; empty = the station image). Save applies it to the boards flashed from then on.
+
+**What the station takes:** an uncompressed `.img` (unpack `.img.xz` / `.zip` first) with an MBR and exactly
+two primary partitions, a FAT boot partition (0x0c, 0x0b, 0x0e or 0x06) and an ext4 root (0x83), with a
+Raspberry Pi 5 kernel (`kernel_2712.img` or `kernel8.img`), `config.txt` and `cmdline.txt` in the boot
+partition: what Raspberry Pi OS and pi-gen produce (bookworm or later). The upload is checked as it arrives
+(`otp_server/diskimage.py`: compressed files, GPT, partition count and types, file systems, a truncated upload)
+and stored under the first 16 hex digits of its SHA-256; the same file uploaded twice is kept once. Uploads stay
+on this station's disk (`<work>/artifacts/custom/`), only the choice is a setting.
+
+**Preparation** (a job per image, `docker/scripts/custom-image.sh` in the tools image, `--privileged`), one set
+per scenario:
+
+* **open** (`clear`): the image as it is. The boot partition is copied whole; the root file system becomes a
+  sparse image in which **only the blocks the ext4 allocation bitmaps mark free are left out**
+  (`docker/scripts/ext4_sparse.py`; a block in use is always written, even when it is all zeros, because a free
+  block may hold anything on the card and a used one may not). The image's own disk identifier, partition sizes
+  and first-partition offset are kept, so `PARTUUID=` entries in its `fstab` and `cmdline.txt` keep working;
+  nothing is grown (the image's own first-boot resizer, if it has one, does that). About a minute for a 6 GB image.
+* **secure** (`crypt`): a copy of the image that **unlocks a LUKS2 root with the board's OTP key at every boot**,
+  installed into the image itself (an arm64 chroot under QEMU, packages from the image's own apt sources, so the
+  station needs internet access and the image's sources must offer `cryptsetup-initramfs` (Debian) and
+  `rpifwcrypto` (archive.raspberrypi.com)): the keyscript `otp-hwkey` (the same derivation as rpi-image-gen's
+  `hwkey`: `HMAC(OTP key, SD CID + "\n")` by `rpi-fw-crypto`, the CID read from sysfs because
+  `block-device-id` is not packaged for bookworm, and handed over in a file under `/run` because bookworm's
+  `rpi-fw-crypto` cannot read a pipe), an initramfs hook that adds `rpi-fw-crypto` and the
+  dm-crypt / crypto modules, `/etc/crypttab` (`cryptroot UUID=<the set's LUKS UUID> none
+  luks,initramfs,keyscript=…`), the root in `/etc/fstab` and in `cmdline.txt` on `/dev/mapper/cryptroot`
+  (`init=…/firstboot` removed), `auto_initramfs=1` when `config.txt` loads no initramfs,
+  `otp-growroot.service`, `rpi-eeprom-update.service` masked; then `update-initramfs -u -k all` (with
+  `MODULES=most` for that run only: `dep` would guess the modules of the build container). The result is
+  checked (every initramfs on the boot partition has the keyscript, `rpi-fw-crypto`, the crypttab with that UUID
+  and the modules) and the root file system must pass `e2fsck`. The files the image had in `/boot/firmware`
+  stay there. About ten minutes. Stage 3 then encrypts the root for each board exactly like the station image's.
+
+**At stage 3** the board gets the image's boot partition as it is when the image has no cloud-init (the station
+cannot write the account, SSH, Wi-Fi and host name settings into such an image: it boots with the configuration
+it was made with, and the page says so); an image with cloud-init gets the first-boot files like the station
+image. On a board locked to our key the image's own boot partition gets `boot.img` (its files, without what a
+Raspberry Pi 5 never loads, and its `config.txt` with `lock_device_private_key=1` added), `boot.sig` and the
+`config.txt` that makes the bootloader load it; everything else the image keeps there stays (`boot-slot.sh` with
+`INPLACE=1`). Software in the image that reads the raw OTP key (`rpi-fw-crypto privkey`, `rpi-otp-private-key`)
+gets an error on a secure board; `hmac` and `sign` work. `boot.img` must stay under the bootloader's
+ramdisk limit (128 MiB).
+
+Worth knowing about a secure board with any image: the bootloader boots the signed `boot.img`, so changes the
+running system makes in `/boot/firmware` (`cmdline.txt`, `config.txt`, a new kernel or initramfs) have no
+effect until the board is provisioned again.
+
+The panel lists every uploaded image with its state per scenario and the job log; **Prepare again** forces a new
+preparation, **Delete** removes the image and its sets (not the one stage 3 writes). A changed preparation
+script or tools image marks the sets stale; with `builds.auto` the chosen image is prepared again (a failed
+preparation is not retried by itself: fix the cause and click Prepare). Disk use: the upload plus about its
+used size per set, plus each secure board's container.
+
+## The image file for Raspberry Pi Imager
+
+A board whose OTP holds its key, whose OTP device key the station holds and whose SD card the station knows
+(all three come from one secure stage 1-3 run) can be re-flashed without the station: the board card on the
+page has **Image file for Raspberry Pi Imager**. Pick the source (the station image or a custom one), click
+**Prepare**, then **Download**. The file is the board's signed boot partition (with the OTP key lock, as at
+stage 3) and its root file system
+encrypted with its OTP key for **that SD card** (keyslot 0 = `HMAC(OTP key, CID + "\n")`; on another card the
+board cannot unlock it), with the partition table of the image set (its disk identifier, the first partition at
+the set's alignment); the partitions are laid out as rpi-fastbootd lays out an IDP image. Write it with Raspberry
+Pi Imager (*Choose OS → Use custom*, no OS customisation: the boot files are signed, the first-boot files come
+from the station) to the board's card in a card reader. At the first boot `otp-growroot` grows the root
+partition, the mapping and the file system to the whole card. The file is assembled from the sparse pieces as
+it streams (`otp_server/diskimage.py`: nothing is written to disk; gaps read as zeros), so it is the size of the
+partitions, mostly ciphertext. Only ciphertext, signed boot files and the first-boot files leave the station,
+as in stage 3. The station images need this version's crypt layer for the growth (built after the change).
 
 ## Operator procedure
 
@@ -282,11 +366,8 @@ program may claim the USB interface: close `rpiboot`, `fastboot` and other tabs 
 * Stage 3 compares the gadget's `getvar:serialno` with the board being provisioned before it contacts the
   server; a gadget of another board is refused with "the fastboot gadget belongs to board X, not Y".
 
-The collapsed **Advanced (manual)** section keeps the serverless tools: device list, rpiboot runs from a
-local directory, and manual fastboot. It works without the server and without a Google login (also from
-`file://`). Before a run it checks the `config.txt` that will actually be served to the selected device's
-SoC, shows which file that is, and warns about other `config.txt` files that differ but are not served. The
-exact bytes confirmed in the irreversible dialog are pinned and served even if the file changes on disk.
+Nothing on the page works without the server: it holds the board secrets and builds every file (the
+serverless "Advanced (manual)" section of earlier versions is gone).
 
 ## The secure scenario and the device key export
 
@@ -313,7 +394,8 @@ and over USB (the plain crypt image set never leaves the server):
 * The board gets its own `image.json`: the `encrypted` block becomes a plain root partition with
   `expand-to-fit` (`imagejson.station_luks`), so `oem idpwrite` only writes the partition table and the
   container goes raw to `mmcblk0p2` (`root.luks.sparse`). The LUKS2 data segment is dynamic, so it covers
-  the whole partition; `rpi-resize` grows the file system at first boot.
+  the whole partition; the file system grows at first boot (`otp-growroot`, and `rpi-resize` on the station
+  image).
 * Before `idpdone` and the power-off the page runs `oem cryptcheck mmcblk0p2`: rpi-fastbootd derives the key from
   OTP itself and checks it against the container's keyslots without activating it (no `/dev/mapper` device, so
   nothing decrypted ever exists on the board), answering the keyslot it opened. It must be keyslot 0. A board
@@ -324,6 +406,15 @@ and over USB (the plain crypt image set never leaves the server):
 * Still in the clear on the way to the board: the boot partition (kernel, initramfs; signed for the board) with
   the first-boot files, and the exported device key (the page relays it to the server). Whoever sees the
   device key and the CID can derive the LUKS key.
+* **The running system cannot read the OTP key.** Every signed OS `boot.img` (stage 3 and the Imager file, the
+  station image and custom images alike) ends its `config.txt` with `[all]` + `lock_device_private_key=1`
+  (`boot-slot.sh`; the slot is refused unless it reports `key_locked`). The firmware then refuses the raw key to
+  Linux (`rpi-fw-crypto privkey`, the `GET_CUSTOMER_PRIVATE_KEY` and user-OTP mailbox calls; EEPROM 2025-08-20
+  and later), while `hmac`, `sign` and `pubkey` keep working, which is all the initramfs keyscript needs. That
+  `config.txt` lives inside `boot.img`, so `boot.sig` covers it: taking the line out needs the board's RSA key.
+  Without it any root process on a secure board could read the key and with it the LUKS key of any card. The
+  fastboot gadget is not locked this way (on the first run its helper must read the key); it READ-locks the key
+  at runtime instead (the helper after the export, rpi-fastbootd at start).
 
 How the key gets to the server:
 
@@ -416,6 +507,7 @@ is shown on the page; unknown keys produce a warning.
 | `provisioning.max_piece_size` | `268435456` | largest sparse piece sent to the board (bytes, rpi-fastbootd max-download-size) |
 | `provisioning.boot_conf` | `[all]`, `BOOT_UART=1`, `POWER_OFF_ON_HALT=1`, `BOOT_ORDER=0xf2461` | EEPROM `boot.conf` written in stage 1 (multi-line) |
 | `image.name` | `rpios-trixie-arm64-lite` | name of the OS image (part of the image set names; a new name rebuilds it). The other `image.*` settings are written to each board at stage 3 and rebuild nothing |
+| `image.custom` | (none) | the custom image stage 3 writes instead of the station image: the id of an image uploaded on the page (empty = the station image) |
 | `image.hostname` | `pi5-{serial}` | host name of the boards; `{serial}` = the board's 8-hex serial |
 | `image.timezone` | `Europe/Kyiv` | time zone of the image's tzdata (the page offers the list) |
 | `image.keyboard` | `us` | keyboard layout of the boards' console (xkb `us`, `gb`, `ua`, …; the page offers the list) |
@@ -512,7 +604,8 @@ More rules of the secure scenario:
   are served signed; it never generates a key. `modules mark-unlocked <serial>` undoes it. Both also clear the
   assumption. When a server is running both send the change through it (`POST /api/modules/{serial}/otp`).
 * A board whose OTP is **locked to our key** always gets signed files: a counter-signed `bootcode5.bin`, a
-  signed EEPROM, a `boot.sig` for the gadget, and a boot partition re-signed per board in stage 3.
+  signed EEPROM, a `boot.sig` for the gadget, and a boot partition re-signed per board in stage 3, whose
+  `boot.img` sets `lock_device_private_key=1` (see "The secure scenario and the device key export").
 * A board **locked to a different key** is refused (HTTP 409, "board OTP is locked to a different key").
 
 ## HTTP API
@@ -524,11 +617,17 @@ docs are at `/api/docs`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/status` | version, Google login + settings state, effective config, storage, Docker, Windows USB driver, artifact status, current jobs |
+| GET | `/api/status` | version, Google login + settings state, effective config, storage, Docker, Windows USB driver, artifact status, custom images, current jobs |
 | GET | `/api/google/login` | redirect to Google's consent screen (Google redirects back to `/?state=…&code=…`) |
 | POST | `/api/google/logout` | forget the Google token on this station (the spreadsheet id is kept) |
 | GET | `/api/image` | the OS image settings `{settings, warnings, choices}`: no password or hash, only `password_set` / `wifi_password_set`; `choices` = the time zone and Wi-Fi country lists |
-| POST | `/api/image` | save changed OS image fields (`hostname`, `user`, `ssh`, …; `password` / `wifi_password`: `""` removes, a string sets) → the same view + `saved`; starts the rebuild with `builds.auto` |
+| POST | `/api/image` | save changed OS image fields (`custom`, `hostname`, `user`, `ssh`, …; `password` / `wifi_password`: `""` removes, a string sets) → the same view + `saved`; starts the rebuild (a new name) or the preparation (a new custom image) with `builds.auto` |
+| GET | `/api/custom-images` | the uploaded images: id, name, size, OS, cloud-init, state per variant, job |
+| PUT | `/api/custom-images?name=<file>` | upload an image: the raw `.img` as the body (`Content-Length` required) → `{image, new, job}`; 400 with the reason for a file the station cannot take |
+| POST | `/api/custom-images/{id}/prepare` | `{force}` → prepare it (again) |
+| DELETE | `/api/custom-images/{id}` | remove it and its sets (400 for the image stage 3 writes) |
+| POST | `/api/modules/{serial}/imager-image` | `{"source": "" \| "<id>" \| null}`: prepare the board's image file for Raspberry Pi Imager → `{ready, name, size, url, partitions, mmc_cid, notes}`, or 409 while parts are built |
+| GET | `/api/modules/{serial}/imager-image/{name}` | the prepared image file (streamed, `Content-Length`, attachment) |
 | GET | `/api/modules` | registry, newest first (public view, no secrets) |
 | POST | `/api/modules/hello` | `{serial, chip?, board?, usb?, rom_stage?}` → get or create a board and its secrets |
 | GET | `/api/modules/{serial}` | one board |
@@ -582,12 +681,14 @@ otp_server/
   modules.py               board registry logic, scenarios, device key, stage verdicts
   storage/                 base.py (record schema), gsheets.py (the modules worksheet)
   docker.py, jobs.py       Docker CLI runner; background jobs with logs and SSE
-  artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3
-  imagejson.py, sparse.py  rpi-image-gen image.json helpers; Android sparse validation
+  artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3, custom images (custom.py)
+  imagejson.py, sparse.py  rpi-image-gen image.json helpers (+ the custom image's); Android sparse validation and expansion
+  diskimage.py             the checks of an uploaded .img; the disk image assembled from sparse pieces (Imager file)
   winusb.py                Windows WinUSB driver-package check (read-only)
 docker/
   tools.Dockerfile, tools-entrypoint.sh     otp-tools image ("otp-run <script>")
   scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, root-luks.sh (+ luks_encrypt.py), image-collect.sh
+  scripts/custom-image.sh (+ ext4_sparse.py, custom-crypt/: otp-hwkey, the initramfs hook, otp-growroot)
   gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder (+ rpi-fastbootd build stage)
   gadget-helpers/otp-keyexport/             pi-gen-micro helper package: OTP device key export
   fastbootd/otp-station.patch               our changes to rpi-fastbootd (command allowlist, cryptcheck, USB only)
@@ -713,6 +814,32 @@ on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycac
 * **Stage 3: "the OTP device key cannot be exported in this boot".** The key exists but was READ-locked before
   the helper ran (for example the gadget was booted without our helper). Run stage 2 again so the gadget boots
   afresh, then stage 3. "this fastboot gadget has no OTP key export helper" means an old gadget: rebuild it.
+* **A custom image is refused at upload.** The message says why: unpack a compressed file first; GPT images,
+  images with more or fewer than two partitions and roots that are not ext4 are not taken.
+* **Preparing a custom image fails (secure set).** The job log shows the step. "the image's apt sources offer no
+  rpifwcrypto": the image needs archive.raspberrypi.com (bookworm or later) in its apt sources. "no
+  initramfs-tools": the image cannot unlock a root at boot. "cannot run the image's arm64 programs": register the
+  arm64 binfmt handler (as for the builds). Network errors: the station needs internet access for the image's
+  packages. The open set can still be used meanwhile.
+* **A secure board with a custom image stops at the `(initramfs)` prompt.** The root was not unlocked. Sets
+  prepared before 2026-10-12 had a keyscript that bookworm's `rpi-fw-crypto` fails without a message: the custom
+  image shows "prepare it again", then provision the board again (or write a new Imager file). To unlock by hand
+  in that shell and boot once (for a diagnosis; no `|` needed):
+
+  ```sh
+  cat /sys/block/mmcblk0/device/cid > /run/cid
+  rpi-fw-crypto hmac --in /run/cid --key-id 1 --outform hex > /run/key
+  cryptsetup open --key-file /run/key --keyfile-size 64 /dev/mmcblk0p2 cryptroot
+  exit
+  ```
+
+  An error from `rpi-fw-crypto` means the OTP key is missing or the firmware refuses it; "No key available"
+  from `cryptsetup` means the card or the board is not the one the set was made for.
+* **The `(initramfs)` shell has the wrong keyboard layout.** It is the layout of the image (its
+  `/etc/default/keyboard`; Raspberry Pi OS ships `gb`): `cryptsetup-initramfs` always copies it into the
+  initramfs. On a US keyboard with `gb`, `|` is Right Alt + `` ` ``; `loadkeys` is there to change single keys
+  (`echo 'keycode 43 = backslash bar' > /run/k.map`, then `loadkeys /run/k.map`). For another layout at every
+  boot, set `XKBLAYOUT` in the image before uploading it.
 * **"board OTP is locked to a different key".** The board was locked with a key this registry does not hold.
   Nothing can be provisioned. Restore the registry row that holds its key.
 * **HTTP 403 "Host … is not allowed" / "cross-site POST rejected".** Open the page at `http://127.0.0.1:<port>/`.

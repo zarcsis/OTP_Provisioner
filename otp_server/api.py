@@ -11,7 +11,8 @@ Error mapping (every error body is ``{"detail": "..."}``):
 
 Endpoints that touch the store or Docker are plain ``def`` handlers, so FastAPI runs them in its
 thread pool and a slow Google call or a per-board quick build never blocks the event loop. Only the
-SSE job log is ``async``.
+SSE job log and the custom image upload (a streamed request body; its blocking work runs in the thread
+pool) are ``async``.
 
 Static files: ``/`` (index.html), ``/css/<file>`` and ``/js/<file>`` from the repository; nothing
 else of the repository is reachable, there are no directory listings, and page assets are sent with
@@ -29,12 +30,15 @@ from typing import Any
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 log = logging.getLogger(__name__)
 
 NO_STORE = {"Cache-Control": "no-store"}
 BUILD_TARGETS = ("tools", "gadget", "image")
 STAGES = (1, 2, 3)
+#: Bytes of an upload collected before they are written out (in the thread pool).
+UPLOAD_BUFFER = 8 * 1024 * 1024
 
 MEDIA_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -349,6 +353,104 @@ def api_router(svc: Any) -> APIRouter:
         else:
             raise HTTPException(400, detail="action must be 'mark-locked' or 'mark-unlocked'")
         return {"module": view(rec)}
+
+    def prepared(fn, *args):
+        """Artifacts call outside the stage routes: NotReady -> 409, unexpected failures -> 500."""
+        try:
+            return call(fn, *args), None
+        except HTTPException:
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(404, detail=_exc_text(exc)) from None
+        except Exception as exc:
+            if NotReady is not None and isinstance(exc, NotReady):
+                return None, _not_ready_response(exc)
+            log.exception("%s failed", getattr(fn, "__name__", "call"))
+            raise HTTPException(500, detail=_exc_text(exc)) from None
+
+    @r.post("/modules/{serial}/imager-image")
+    def imager_image(serial: str, body: Any = Body(default=None)):
+        """Prepare the disk image file of a board locked to our key, for Raspberry Pi Imager:
+        ``{"source": "" (station image) | "<custom image id>" | null (the image.custom setting)}``."""
+        b = body_dict(body)
+        source = b.get("source")
+        if source is not None and not isinstance(source, str):
+            raise HTTPException(400, detail="source must be a string: \"\" for the station image or a custom image id")
+        require_module(serial)
+        out, not_ready = prepared(artifacts().imager_image, serial, source)
+        if not_ready is not None:
+            return not_ready
+        return JSONResponse(out, headers=NO_STORE)
+
+    @r.get("/modules/{serial}/imager-image/{name}")
+    def imager_file(serial: str, name: str):
+        """The prepared image file, streamed (assembled from the pieces on the fly; nothing is written)."""
+        if not valid_file_name(name):
+            raise HTTPException(404, detail="no such file")
+        require_module(serial)
+        plan, not_ready = prepared(artifacts().imager_file, serial, name)
+        if not_ready is not None:
+            return not_ready
+        return StreamingResponse(plan.iter_bytes(), media_type="application/octet-stream",
+                                 headers={**NO_STORE, "Content-Length": str(plan.size),
+                                          "Content-Disposition": f'attachment; filename="{name}"'})
+
+    # ---------------------------------------------------------------- custom images
+    @r.get("/custom-images")
+    def list_custom_images() -> JSONResponse:
+        return JSONResponse(call(artifacts().custom_images), headers=NO_STORE)
+
+    @r.put("/custom-images")
+    async def upload_custom_image(request: Request, name: str = "") -> JSONResponse:
+        """Upload an operator's own OS image: the raw ``.img`` as the request body (``?name=`` = its file
+        name), checked as it arrives; then it is prepared for both scenarios in a job."""
+        await run_in_threadpool(require_google)
+        arts = await run_in_threadpool(artifacts)
+        length = request.headers.get("content-length", "")
+        if not length.isdigit():
+            raise HTTPException(411, detail="the upload needs a Content-Length")
+        try:
+            up = await run_in_threadpool(arts.custom.begin_upload, name, int(length))
+        except ValueError as exc:
+            raise HTTPException(400, detail=_exc_text(exc)) from None
+        done = False
+        try:
+            buf = bytearray()
+            async for chunk in request.stream():
+                buf += chunk
+                if len(buf) >= UPLOAD_BUFFER:
+                    data, buf = bytes(buf), bytearray()
+                    await run_in_threadpool(up.write, data)
+            if buf:
+                await run_in_threadpool(up.write, bytes(buf))
+            info, new = await run_in_threadpool(up.finish)
+            done = True
+        except ValueError as exc:
+            raise HTTPException(400, detail=_exc_text(exc)) from None
+        finally:
+            if not done:
+                await run_in_threadpool(up.abort)
+        job = None
+        if new or arts.custom.missing(info["id"]):
+            job = await run_in_threadpool(arts.custom.start_prepare, info["id"])
+        log.info("custom image %s uploaded (%s, %d bytes)%s", info["id"], info["name"], info["size"],
+                 "" if new else ", already on the station")
+        return JSONResponse({"image": info, "new": new, "job": job.to_dict() if job is not None else None},
+                            headers=NO_STORE)
+
+    @r.post("/custom-images/{cid}/prepare")
+    def prepare_custom_image(cid: str, body: Any = Body(default=None)) -> dict:
+        b = body_dict(body)
+        force = b.get("force", False)
+        if not isinstance(force, bool):
+            raise HTTPException(400, detail="force must be true or false")
+        job = call(artifacts().custom.start_prepare, cid, force)
+        return {"job": job.to_dict()}
+
+    @r.delete("/custom-images/{cid}")
+    def delete_custom_image(cid: str) -> dict:
+        call(artifacts().custom.delete, cid)
+        return {"ok": True}
 
     # ---------------------------------------------------------------- fastboot
     @r.post("/fastboot/identify")

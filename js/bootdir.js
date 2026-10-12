@@ -10,10 +10,8 @@
  * <prefix> is "2712" for BCM2712 (Pi 5 / CM5), "2711" for BCM2711 and
  * "2710" for the older SoCs.
  *
- * Three sources are supported: a stage manifest from the OTP_Provisioner
- * server (files fetched lazily by name, size + SHA-256 checked), a
- * FileSystemDirectoryHandle from window.showDirectoryPicker() (lazy reads,
- * no size limit) and a FileList from <input type="file" webkitdirectory>.
+ * The files come from a stage manifest of the OTP_Provisioner server (fetched
+ * lazily by name, size + SHA-256 checked): BootDir.fromManifest().
  */
 (function () {
     'use strict';
@@ -32,59 +30,6 @@
             this._read = reader;            // async (relPath) => Uint8Array|null
             this._tar = undefined;          // Uint8Array | null once loaded
             this._cache = new Map();
-            this._pins = new Map();         // "<prefix>|<name>" → {data, origin}: bytes resolve() must serve verbatim
-        }
-
-        /** Directory picked with the File System Access API. */
-        static fromDirectoryHandle(handle) {
-            const reader = async (relPath) => {
-                const parts = relPath.split('/').filter(Boolean);
-                let dir = handle;
-                try {
-                    for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i]);
-                    const fh = await dir.getFileHandle(parts[parts.length - 1]);
-                    const file = await fh.getFile();
-                    return new Uint8Array(await file.arrayBuffer());
-                } catch (e) {
-                    if (e && (e.name === 'NotFoundError' || e.name === 'TypeMismatchError')) return null;
-                    throw e;
-                }
-            };
-            const bd = new BootDir(handle.name, reader);
-            bd._listTop = async () => {
-                const out = [];
-                for await (const [name, h] of handle.entries()) {
-                    if (h.kind === 'file') {
-                        const f = await h.getFile();
-                        out.push({ name, size: f.size, kind: 'file' });
-                    } else out.push({ name, size: 0, kind: 'dir' });
-                }
-                return out;
-            };
-            return bd;
-        }
-
-        /** Entries [{path, file}] with paths relative to the directory root ("2712/bootcode5.bin"). */
-        static fromEntries(name, entries) {
-            const map = new Map(entries.map((e) => [e.path.replace(/\\/g, '/'), e.file]));
-            const reader = async (relPath) => {
-                const f = map.get(relPath);
-                if (!f) return null;
-                return new Uint8Array(await f.arrayBuffer());
-            };
-            const bd = new BootDir(name, reader);
-            bd._listTop = async () => {
-                const out = [];
-                const dirs = new Set();
-                for (const [p, f] of map) {
-                    const i = p.indexOf('/');
-                    if (i < 0) out.push({ name: p, size: f.size, kind: 'file' });
-                    else dirs.add(p.slice(0, i));
-                }
-                for (const d of dirs) out.push({ name: d, size: 0, kind: 'dir' });
-                return out;
-            };
-            return bd;
         }
 
         /**
@@ -122,27 +67,10 @@
             const label = manifest ? `server stage ${manifest.stage || '?'}${manifest.mode ? ' (' + manifest.mode + ')' : ''}` : 'server';
             const bd = new BootDir(label, reader);
             bd.manifest = manifest;
-            bd._listTop = async () => [...files.values()].map((f) => ({ name: f.name, size: f.size || 0, kind: 'file' }));
             return bd;
         }
 
-        /** FileList from <input type="file" webkitdirectory>. */
-        static fromFileList(files) {
-            const arr = Array.from(files);
-            if (!arr.length) throw new Error('empty directory');
-            const first = arr[0].webkitRelativePath || arr[0].name;
-            const root = first.split('/')[0];
-            const entries = arr.map((f) => {
-                const rel = f.webkitRelativePath || f.name;
-                const path = rel.startsWith(root + '/') ? rel.slice(root.length + 1) : rel;
-                return { path, file: f };
-            });
-            return BootDir.fromEntries(root, entries);
-        }
-
         static chipForProductId(pid) { return CHIPS[pid] || null; }
-
-        async listTop() { return this._listTop ? this._listTop() : []; }
 
         async readFile(relPath) {
             if (this._cache.has(relPath)) return this._cache.get(relPath);
@@ -167,8 +95,6 @@
             if (fname.includes('..')) return { denied: true, reason: 'path traversal (..)' };
             if (fname.startsWith('/') || fname.startsWith('\\')) return { denied: true, reason: 'absolute path' };
             const prefix = chip.prefix;
-            const pinned = this._pins.get(`${prefix}|${fname.toLowerCase()}`);
-            if (pinned) return { data: pinned.data, origin: pinned.origin };
             const tar = await this.bootfiles();
             if (tar) {
                 const overlay = await this.readFile(prefix + '/' + fname);
@@ -183,72 +109,6 @@
             return null;
         }
 
-        /** main(): a boot directory must contain bootfiles.bin or a bootcode*.bin. */
-        async validate() {
-            const problems = [];
-            const tar = await this.bootfiles();
-            const hasBootcode = (await this.has('bootcode.bin')) || (await this.has('bootcode4.bin')) || (await this.has('bootcode5.bin'));
-            if (!tar && !hasBootcode) problems.push("No 'bootfiles.bin' or 'bootcode*.bin' in the directory: rpiboot would refuse it.");
-            return problems;
-        }
-
-        /**
-         * Make resolve(fname, chip) return exactly `found.data` for the rest of this directory's life (until
-         * unpin): the bytes the operator confirmed are the bytes the board gets, even if the file changes on disk.
-         */
-        pin(fname, chip, found) {
-            this._pins.set(`${chip.prefix}|${String(fname).toLowerCase()}`, { data: found.data, origin: found.origin });
-        }
-
-        unpin(fname, chip) { this._pins.delete(`${chip.prefix}|${String(fname).toLowerCase()}`); }
-
-        /** Parse rpiboot config.txt bytes (NOT the OS config.txt) into {text, keys}. */
-        static parseConfig(data) {
-            const text = new TextDecoder().decode(data);
-            const keys = {};
-            for (const raw of text.split(/\r?\n/)) {
-                const line = raw.trim();
-                if (!line || line.startsWith('#')) continue;
-                const m = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
-                if (m) keys[m[1]] = m[2].trim();
-            }
-            return { text, keys };
-        }
-
-        /**
-         * The rpiboot-side config.txt as {text, keys, origin, data}, or null.
-         * With `chip`: the file the file server will serve to that chip — the same resolve() result
-         * (<prefix>/config.txt overlay, the bootfiles.bin member <prefix>/config.txt, <prefix>/config.txt,
-         * then the top-level config.txt). Without `chip`: the top-level file only.
-         */
-        async configTxt(chip) {
-            let data;
-            let origin;
-            if (chip) {
-                const found = await this.resolve('config.txt', chip);
-                if (!found || found.denied) return null;
-                data = found.data;
-                origin = found.origin;
-            } else {
-                data = await this.readFile('config.txt');
-                if (!data) return null;
-                origin = `${this.name}/config.txt`;
-            }
-            return Object.assign(BootDir.parseConfig(data), { origin, data });
-        }
-
-        /** Every config.txt the directory holds for `chip`, in resolve() priority order: [{origin, data, text, keys}]. */
-        async configCandidates(chip) {
-            const out = [];
-            const add = (data, origin) => { if (data) out.push(Object.assign(BootDir.parseConfig(data), { origin, data })); };
-            const prefix = chip.prefix;
-            const tar = await this.bootfiles();
-            add(await this.readFile(`${prefix}/config.txt`), `${this.name}/${prefix}/config.txt`);
-            if (tar) add(OTP.tar.find(tar, `${prefix}/config.txt`), `bootfiles.bin:${prefix}/config.txt`);
-            add(await this.readFile('config.txt'), `${this.name}/config.txt`);
-            return out;
-        }
-
         /** SHA-256 of a byte array, hex, via WebCrypto. */
         static async sha256Hex(bytes) {
             const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -256,20 +116,6 @@
         }
     }
 
-    /**
-     * Keys of the rpiboot config.txt that change the SoC or the EEPROM
-     * permanently. The UI refuses to run a directory that sets any of them
-     * without an explicit, typed confirmation.
-     */
-    const IRREVERSIBLE_KEYS = {
-        program_pubkey: 'writes the SHA-256 of the customer public key into OTP: the SoC boots only firmware counter-signed with that key, forever',
-        program_jtag_lock: 'permanently disables VideoCore JTAG',
-        eeprom_write_protect: 'sets the EEPROM write-protect bit (permanent while /WP is pulled low)',
-        revoke_devkey: 'revokes the development key in OTP',
-        program_rpiboot_gpio: 'programs the nRPIBOOT GPIO selection into OTP',
-    };
-
     OTP.BootDir = BootDir;
     OTP.CHIPS = CHIPS;
-    OTP.IRREVERSIBLE_KEYS = IRREVERSIBLE_KEYS;
 })();

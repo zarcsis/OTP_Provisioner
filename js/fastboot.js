@@ -170,17 +170,6 @@
             return clean([...r.infos.map(clean), clean(r.message)].filter((s) => s !== '').join('\n'));
         }
 
-        /** getvar:all returns one INFO line per variable ("name: value"). */
-        async getvarAll() {
-            const r = await this.command('getvar:all');
-            const vars = {};
-            for (const line of r.infos) {
-                const i = line.indexOf(':');
-                if (i > 0) vars[line.slice(0, i).trim()] = clean(line.slice(i + 1));
-            }
-            return vars;
-        }
-
         /** Read several variables, skipping the ones the daemon does not know. */
         async getvars(names) {
             const out = {};
@@ -216,11 +205,6 @@
                 if (onProgress) onProgress(sent, size);
             }
             return this.readResponse();
-        }
-
-        async flash(partition, bytes, onProgress) {
-            await this.download(bytes, onProgress);
-            return this.command(`flash:${partition}`);
         }
 
         /**
@@ -490,28 +474,6 @@
             }
             progress({ phase: 'done' });
             return result;
-        }
-
-        /**
-         * Manual mode (Advanced panel): IDP from a local rpi-image-gen output directory.
-         * readImage(name) → Uint8Array of a sparse image next to image.json. No splitting: a sparse file above
-         * max-download-size is refused.
-         */
-        async provisionIdp(imageJsonBytes, readImage, onProgress, extra) {
-            const json = JSON.parse(dec.decode(imageJsonBytes));
-            const pi = (json.layout && json.layout.partitionimages) || {};
-            const parts = {};
-            for (const v of Object.values(pi)) if (v && v.simage) parts[v.simage] = [{ name: v.simage }];
-            return this.idpProvision(Object.assign({
-                imageJson: imageJsonBytes,
-                parts,
-                readPiece: async (p) => { const b = await readImage(p.name); if (!b) throw new FastbootError(`image "${p.name}" not found next to image.json`); return b; },
-                erase: false,
-                fwcryptoInit: false,
-                reboot: false,
-                totalBytes: 0,
-                onProgress: onProgress ? (p) => onProgress(p.sent, p.total, p.piece) : null,
-            }, extra || {}));
         }
     }
 
