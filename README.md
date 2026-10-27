@@ -234,7 +234,10 @@ worksheet. Open and secure boards get the same settings.
   shell and `PATH` tweaks, avahi, `/etc/machine-id` = `uninitialized`, the NoCloud templates in
   `/boot/firmware`, and no `apt`/`dpkg` leftovers of the build (recommends are installed again, as on
   Raspberry Pi OS). The differences from the official image: no Pi 3/4 kernel, `cryptsetup` added (the
-  secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, and on the
+  secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, **AppArmor on**
+  (`apparmor=1 security=apparmor` in `cmdline.txt`, `apparmor.service` enabled: the Raspberry Pi kernel has
+  AppArmor built in but selects no LSM by default, so Raspberry Pi OS ships the package with it off;
+  `aa-status` on a board lists the loaded profiles), and on the
   **secure** (crypt) image `rpi-eeprom-update.service` is off (that bootloader is signed for the board,
   and only the station updates it) and `otp-growroot.service` grows the encrypted root to the whole card at
   the first boot (the partition when it ends before the card does, the LUKS2 mapping, the ext4 inside).

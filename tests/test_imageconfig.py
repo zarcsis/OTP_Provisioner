@@ -1,6 +1,9 @@
 """The rpi-image-gen config of the station image (otp_server.imageconfig) and the station layers."""
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -169,9 +172,55 @@ def test_otp_rpios_setup_layer():
     assert "systemctl disable ssh.service" in text and 'rm -f "$1"/etc/ssh/ssh_host_*_key*' in text
     assert "WirelessEnabled=false" in text and "99-default.link" in text
     assert "systemctl disable rpi-eeprom-update.service" in text and '"${IGconf_image_pmap:-clear}" = crypt' in text
+    assert "apparmor=1 security=apparmor" in text and "systemctl enable apparmor.service" in text
     for name in ("meta-data", "network-config", "user-data"):
         assert f'"$1/boot/firmware/{name}"' in text
     assert 'rm -f "$1/etc/apt/apt.conf.d/99mmdebstrap" "$1/etc/dpkg/dpkg.cfg.d/99mmdebstrap"' in text
+
+
+SH = shutil.which("sh")
+
+CHROOT_STUB = """#!/bin/sh
+shift
+printf '%s\\n' "$*" >> "$HOOK_CALLS"
+"""
+
+
+@pytest.mark.skipif(SH is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_otp_rpios_setup_turns_apparmor_on(tmp_path):
+    """The Raspberry Pi kernel has AppArmor built in but an empty default LSM list (CONFIG_LSM=""): the image's
+    cmdline.txt selects it, replacing any earlier choice, and apparmor.service loads the profiles."""
+    yaml = pytest.importorskip("yaml")
+    doc = yaml.safe_load((LAYERS / "otp-rpios-setup.yaml").read_text(encoding="utf-8"))
+    hook = next(h for h in doc["mmdebstrap"]["customize-hooks"] if "security=apparmor" in h)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "chroot").write_bytes(CHROOT_STUB.encode())
+    (bindir / "chroot").chmod(0o755)
+    calls = tmp_path / "calls"
+    root = tmp_path / "root"
+    (root / "boot" / "firmware").mkdir(parents=True)
+    cmdline = root / "boot" / "firmware" / "cmdline.txt"
+    env = dict(os.environ, HOOK_CALLS=str(calls).replace("\\", "/"),
+               PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+
+    def run() -> subprocess.CompletedProcess:
+        calls.write_bytes(b"")
+        return subprocess.run([SH, "-c", hook, "sh", str(root).replace("\\", "/")], capture_output=True, env=env,
+                              timeout=60)
+
+    cmdline.write_bytes(b"console=serial0,115200 console=tty1 root=ROOTDEV lsm=yama security=selinux "
+                        b"fsck.repair=yes rootwait\n")
+    want = b"console=serial0,115200 console=tty1 root=ROOTDEV fsck.repair=yes rootwait apparmor=1 security=apparmor\n"
+    for _ in range(2):                                    # the same line when it is already there
+        r = run()
+        assert r.returncode == 0, r.stderr.decode(errors="replace")
+        assert cmdline.read_bytes() == want
+        assert calls.read_text().splitlines() == ["systemctl enable apparmor.service"]
+
+    cmdline.unlink()                                      # rpi-boot-firmware has not run: the build stops
+    r = run()
+    assert r.returncode != 0 and b"cmdline.txt missing" in r.stderr and not cmdline.exists()
 
 
 def test_layers_are_valid_yaml():

@@ -6,12 +6,12 @@
 #  locked with no login shell, so cloud-init or the first-boot wizard sets it up;
 #  SSH is off; Wi-Fi stays off until a country is set; classic interface names
 #  (eth0, wlan0); en_GB locale, gb keyboard, Europe/London; pi-gen's shell and
-#  PATH tweaks; avahi announces the board; the NoCloud templates in
-#  /boot/firmware. The station writes the real user-data, network-config and
-#  meta-data per board at stage 3. On the crypt variant (secure boards) the
-#  automatic bootloader EEPROM update is off: such a bootloader is signed for
-#  the board and only the station updates it; and otp-growroot grows the
-#  encrypted root to the whole card at the first boot.
+#  PATH tweaks; avahi announces the board; AppArmor on (kernel command line);
+#  the NoCloud templates in /boot/firmware. The station writes the real
+#  user-data, network-config and meta-data per board at stage 3. On the crypt
+#  variant (secure boards) the automatic bootloader EEPROM update is off: such
+#  a bootloader is signed for the board and only the station updates it; and
+#  otp-growroot grows the encrypted root to the whole card at the first boot.
 # X-Env-Layer-Version: 1.0.0
 # X-Env-Layer-Requires: device-user-admin,otp-rpios-lite
 # METAEND
@@ -105,6 +105,21 @@ mmdebstrap:
       [ -f "$1/etc/kernel-img.conf" ] || echo "do_symlinks=0" > "$1/etc/kernel-img.conf"
       rm -f "$1/etc/systemd/system/getty@tty1.service.d/noclear.conf"
       rmdir "$1/etc/systemd/system/getty@tty1.service.d" 2>/dev/null || true
+    - |-
+      # AppArmor on, as on Debian. The apparmor package (in the Raspberry Pi OS Lite package set) loads the
+      # profiles at boot, but the Raspberry Pi kernel builds AppArmor in with an empty default LSM list
+      # (CONFIG_LSM=""), so it stays off until the kernel command line selects it. boot-slot.sh keeps these
+      # words when it appends a board's own parameters; on a secure board they are inside the signed boot.img.
+      set -eu
+      f=$1/boot/firmware/cmdline.txt
+      [ -s "$f" ] || { echo "otp-rpios-setup: $f missing" >&2; exit 1; }
+      set -f
+      words=
+      for w in $(cat "$f"); do
+         case "$w" in apparmor=*|security=*|lsm=*) ;; *) words="$words $w" ;; esac
+      done
+      printf '%s\n' "${words# } apparmor=1 security=apparmor" > "$f"
+      chroot "$1" systemctl enable apparmor.service
     - |-
       # A secure board's bootloader is signed for that board: Raspberry Pi's automatic EEPROM update
       # does not know that, so it stays off there and the station updates the bootloader.

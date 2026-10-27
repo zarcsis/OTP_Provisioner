@@ -495,6 +495,9 @@ For the planned split (server on another machine, Sheets replaced, the open scen
   `instance-id` must change when the files change (it is a hash of them) or cloud-init ignores the new
   seed. Secrets in those files (account hash, Wi-Fi PMK) sit on an unencrypted FAT partition on every
   board.
+* AppArmor is on in the station image only through `cmdline.txt` (`apparmor=1 security=apparmor`, written by
+  `otp-rpios-setup`): the Raspberry Pi kernel has `CONFIG_SECURITY_APPARMOR=y` but `CONFIG_LSM=""`. Anything
+  that rewrites the boot partition's `cmdline.txt` instead of editing it drops it; custom images keep their own.
 * The package set is pinned to one Raspberry Pi OS Lite release `.info`; regenerate
   `otp-rpios-packages.yaml` with `image/rpios_packages.py` when the base release moves, and re-verify
   the first boot on hardware (cloud-init, NetworkManager and raspi-config behaviour all changed between
