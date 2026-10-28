@@ -1792,6 +1792,89 @@
             await app.loadImageSettings();
         }
 
+        section = 'page-packages';
+        {
+            await fakeReset();
+            app.img.loaded = null;
+            await app.loadImageSettings();
+            await app.refreshStatus();
+            const rows = () => [...document.querySelectorAll('#packages-list .custom-row')];
+            const rowOf = (re) => rows().find((r) => re.test(r.querySelector('.custom-title').textContent));
+            const tick = (row, sel) => {
+                const c = row.querySelector(sel);
+                c.checked = !c.checked;
+                c.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+            const saveBtn = document.getElementById('btn-image-save');
+            const upStatus = document.getElementById('package-upload-status');
+            eq(rows().length, 2, 'one row per uploaded package');
+            const sysRow = rowOf(/vn-demo-provider/);
+            assert(/system · runs as root/.test(sysRow.textContent) && /offers to apps: demo\.detections\.report, demo\.frames\.read/.test(sysRow.textContent),
+                'a system package: runs as root, lists the permissions it offers', sysRow.textContent);
+            const detRow = rowOf(/vn-demo-detector/);
+            assert(/prepared/.test(detRow.textContent) && /102 Debian packages, 8200 files/.test(detRow.textContent) && /in the VM in 20 s/.test(detRow.textContent),
+                'an app: prepared, its root file system and the VM install', detRow.textContent);
+            eq(detRow.querySelectorAll('input[data-grant]').length, 0, 'an app not in the image: no permissions to tick');
+            const sent = [];
+            const realSave = OTP.api.saveImageSettings;
+            OTP.api.saveImageSettings = (b) => { sent.push(JSON.parse(JSON.stringify(b))); return realSave.call(OTP.api, b); };
+            try {
+                tick(rowOf(/vn-demo-detector/), 'input[data-in-image]');
+                assert(/No permissions to grant \(slot 1\)/.test(rowOf(/vn-demo-detector/).textContent), 'in the image, no system package: nothing to grant, slot 1',
+                    rowOf(/vn-demo-detector/).textContent);
+                eq(saveBtn.disabled, false, 'the change can be saved');
+                tick(rowOf(/vn-demo-provider/), 'input[data-in-image]');
+                const d = rowOf(/vn-demo-detector/);
+                deq([...d.querySelectorAll('input[data-grant]')].map((c) => c.dataset.grant), ['demo.detections.report', 'demo.frames.read'],
+                    'the provider in the image: its permissions can be granted');
+                assert(/demo\.frames\.read \(requested\)/.test(d.textContent), 'what the app asks for is marked', d.textContent);
+                eq(d.querySelectorAll('input[data-grant]:checked').length, 0, 'nothing is granted until the operator ticks it');
+                tick(d, 'input[data-grant="demo.frames.read"]');
+                tick(rowOf(/vn-demo-detector/), 'input[data-grant="demo.detections.report"]');
+                const mem = rowOf(/vn-demo-detector/).querySelector('input[data-limit="memory_mb"]');
+                mem.value = '128';
+                mem.dispatchEvent(new Event('input', { bubbles: true }));
+                saveBtn.click();
+                await until(() => sent.length === 1 && !app.img.saving, 3000, 'save the packages');
+                deq(sent[0], { packages: ['4022f7f285768071'],
+                    apps: ['8ebcf7faf1c76273 slot=1 grant=demo.detections.report,demo.frames.read memory=128'] },
+                'Save sends image.packages and the image.apps line');
+                await until(() => /The image changed \(its name or its packages\)/.test(document.getElementById('image-status').textContent), 3000, 'saved message');
+                await app.refreshStatus();
+                eq(saveBtn.disabled, true, 'saved: nothing left to save');
+                const saved = rowOf(/vn-demo-detector/);
+                eq(saved.querySelector('button.danger-outline').disabled, true, 'an app in the image cannot be deleted');
+                eq(saved.querySelectorAll('input[data-grant]:checked').length, 2, 'the saved grants are ticked');
+                [...saved.querySelectorAll('button')].find((b) => b.textContent === 'Sandbox').click();
+                await until(() => /UIDMap=0:1114112:65536/.test(rowOf(/vn-demo-detector/).textContent), 3000, 'the sandbox files');
+                assert(/slot 1, host UIDs 1114112–1179647/.test(rowOf(/vn-demo-detector/).textContent), 'the preview names the slot and the UID range');
+
+                await app.uploadPackage(new File([new TextEncoder().encode('!<arch>\nfake')], 'my-app_2.0_arm64.deb'), 'app');
+                assert(/my-app 1\.0\.0 uploaded: the station installs it into its own root file system now/.test(upStatus.textContent),
+                    'an app upload is reported', upStatus.textContent);
+                await until(() => rows().length === 3, 3000, 'the new row');
+                assert(/preparing/.test(rowOf(/my-app/).textContent) && /Log/.test(rowOf(/my-app/).textContent), 'the new app is being prepared (with its job log)');
+                await app.uploadPackage(new File([new Uint8Array([1, 2, 3])], 'junk.deb'), 'system');
+                assert(/^Upload failed: not a Debian package/.test(upStatus.textContent), 'a file that is not a package is refused', upStatus.textContent);
+                eq(document.getElementById('package-upload-progress').classList.contains('hidden'), true, 'the progress bar is hidden after an upload');
+
+                tick(rowOf(/vn-demo-provider/), 'input[data-in-image]');
+                eq(saveBtn.disabled, false, 'a new change');
+                document.getElementById('btn-image-revert').click();
+                eq(saveBtn.disabled, true, 'Revert drops it');
+                eq(rowOf(/vn-demo-provider/).querySelector('input[data-in-image]').checked, true, 'the saved state is back');
+            } finally {
+                OTP.api.saveImageSettings = realSave;
+            }
+            deq(app.parseAppLine('0123456789abcdef slot=3 grant=b,a cpus=0.5'),
+                { id: '0123456789abcdef', slot: 3, grant: ['b', 'a'], memory_mb: 256, cpus: 0.5, tasks: 512 }, 'an image.apps line is read');
+            eq(app.formatAppLine({ id: 'x', slot: 2, grant: ['b', 'a'], memory_mb: 256, cpus: 1, tasks: 64 }), 'x slot=2 grant=a,b tasks=64',
+                'and written as the server writes it (defaults left out)');
+            await fakeReset();
+            app.img.loaded = null;
+            await app.loadImageSettings();
+        }
+
         section = 'page-imager';
         {
             await fakeReset();

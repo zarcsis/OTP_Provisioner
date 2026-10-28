@@ -65,6 +65,18 @@
                     <span id="custom-upload-status" class="muted"></span>
                 </div>
                 <div class="progress hidden" id="custom-upload-progress"><div></div></div>
+                <h3>Applications</h3>
+                <p class="hint">Built into the station image: saving a change rebuilds it. A <b>system package</b> is trusted: installed like the image's own packages, it runs as root. An <b>app</b> is any ordinary package that runs sandboxed: its own container with systemd, its own range of user IDs, no network, and on the system bus only the calls of the permissions ticked for it. Its maintainer scripts run on the station, in a throwaway VM.</p>
+                <div id="packages-note" class="hint"></div>
+                <div id="packages-list" class="custom-images"></div>
+                <div class="row">
+                    <button type="button" id="btn-system-upload" class="small" data-own="1" title="A trusted .deb (arm64 or all), installed into the image as root. It may declare permissions for apps (/usr/share/vn-apps/permissions/*.json)">Upload system package…</button>
+                    <button type="button" id="btn-app-upload" class="small" data-own="1" title="Any .deb (arm64 or all), its dependencies from Debian trixie. Installed on the station in a throwaway VM, run on the board in its own sandbox">Upload app…</button>
+                    <input type="file" id="package-file" accept=".deb" class="hidden" data-own="1">
+                    <button type="button" id="btn-package-cancel" class="small hidden" data-own="1">Cancel</button>
+                    <span id="package-upload-status" class="muted"></span>
+                </div>
+                <div class="progress hidden" id="package-upload-progress"><div></div></div>
                 <h3>System</h3>
                 <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63" placeholder="pi5-{serial}" title="{serial} = the board's 8-hex serial"></label>
                 <label class="field"><span>Time zone</span><select name="timezone"></select></label>

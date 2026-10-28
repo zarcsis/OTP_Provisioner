@@ -26,6 +26,11 @@ on the station for both scenarios; the secure variant gets an initramfs that unl
 installed into the image itself) and **the image file for Raspberry Pi Imager** (for a board already locked to
 its key: its signed boot partition and its encrypted root for its own SD card, streamed as one `.img`).
 
+The station image can also carry **system packages** (trusted .debs, installed like the image's own) and
+**sandboxed apps** (any ordinary .deb, installed on the station in a throwaway arm64 VM and run on the board in
+its own rootful podman container with its own UID range, no network and the system bus only through its own
+filtering proxy). See "Sandboxed apps" under "Architecture in one pass".
+
 Everything the station knows lives in a Google spreadsheet of the signed-in operator (`settings` and
 `modules` worksheets). There is no config file, no local registry and no `.gitignore` (both on purpose).
 
@@ -95,10 +100,13 @@ otp_server/
   diskimage.py                upload checks of a custom .img (MBR, two partitions); DiskPlan = the Imager file
   secrets_gen.py              RSA key, customer_key_hash, device_secret, LUKS key/passphrase derivation
   artifacts/                  tools image, stage 1 (EEPROM), gadget + stage 2, image + stage 3, LUKS per board,
-                              custom.py (uploaded images, their preparation job, status, delete)
+                              custom.py (uploaded images, their preparation job, status, delete),
+                              packages.py (system packages and apps: upload, an app's install in a VM, status)
   firstboot.py                the board's cloud-init NoCloud seed (user-data/network-config/meta-data/ssh)
   imagejson.py, sparse.py     rpi-image-gen's image.json (IDP, + custom_image_json) and Android sparse images (+ expand)
-  imageconfig.py, image_choices.py   OS image settings validation; tz / Wi-Fi country / keyboard lists
+  imageconfig.py, image_choices.py   OS image settings validation (+ image.apps lines); tz / Wi-Fi country / keyboard lists
+  debpkg.py, sandbox.py       .deb metadata (nothing unpacked); the files of every app's sandbox on the board
+  rootfs_tar.py               the check of an app's installed root file system (untrusted) and the shift of its owners
   jobs.py, docker.py          background jobs with SSE logs; docker CLI wrapper (idle watchdog, binfmt)
   winusb.py, passhash.py      Windows WinUSB driver check; sha512-crypt
 js/
@@ -117,11 +125,14 @@ docker/
   scripts/custom-image.sh     an uploaded .img -> clear / crypt IDP set (ext4_sparse.py; custom-crypt/ = what the
                               crypt variant installs: otp-hwkey keyscript, initramfs hook, otp-growroot + unit)
   gadget.Dockerfile, gadget-entrypoint.sh    arm64 pi-gen-micro builder (+ a stage that compiles rpi-fastbootd)
+  apps.Dockerfile, scripts/app-*             otp-app-builder; the installer VM's kit, an app's rootfs, its install in the VM
   gadget-helpers/otp-keyexport/              pi-gen-micro package: exports / generates the OTP device key
   fastbootd/otp-station.patch, station-test.sh, station_test.cpp   our rpi-fastbootd and its build-time test
 image/
   build.sh, docker/           rpi-image-gen front end (Linux native or --docker; the station runs --in-container)
   layer/otp-rpios-*.yaml      the three station layers = Raspberry Pi OS Lite; rpios_packages.py regenerates one
+  layer/otp-apps.yaml         the sandboxed apps (in the config only when image.apps is set)
+examples/apps/                the demo: vn-demo-provider (system), vn-demo-detector (app), build.py (stdlib .deb builder)
   rpi-image-gen/              submodule (v2.8.0)
 external/usbboot, external/pi-gen-micro   submodules (shallow); usbboot carries rpi-eeprom
 tests/                        pytest (server), tests/web/ (page self-test, e2e with a real server + mock board)
@@ -139,8 +150,8 @@ python server.py                              # http://127.0.0.1:8765/, opens Ch
 python -B -m otp_server build tools|gadget|image [--force]
 python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 
-python -B -m pytest -q                        # ~1150 tests, ~1 min; needs no Docker, no Google, no hardware
-python -B tests/web/run_selftest.py           # ~600 checks: the page in headless Chrome against a fake API + mock board
+python -B -m pytest -q                        # ~1230 tests, ~1 min; needs no Docker, no Google, no hardware
+python -B tests/web/run_selftest.py           # ~630 checks: the page in headless Chrome against a fake API + mock board
 python -B tests/web/run_e2e.py                # ~240 checks: real server + real artifacts + mock board, both scenarios
 ```
 
@@ -196,6 +207,25 @@ aligned like IDP); `Artifacts` pins the pieces (path + sha) and `GET …/imager-
 `DiskPlan.iter_bytes()` (sparse expansion on the fly, nothing written). The root partition is only as large as
 the container; `otp-growroot` (in every crypt image, the station's too) grows partition, mapping and ext4 at
 the first boot.
+
+**Sandboxed apps.** `Packages` (`artifacts/packages.py`, owned by `ImageBuilder`) keeps the uploads in
+`<work>/artifacts/packages/<id>/`. An app's preparation (`package:<id>` job, heavy lock, `otp-app-builder`): the VM
+kit once (`app-vmkit.sh`: Debian's arm64 kernel, the virtio/ext4 modules resolved from `.modinfo`, busybox,
+`app-vm-init` as `/init`), `app-rootfs.sh` (privileged: mmdebstrap trixie arm64 + systemd + `apt-get satisfy` of the
+app's dependency fields, an ext4 image by `mke2fs -d <tar>` with the .deb in `/vn-install`), `app-install.sh`
+(`isolated=True`: `--network none --cap-drop ALL no-new-privileges`; qemu-system-aarch64 TCG, two disks; `dpkg -i`
+in a chroot, the result as a tar on the second disk), then `rootfs_tar.sanitize(uid_base=0)` into the prepared
+`rootfs.tar`. `ImageBuilder.rendered()` asks `Packages.image_inputs()` (small JSON reads only: it runs on every
+status poll) and `imageconfig.render(inputs=...)` adds `packages:` (system debs as blobs in `/cfg/system/`), the
+layer `otp-apps` with `IGconf_otpapps_dir=/cfg/apps`, `apps/sandbox.tar` (all of `sandbox.render()`),
+`apps/apps.list` and one blob per app whose owners move into its slot's range when the config dir is written
+(`sanitize(uid_base=...)` again). Blobs enter the digest by sha256 and `problems` (an app not prepared, a grant no
+system package offers) too, so the build job prepares missing apps first and refuses a config that still has
+problems. On the board: `vnapp<N>` = base UID `0x100000 + N*65536`, a quadlet with `Rootfs=`, `UIDMap`/`GIDMap`,
+`Network=none`, `AddCapability=CAP_SYS_ADMIN`, the AppArmor profile via `PodmanArgs`, limits on the service in
+`vnapps.slice`; the proxy unit `vn-app-<pkg>-bus.service` as `vnapp<N>` (member of `vnapps`) with `--filter --call=`
+rules from the system packages' permission catalogs, its socket directory mounted at `/run/dbus`;
+`/etc/vn-apps/registry.json` for the services to check callers by UID.
 
 **Trust boundaries.** The page is untrusted by design (the future client will be someone else's
 machine): it receives only what the board must have, and in the secure scenario only ciphertext plus
@@ -325,6 +355,34 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
   image keeps in `/boot/firmware` (the owner's has `auth.ini`, `auth.json`, `custom.toml`, `userconf`): custom
   images are signed in place.
 
+**Sandboxed apps (2026-10-27, prototyped by hand on a Pi 5 with trixie and kernel 6.18, then built into the station)**
+* **podman creates mount targets inside a `Rootfs=` directory** (`run/.containerenv`, `etc/hosts`, ...). One run
+  without the user namespace (options after the path: `podman run --rootfs` takes the first non-option as the
+  path) left `run/.containerenv` owned by real root, and every run with `UIDMap` then failed with "open
+  `run/.containerenv`: Permission denied". Never start an app's container without its `UIDMap`.
+* **crun mounts inside the app's user namespace**, so the container's root (the base UID) must traverse the
+  path to the rootfs: `/var/lib/vn-apps` is `0711`, the app's directory `0700` for its base UID (Android's
+  `/data/data` model). The proxy socket likewise: `/run/vn-apps` `0711`, `<app>/` `0700`, `<app>/bus/` `0755`, the
+  socket `0777` (UMask=0000): every user of the container may connect, no other host user can reach it.
+* **systemd in the container needs CAP_SYS_ADMIN** (in its user namespace) and AppArmor `mount`, `pivot_root`,
+  `userns`: without them every unit with `PrivateTmp=`, `ProtectSystem=`, `DynamicUser=` ... fails with
+  226/NAMESPACE, which is most Debian services. AppArmor 4 also denies `userns_create` to a profile without
+  `userns,` (podman's `containers-default` has none). The demo probe reports mount/userns as INFO for that reason.
+* **The memfd of the frame ring starts as mode 0777**: whoever holds a read-only descriptor could re-open it for
+  writing through `/proc/self/fd`. The provider makes it 0444 (another UID's container root has no CAP_FOWNER
+  over it) and seals it with `F_SEAL_FUTURE_WRITE` (writes and writable mappings fail with EPERM).
+* **The Raspberry Pi kernel disables the memory cgroup** (`cgroup_disable=memory` from the firmware): layer
+  otp-apps adds `cgroup_enable=memory`. **A dash in a slice name means a parent slice**: `vn-apps.slice` landed in
+  `vn.slice`; it is `vnapps.slice`.
+* **Debian's arm64 kernel builds virtio_blk and ext4 as modules** (virtio-pci is built in) and a kernel package
+  has no `modules.dep` (depmod writes it in postinst): `app-vmkit.sh` reads dependencies with
+  `modinfo -F depends`, adds `crc32c_generic`/`libcrc32c` for ext4's checksums and unpacks the `.ko.xz`.
+* **`mke2fs -d <tarball>` loads libarchive at run time** ("you need libarchive to be able to process tarballs"):
+  `libarchive13t64` is in the image. **A raw disk does not stay sparse on a Windows host**: the result disk is
+  sized from the root image (+512 MiB), not a fixed 16 GiB.
+* **tarfile stops quietly at a damaged header** after the first member (`next()` returns None): `sanitize` requires
+  the two zero blocks of a proper end, so a truncated VM result is refused instead of becoming half a rootfs.
+
 **First boot and the image**
 * **A first boot cut short lost Wi-Fi and SSH for good.** The board was unplugged from the station's USB
   while cloud-init ran; its per-instance markers survived as empty files, the next boot crashed on an
@@ -399,6 +457,15 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
 * The Imager file is assembled from the same per-board pieces stage 3 serves (signed slot, container); it must
   not gain anything the page may not see (it carries what stage 3 carries: ciphertext, signed boot files,
   first-boot files).
+* **An app's maintainer scripts never run outside the installer VM** (`app-install.sh`, `isolated=True`): not in
+  the privileged `app-rootfs.sh` (Debian's packages only, from the dependency fields), not in the image build.
+  Every root file system that leaves the VM goes through `rootfs_tar.sanitize` before anything unpacks it, and
+  again with the app's base UID on its way into the config dir; the layer unpacks only that.
+* An app's container never starts without its `UIDMap`/`GIDMap`, its rootfs owners are always inside its own
+  slot's range (`sandbox.uid_base`), and two apps never share a slot. File capabilities in an app's rootfs are v3
+  with the app's base UID as root (a v2 capability there would be a real one for any host process running the file).
+* An app's D-Bus proxy runs as the app's base UID and the services decide by that UID: never run it as root or
+  share one proxy between apps.
 * Logs must never contain key material, passphrases or tokens (`docker.py` masks env names matching
   KEY/PASS/SECRET/TOKEN/PRIVATE; the page redacts passphrases in command echoes).
 

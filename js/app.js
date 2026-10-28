@@ -466,6 +466,8 @@
     const IMAGE_BOOL = ['ssh', 'ssh_password_login', 'wifi_hidden'];
     const IMAGE_SECRETS = ['password', 'wifi_password'];
     const img = { loaded: null, warnings: [], remove: { password: false, wifi_password: false }, saving: false, loading: false, choicesKey: '', customKey: '' };
+    /** image.packages / image.apps as the operator is editing them (``draft``), the sandbox previews shown, the upload. */
+    const pkgs = { draft: null, preview: {}, upload: null, kind: 'app', key: '' };
     const imageInput = (name) => imageForm.elements.namedItem(name);
     const imageKeys = () => imageInput('ssh_authorized_keys').value.split('\n').map((x) => x.trim()).filter(Boolean);
 
@@ -486,6 +488,11 @@
             const v = imageInput(k).value;
             if (v) out[k] = v;
             else if (img.remove[k]) out[k] = '';
+        }
+        if (pkgs.draft) {
+            const d = draftLines();
+            if (d.packages.join('\n') !== (s.packages || []).join('\n')) out.packages = d.packages;
+            if (d.apps.join('\n') !== (s.apps || []).join('\n')) out.apps = d.apps;
         }
         return out;
     }
@@ -572,6 +579,8 @@
                 : chosen.cloud_init === false ? `${chosen.name} has no cloud-init: the settings below are not written to it; boards boot with the configuration the image was made with.`
                     : '';
         $('#btn-custom-upload').disabled = !usable || !!upload.handle;
+        $('#btn-system-upload').disabled = !usable || !!pkgs.upload;
+        $('#btn-app-upload').disabled = !usable || !!pkgs.upload;
         if (!s && !img.loading && !(api.available && googleReady())) setImageStatus('Available once the server is running and signed in to Google.');
     }
 
@@ -580,6 +589,7 @@
         img.loaded = s;
         img.warnings = view.warnings || [];
         img.remove = { password: false, wifi_password: false };
+        resetPackagesDraft(s);
         if (view.choices) fillImageChoices(view.choices);
         fillCustomSelect(true);
         for (const k of IMAGE_TEXT) {
@@ -591,6 +601,7 @@
         imageInput('ssh_authorized_keys').value = (s.ssh_authorized_keys || []).join('\n');
         for (const k of IMAGE_SECRETS) { imageInput(k).value = ''; imageInput(k).type = 'password'; }
         for (const b of imageForm.querySelectorAll('button[data-show]')) b.textContent = 'show';
+        renderPackages();
         renderImagePanel();
     }
 
@@ -621,13 +632,13 @@
             const names = (r.saved || []).map((k) => k.replace(/^image\./, '')).join(', ');
             const builds = srv.status && srv.status.config && srv.status.config.builds;
             const auto = !builds || builds.auto !== false;
-            const renamed = (r.saved || []).includes('image.name');
+            const renamed = (r.saved || []).some((k) => ['image.name', 'image.packages', 'image.apps'].includes(k));
             const source = (r.saved || []).includes('image.custom');
             const chosen = customList().find((c) => c.id === (r.settings && r.settings.custom));
             setImageStatus(`Saved: ${names}. ` + (source ? (chosen ? `Stage 3 now writes ${chosen.name}${chosen.ready ? '' : ' once it is prepared'}. ` : 'Stage 3 now writes the station image. ') : '')
                 + (!renamed ? 'Boards flashed from now on get them at stage 3 (no rebuild).'
-                    : auto ? 'The image has a new name: the server rebuilds both images now; stage 3 waits for them.'
-                        : 'The image has a new name: start the OS image build under Server builds (automatic builds are off).'));
+                    : auto ? 'The image changed (its name or its packages): the server rebuilds both images now, preparing apps that are not prepared yet first; stage 3 waits for them.'
+                        : 'The image changed (its name or its packages): start the OS image build under Server builds (automatic builds are off).'));
             log('ok', `OS image settings saved: ${names}`);
             refreshStatus();
         } catch (e) {
@@ -764,6 +775,282 @@
         if (f) uploadCustom(f);
     });
     $('#btn-custom-cancel').addEventListener('click', () => { if (upload.handle) upload.handle.abort(); });
+
+    // ---------- packages for the station image: system packages and sandboxed apps ----------
+    const APP_DEFAULTS = { memory_mb: 256, cpus: 1, tasks: 512 };
+    const APP_LIMITS = { memory_mb: [32, 8192, 1], cpus: [0.05, 4, 0.05], tasks: [16, 8192, 1] };
+    const pkgStatus = () => (srv.status && srv.status.packages) || null;
+    const pkgList = () => (pkgStatus() && pkgStatus().packages) || [];
+
+    /** An image.apps line (the server checked it when it was saved) -> {id, slot, grant, memory_mb, cpus, tasks}. */
+    function parseAppLine(line) {
+        const [id, ...words] = String(line).trim().split(/\s+/);
+        const e = { id, slot: 0, grant: [], ...APP_DEFAULTS };
+        for (const w of words) {
+            const i = w.indexOf('=');
+            const k = w.slice(0, i);
+            const v = w.slice(i + 1);
+            if (k === 'slot') e.slot = Number(v);
+            else if (k === 'grant') e.grant = v.split(',').filter(Boolean);
+            else if (k === 'memory') e.memory_mb = Number(v);
+            else if (k === 'cpus') e.cpus = Number(v);
+            else if (k === 'tasks') e.tasks = Number(v);
+        }
+        return e;
+    }
+
+    /** The line the server writes for an entry (otp_server.imageconfig.format_app_line). */
+    function formatAppLine(e) {
+        const words = [e.id, `slot=${e.slot}`];
+        if (e.grant.length) words.push('grant=' + [...e.grant].sort().join(','));
+        if (e.memory_mb !== APP_DEFAULTS.memory_mb) words.push(`memory=${e.memory_mb}`);
+        if (e.cpus !== APP_DEFAULTS.cpus) words.push(`cpus=${e.cpus}`);
+        if (e.tasks !== APP_DEFAULTS.tasks) words.push(`tasks=${e.tasks}`);
+        return words.join(' ');
+    }
+
+    function resetPackagesDraft(s) {
+        pkgs.draft = { packages: [...((s && s.packages) || [])], apps: ((s && s.apps) || []).map(parseAppLine) };
+        pkgs.key = '';
+    }
+
+    function draftLines() {
+        const d = pkgs.draft || { packages: [], apps: [] };
+        return { packages: [...d.packages], apps: d.apps.map(formatAppLine) };
+    }
+
+    /** Permissions the system packages of the draft declare: {name: {description, provider, calls}}. */
+    function offeredPermissions() {
+        const d = pkgs.draft || { packages: [] };
+        const out = {};
+        for (const p of pkgList()) {
+            if (p.kind !== 'system' || !d.packages.includes(p.id)) continue;
+            for (const [name, perm] of Object.entries(p.permissions || {})) {
+                out[name] = { description: perm.description || '', provider: p.deb.package,
+                    calls: (perm.calls || []).map((c) => `${c.interface}.${c.method}`) };
+            }
+        }
+        return out;
+    }
+
+    const appEntry = (id) => ((pkgs.draft && pkgs.draft.apps) || []).find((a) => a.id === id) || null;
+
+    function freeSlot() {
+        const taken = new Set(((pkgs.draft && pkgs.draft.apps) || []).map((a) => a.slot));
+        for (let s = 1; s <= 64; s++) if (!taken.has(s)) return s;
+        return 0;
+    }
+
+    function setInImage(p, on) {
+        const d = pkgs.draft;
+        if (!d) return;
+        if (p.kind === 'system') {
+            d.packages = d.packages.filter((x) => x !== p.id);
+            if (on) d.packages.push(p.id);
+        } else if (!on) {
+            d.apps = d.apps.filter((a) => a.id !== p.id);
+        } else if (!appEntry(p.id)) {
+            const slot = freeSlot();
+            if (!slot) { log('error', 'All 64 app slots are taken'); return; }
+            d.apps.push({ id: p.id, slot, grant: [], ...APP_DEFAULTS });
+        }
+    }
+
+    function appState(p) {
+        const job = p.job;
+        const active = !!job && (job.status === 'queued' || job.status === 'running');
+        if (active) return ['preparing', 'warn', active];
+        if (p.prepared) return ['prepared', 'ok', false];
+        return [p.error ? 'failed' : 'not prepared', 'err', false];
+    }
+
+    function packageRow(p, usable, offered) {
+        const deb = p.deb || {};
+        const own = { 'data-own': '1', type: 'button' };
+        const entry = p.kind === 'app' ? appEntry(p.id) : null;
+        const inImage = p.kind === 'system' ? pkgs.draft.packages.includes(p.id) : !!entry;
+        const [state, tone, active] = p.kind === 'app' ? appState(p) : ['system · runs as root', 'warn', false];
+        const title = el('div', { class: 'custom-title' }, `${deb.package} ${deb.version}`, badge(state, tone),
+            inImage ? badge('in the image', 'ok') : null);
+        const meta = el('div', { class: 'custom-meta mono', title: `sha256 ${p.sha256 || ''}` },
+            [p.name, fmtBytes(p.size), deb.architecture, `uploaded ${fmtTime(p.uploaded)}`].filter(Boolean).join(' · '));
+        const main = el('div', { class: 'custom-main' }, title, meta, el('div', { class: 'custom-detail' }, deb.summary || ''));
+        if (p.kind === 'system') {
+            const names = Object.keys(p.permissions || {}).sort();
+            main.append(el('div', { class: 'custom-detail' }, names.length ? `Permissions it offers to apps: ${names.join(', ')}` : 'Offers no permissions to apps'));
+        } else {
+            if (deb.depends) main.append(el('div', { class: 'custom-detail mono' }, `Depends: ${deb.depends}`));
+            if (p.prepared) {
+                const rep = (p.prepared.rootfs && p.prepared.rootfs.report) || {};
+                main.append(el('div', { class: 'custom-detail' }, `Root file system: ${p.prepared.base.packages} Debian packages, ${rep.members} files, ${fmtBytes(p.prepared.rootfs.size)}; installed in the VM in ${p.prepared.install.seconds} s`));
+            }
+            if (p.error && !active) main.append(el('div', { class: 'custom-detail bad' }, p.error));
+            if (entry) main.append(appGrants(p, entry, offered), appLimits(entry));
+        }
+        const preview = pkgs.preview[p.id];
+        if (preview) {
+            main.append(el('details', { class: 'sandbox-files', open: true },
+                el('summary', {}, `Sandbox on the board: slot ${preview.app.slot}, host UIDs ${preview.app.uids[0]}–${preview.app.uids[1]}${preview.in_image ? '' : ' (not in the image yet: no permissions)'}`),
+                ...Object.entries(preview.files).map(([path, text]) => el('div', {},
+                    el('div', { class: 'mono sandbox-path' }, '/' + path), el('pre', { class: 'mono' }, text)))));
+        }
+        const check = el('input', { type: 'checkbox', 'data-in-image': p.id });
+        check.checked = inImage;
+        const actions = el('div', { class: 'custom-actions' },
+            el('label', { class: 'check', title: p.kind === 'system' ? 'Install it into the station image (as root)' : 'Build it into the station image, sandboxed' }, check, ' in the image'));
+        if (p.kind === 'app') {
+            if (p.job) actions.append(el('button', Object.assign({ class: 'small', onclick: () => selectJobLog(p.job, true) }, own), 'Log'));
+            actions.append(el('button', Object.assign({ class: 'small', disabled: !usable || active, onclick: () => preparePackage(p) }, own), p.prepared ? 'Prepare again' : 'Prepare'),
+                el('button', Object.assign({ class: 'small', disabled: !usable, onclick: () => toggleSandbox(p) }, own), preview ? 'Hide sandbox' : 'Sandbox'));
+        }
+        actions.append(el('button', Object.assign({ class: 'small danger-outline', disabled: !usable || active || p.selected, title: p.selected ? 'Part of the station image: take it out and save first' : 'Remove the package (and what was prepared from it) from the station', onclick: () => deletePackage(p) }, own), 'Delete'));
+        return el('div', { class: 'custom-row' + (inImage ? ' selected' : '') }, main, actions);
+    }
+
+    function appGrants(p, entry, offered) {
+        const requested = new Set(p.requested || []);
+        const names = [...new Set([...Object.keys(offered), ...entry.grant])].sort();
+        const box = el('div', { class: 'grants' }, el('div', { class: 'custom-detail' }, names.length
+            ? `Permissions (slot ${entry.slot}): tick what this app may call on the system bus`
+            : `No permissions to grant (slot ${entry.slot}): put a system package that offers some into the image`));
+        for (const name of names) {
+            const o = offered[name];
+            const cb = el('input', { type: 'checkbox', 'data-grant': name, 'data-app': p.id });
+            cb.checked = entry.grant.includes(name);
+            box.append(el('label', { class: 'check' + (o ? '' : ' bad'), title: o ? `${o.description} (${o.calls.join(', ')}; from ${o.provider})` : 'No system package in the image offers this permission: the image cannot be built with it' },
+                cb, ` ${name}`, requested.has(name) ? el('span', { class: 'muted' }, ' (requested)') : null, o ? null : el('span', {}, ' (not offered)')));
+        }
+        return box;
+    }
+
+    function appLimits(entry) {
+        const field = (key, label) => {
+            const [min, max, step] = APP_LIMITS[key];
+            return el('label', { class: 'check' }, `${label} `, el('input', { type: 'number', class: 'limit', min, max, step, value: entry[key], 'data-limit': key, 'data-app': entry.id }));
+        };
+        return el('div', { class: 'grants' }, field('memory_mb', 'memory MiB'), field('cpus', 'CPUs'), field('tasks', 'tasks'));
+    }
+
+    function renderPackages() {
+        if (!pkgs.draft && img.loaded) resetPackagesDraft(img.loaded);
+        const st = pkgStatus();
+        const usable = api.available && googleReady() && !!img.loaded && !img.saving;
+        const key = JSON.stringify([st, pkgs.draft, Object.keys(pkgs.preview), usable]);
+        const box = $('#packages-list');
+        // Polling re-renders; never under the operator's fingers (a number being typed keeps its focus).
+        if (key === pkgs.key || box.contains(document.activeElement) && document.activeElement.type === 'number') return;
+        pkgs.key = key;
+        const offered = offeredPermissions();
+        box.replaceChildren(...(pkgs.draft ? pkgList().map((p) => packageRow(p, usable, offered)) : []));
+        const notes = [...((st && st.notes) || []), ...((st && st.problems) || []).map((t) => `Saved settings: ${t}`)];
+        const missing = pkgs.draft ? pkgs.draft.apps.filter((a) => !pkgList().some((p) => p.id === a.id)).map((a) => `app ${a.id} is not on this station`) : [];
+        $('#packages-note').replaceChildren(...[...notes, ...missing].map((t) => el('div', { class: 'bad' }, t)));
+        renderImagePanel();
+    }
+
+    $('#packages-list').addEventListener('change', (ev) => {
+        const t = ev.target;
+        const p = pkgList().find((x) => x.id === (t.dataset.inImage || t.dataset.app));
+        if (!p || !pkgs.draft) return;
+        if (t.dataset.inImage) setInImage(p, t.checked);
+        else if (t.dataset.grant) {
+            const e = appEntry(p.id);
+            if (e) e.grant = t.checked ? [...new Set([...e.grant, t.dataset.grant])] : e.grant.filter((g) => g !== t.dataset.grant);
+        }
+        pkgs.key = '';
+        renderPackages();
+    });
+    $('#packages-list').addEventListener('input', (ev) => {
+        const t = ev.target;
+        if (!t.dataset.limit) return;
+        const e = appEntry(t.dataset.app);
+        const [min, max] = APP_LIMITS[t.dataset.limit];
+        const v = Number(t.value);
+        t.classList.toggle('bad', !(v >= min && v <= max));
+        if (e && v >= min && v <= max) e[t.dataset.limit] = t.dataset.limit === 'cpus' ? v : Math.round(v);
+        renderImagePanel();
+    });
+
+    async function uploadPackage(file, kind) {
+        if (pkgs.upload) return;
+        const bar = $('#package-upload-progress');
+        const status = $('#package-upload-status');
+        bar.classList.remove('hidden');
+        bar.firstElementChild.style.width = '0';
+        $('#btn-package-cancel').classList.remove('hidden');
+        log('info', `Uploading ${file.name} (${fmtBytes(file.size)}) to the station as ${kind === 'system' ? 'a system package' : 'an app'}…`);
+        pkgs.upload = api.uploadPackage(file, kind, (sent, total) => {
+            const pct = total ? Math.min(100, Math.round((100 * sent) / total)) : 0;
+            bar.firstElementChild.style.width = pct + '%';
+            status.textContent = `${file.name}: ${fmtBytes(sent)} / ${fmtBytes(total)} (${pct}%)`;
+        });
+        renderImagePanel();
+        try {
+            const r = await pkgs.upload.promise;
+            const name = `${r.package.deb.package} ${r.package.deb.version}`;
+            status.textContent = !r.new ? `${name} is already on the station.`
+                : kind === 'app' ? `${name} uploaded: the station installs it into its own root file system now (a few minutes). Tick "in the image" and its permissions, then save.`
+                    : `${name} uploaded. Tick "in the image" and save to install it into the station image.`;
+            log('ok', `Package ${name} (${r.package.id}, ${r.package.kind}) ${r.new ? 'uploaded' : 'was uploaded before'}`);
+            if (r.job) selectJobLog(r.job, true);
+            await refreshStatus();
+        } catch (e) {
+            status.textContent = `Upload failed: ${e.detail || e.message}`;
+            log('error', `Upload of ${file.name}: ${e.detail || e.message}`);
+        } finally {
+            pkgs.upload = null;
+            bar.classList.add('hidden');
+            $('#btn-package-cancel').classList.add('hidden');
+            renderImagePanel();
+        }
+    }
+
+    async function preparePackage(p) {
+        try {
+            const r = await api.preparePackage(p.id, !!p.prepared);
+            log('info', `Prepare app ${p.deb.package}: job ${r.job.id} ${r.job.status}`);
+            selectJobLog(r.job, true);
+        } catch (e) {
+            log('error', `Prepare app ${p.deb.package}: ${e.detail || e.message}`);
+        }
+        refreshStatus();
+    }
+
+    async function toggleSandbox(p) {
+        if (pkgs.preview[p.id]) {
+            delete pkgs.preview[p.id];
+        } else {
+            try {
+                pkgs.preview[p.id] = await api.packageSandbox(p.id);
+            } catch (e) {
+                log('error', `Sandbox of ${p.deb.package}: ${e.detail || e.message}`);
+            }
+        }
+        pkgs.key = '';
+        renderPackages();
+    }
+
+    async function deletePackage(p) {
+        if (!window.confirm(`Remove ${p.deb.package} ${p.deb.version} from the station?`)) return;
+        try {
+            await api.deletePackage(p.id);
+            delete pkgs.preview[p.id];
+            log('ok', `Package ${p.deb.package} removed from the station`);
+        } catch (e) {
+            log('error', `Delete package ${p.deb.package}: ${e.detail || e.message}`);
+        }
+        refreshStatus();
+    }
+
+    for (const [btn, kind] of [['#btn-system-upload', 'system'], ['#btn-app-upload', 'app']]) {
+        $(btn).addEventListener('click', () => { pkgs.kind = kind; $('#package-file').click(); });
+    }
+    $('#package-file').addEventListener('change', (e) => {
+        const f = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (f) uploadPackage(f, pkgs.kind);
+    });
+    $('#btn-package-cancel').addEventListener('click', () => { if (pkgs.upload) pkgs.upload.abort(); });
     $('#btn-image-revert').addEventListener('click', () => {
         if (img.loaded) fillImageForm({ settings: img.loaded, warnings: img.warnings });   // the lists stay
         setImageStatus('');
@@ -963,6 +1250,7 @@
         renderServerBadges();
         renderBuilds();
         renderCustomImages();
+        renderPackages();
         if (!googleReady() && img.loaded) {           // signed out: the next account has its own settings
             img.loaded = null;
             img.warnings = [];
@@ -1024,5 +1312,6 @@
 
     // exposed for the self-test page
     OTP.app = { log, flow, srv, steps, setStep, renderBoard, renderRegistry, refreshStatus, ready, confirmIrreversible, renderGoogle, renderScenario, currentScenario,
-        img, loadImageSettings, renderImagePanel, tzOffset, imager, renderImager, prepareImager, renderCustomImages, uploadCustom, upload, showNeed };
+        img, loadImageSettings, renderImagePanel, tzOffset, imager, renderImager, prepareImager, renderCustomImages, uploadCustom, upload, showNeed,
+        pkgs, renderPackages, uploadPackage, parseAppLine, formatAppLine };
 })();

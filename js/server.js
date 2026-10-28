@@ -64,6 +64,28 @@
             throw new ApiError(res.status, detailOf(data), data);
         }
 
+        /** PUT a File as the request body with progress (XHR: fetch has no upload progress). Returns {promise, abort()}. */
+        function putFile(url, file, onProgress) {
+            const XHR = opts.XMLHttpRequest || window.XMLHttpRequest;
+            const xhr = new XHR();
+            const promise = new Promise((resolve, reject) => {
+                xhr.open('PUT', url);
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                xhr.setRequestHeader('Accept', 'application/json');
+                if (xhr.upload && onProgress) xhr.upload.onprogress = (e) => onProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+                xhr.onload = () => {
+                    let data = null;
+                    try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch (e) { data = { detail: String(xhr.responseText).slice(0, 500) }; }
+                    if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+                    else reject(new ApiError(xhr.status, detailOf(data), data));
+                };
+                xhr.onerror = () => reject(new ApiError(0, 'the upload failed (connection lost)'));
+                xhr.onabort = () => reject(new ApiError(0, 'the upload was cancelled'));
+                xhr.send(file);
+            });
+            return { promise, abort: () => xhr.abort() };
+        }
+
         const api = {
             available: false,
             lastStatus: null,
@@ -115,24 +137,17 @@
              * Resolves {image, new, job}; rejects with ApiError. Returns {promise, abort()}.
              */
             uploadCustomImage(file, onProgress) {
-                const XHR = opts.XMLHttpRequest || window.XMLHttpRequest;
-                const xhr = new XHR();
-                const promise = new Promise((resolve, reject) => {
-                    xhr.open('PUT', `${base}/api/custom-images?name=${enc(file.name || 'custom.img')}`);
-                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-                    xhr.setRequestHeader('Accept', 'application/json');
-                    if (xhr.upload && onProgress) xhr.upload.onprogress = (e) => onProgress(e.loaded, e.lengthComputable ? e.total : file.size);
-                    xhr.onload = () => {
-                        let data = null;
-                        try { data = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch (e) { data = { detail: String(xhr.responseText).slice(0, 500) }; }
-                        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-                        else reject(new ApiError(xhr.status, detailOf(data), data));
-                    };
-                    xhr.onerror = () => reject(new ApiError(0, 'the upload failed (connection lost)'));
-                    xhr.onabort = () => reject(new ApiError(0, 'the upload was cancelled'));
-                    xhr.send(file);
-                });
-                return { promise, abort: () => xhr.abort() };
+                return putFile(`${base}/api/custom-images?name=${enc(file.name || 'custom.img')}`, file, onProgress);
+            },
+            /** System packages and sandboxed apps for the station image (also in /api/status as packages). */
+            packages() { return request('GET', '/api/packages'); },
+            preparePackage(id, force) { return request('POST', `/api/packages/${enc(id)}/prepare`, { force: !!force }); },
+            /** The files of an app's sandbox as the image would get them now: {app, in_image, files: {path: text}}. */
+            packageSandbox(id) { return request('GET', `/api/packages/${enc(id)}/sandbox`); },
+            deletePackage(id) { return request('DELETE', `/api/packages/${enc(id)}`); },
+            /** Upload a .deb (a File); kind "system" | "app". Resolves {package, new, job}. Returns {promise, abort()}. */
+            uploadPackage(file, kind, onProgress) {
+                return putFile(`${base}/api/packages?kind=${enc(kind)}&name=${enc(file.name || 'package.deb')}`, file, onProgress);
             },
             /**
              * Prepare the image file of a locked board for Raspberry Pi Imager; source: "" = the station image,

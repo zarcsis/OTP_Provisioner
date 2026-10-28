@@ -255,6 +255,15 @@ body.gated #main-layout { opacity: 0.35; pointer-events: none; user-select: none
 .custom-detail { font-size: 12px; }
 .custom-detail.bad { color: var(--err); }
 .custom-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.grants { display: flex; gap: 4px 12px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.grants label.check.bad { color: var(--err); }
+input.limit { width: 6em; }
+input.limit.bad { border-color: var(--err); }
+.sandbox-files { margin-top: 6px; font-size: 12px; }
+.sandbox-files pre { max-height: 16em; overflow: auto; margin: 2px 0 8px; padding: 6px; background: var(--bg);
+                     border: 1px solid var(--border); border-radius: 4px; white-space: pre; }
+.sandbox-path { color: var(--muted); }
+#packages-note .bad { color: var(--err); font-size: 12px; }
 .imager { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 8px; }
 .imager h3 { margin: 0 0 6px; }
 .imager .row { flex-wrap: wrap; }

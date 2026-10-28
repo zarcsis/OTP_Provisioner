@@ -106,13 +106,13 @@ _COUNTS: Counter = Counter()
 
 #: The image.* settings (otp_server.config.ImageCfg) behind GET/POST /api/image; secrets as the server keeps them.
 _INITIAL_IMAGE: dict[str, Any] = {
-    "name": "deb13-arm64-min", "custom": "", "hostname": "pi5", "timezone": "Europe/Kyiv", "keyboard": "us", "user": "pi", "password_hash": "",
+    "name": "deb13-arm64-min", "custom": "", "packages": [], "apps": [], "hostname": "pi5", "timezone": "Europe/Kyiv", "keyboard": "us", "user": "pi", "password_hash": "",
     "ssh": False, "ssh_password_login": True, "ssh_authorized_keys": [], "wifi_ssid": "", "wifi_password": "",
     "wifi_country": "UA", "wifi_hidden": False,
 }
 IMAGE: dict[str, Any] = copy.deepcopy(_INITIAL_IMAGE)
-IMAGE_FIELDS = ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
-                "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")
+IMAGE_FIELDS = ("name", "custom", "packages", "apps", "hostname", "timezone", "keyboard", "user", "ssh",
+                "ssh_password_login", "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")
 
 
 def _custom(cid: str, name: str, size: int, *, ready: bool = True, cloud_init: bool = False, error: str = "") -> dict:
@@ -128,6 +128,44 @@ def _custom(cid: str, name: str, size: int, *, ready: bool = True, cloud_init: b
 
 _INITIAL_CUSTOM: list[dict[str, Any]] = [_custom("3d0c4b7e6a514f2e", "os.img", 6_442_450_944)]
 CUSTOM: list[dict[str, Any]] = copy.deepcopy(_INITIAL_CUSTOM)
+
+PROVIDER_ID, DETECTOR_ID = "4022f7f285768071", "8ebcf7faf1c76273"
+_DEMO_CALL = {"service": "io.github.DetectInt.Demo", "interface": "io.github.DetectInt.Demo1",
+              "path": "/io/github/DetectInt/Demo"}
+DEMO_PERMISSIONS = {
+    "demo.frames.read": {"description": "Read the provider's camera frames (a read-only handle to its shared memory)",
+                         "calls": [dict(_DEMO_CALL, method="GetFrameHandle")]},
+    "demo.detections.report": {"description": "Report detections to the provider",
+                               "calls": [dict(_DEMO_CALL, method="ReportDetection")]},
+}
+
+
+def _package(pid: str, kind: str, package: str, *, prepared: bool = True) -> dict:
+    """otp_server.artifacts.packages.Packages.status() of one upload."""
+    row = {"id": pid, "kind": kind, "name": f"{package}_1.0.0_all.deb", "size": 7072, "sha256": pid + "0" * 48,
+           "uploaded": "2026-10-27T21:00:00Z", "selected": False,
+           "deb": {"package": package, "version": "1.0.0", "architecture": "all", "summary": f"{package} of the demo",
+                   "depends": "python3, python3-gi, gir1.2-glib-2.0, systemd", "scripts": ["postinst", "postrm", "prerm"],
+                   "files": 11, "data_bytes": 10756},
+           "permissions": copy.deepcopy(DEMO_PERMISSIONS) if kind == "system" else None,
+           "requested": ["demo.detections.report", "demo.frames.read"] if kind == "app" else None}
+    if kind == "app":
+        report = {"members": 8200, "bytes": 206861729, "dropped": {}, "capabilities": [], "setid": []}
+        row["prepared"] = {
+            "package": package, "version": "1.0.0", "id": pid, "set": "abc", "built": "2026-10-27T21:05:00Z",
+            "base": {"suite": "trixie", "depends": row["deb"]["depends"], "packages": 102},
+            "install": {"dpkg": "0", "tar": "0", "seconds": 20},
+            "rootfs": {"file": "rootfs.tar", "size": 212899840, "sha256": "f" * 64, "report": report},
+        } if prepared else None
+        row.update(error="", job=None)
+    return row
+
+
+_INITIAL_PACKAGES: list[dict[str, Any]] = [_package(PROVIDER_ID, "system", "vn-demo-provider"),
+                                           _package(DETECTOR_ID, "app", "vn-demo-detector")]
+PACKAGES: list[dict[str, Any]] = copy.deepcopy(_INITIAL_PACKAGES)
+_APP_LINE_RE = re.compile(r"[0-9a-f]{16} slot=([1-9]|[1-5][0-9]|6[0-4])( grant=[a-z0-9._,-]+)?( memory=\d+)?"
+                          r"( cpus=[0-9.]+)?( tasks=\d+)?")
 #: Calls of POST /api/modules/{serial}/imager-image per board (the first answers 409 with a running job).
 _IMAGER_CALLS: Counter = Counter()
 
@@ -136,6 +174,7 @@ def reset() -> None:
     """Back to the canned state (modules, status overrides, request counts, image settings)."""
     MODULES[:] = copy.deepcopy(_INITIAL_MODULES)
     CUSTOM[:] = copy.deepcopy(_INITIAL_CUSTOM)
+    PACKAGES[:] = copy.deepcopy(_INITIAL_PACKAGES)
     _IMAGER_CALLS.clear()
     _STATUS_OVERRIDES.clear()
     _COUNTS.clear()
@@ -157,9 +196,9 @@ def image_view() -> dict[str, Any]:
     """otp_server.app.Services.image_settings: no password or hash, only whether they are set."""
     i = IMAGE
     sudo = "passwd" if i["password_hash"] else ("nopasswd" if i["ssh"] and i["ssh_authorized_keys"] else "wizard")
-    view = {k: copy.deepcopy(i[k]) for k in ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh",
-                                             "ssh_password_login", "ssh_authorized_keys", "wifi_ssid", "wifi_country",
-                                             "wifi_hidden")}
+    view = {k: copy.deepcopy(i[k]) for k in ("name", "custom", "packages", "apps", "hostname", "timezone", "keyboard",
+                                             "user", "ssh", "ssh_password_login", "ssh_authorized_keys", "wifi_ssid",
+                                             "wifi_country", "wifi_hidden")}
     view.update(password_set=bool(i["password_hash"]), wifi_password_set=bool(i["wifi_password"]), sudo=sudo)
     warnings = []
     if not i["password_hash"] and not (i["ssh"] and i["ssh_authorized_keys"]):
@@ -191,6 +230,9 @@ def _save_image(data: Any) -> tuple[int, Any]:
         return 400, {"detail": f"config image.wifi_country: Wi-Fi country {changed['wifi_country']!r} is not in wireless-regdb"}
     if changed.get("custom") and not any(c["id"] == changed["custom"] for c in CUSTOM):
         return 400, {"detail": f"config image.custom: no custom image {changed['custom']!r} on this station"}
+    for line in changed.get("apps") or []:
+        if not _APP_LINE_RE.fullmatch(str(line)):
+            return 400, {"detail": f"config image.apps: {line!r}"}
     if data.get("password") is not None:
         changed["password_hash"] = ("$6$fakesalt$" + "x" * 86) if data["password"] else ""
     if data.get("wifi_password") is not None:
@@ -244,9 +286,91 @@ def status() -> dict[str, Any]:
                        "detail": "WinUSB is not bound to 18d1:4e40 yet (wdi-simple -v 0x18d1 -p 0x4e40)"},
         "artifacts": _ARTIFACTS,
         "custom_images": [dict(c, selected=c["id"] == IMAGE["custom"]) for c in CUSTOM],
+        "packages": packages_status(),
         "jobs": list(_JOBS.values()),
     }
     return _merge(s, _STATUS_OVERRIDES)
+
+
+def _app_slot(line: str) -> int:
+    return int(line.split("slot=")[1].split()[0])
+
+
+def packages_status() -> dict[str, Any]:
+    """otp_server.artifacts.Artifacts.packages_status."""
+    chosen = set(IMAGE["packages"]) | {line.split()[0] for line in IMAGE["apps"]}
+    perms = {}
+    for p in PACKAGES:
+        if p["kind"] == "system" and p["id"] in IMAGE["packages"]:
+            for name, perm in (p["permissions"] or {}).items():
+                perms[name] = {"description": perm["description"], "provider": p["deb"]["package"],
+                               "calls": [f"{c['interface']}.{c['method']}" for c in perm["calls"]]}
+    slots = {_app_slot(line) for line in IMAGE["apps"]}
+    return {"packages": [dict(p, selected=p["id"] in chosen) for p in PACKAGES], "permissions": perms,
+            "selected": {"packages": list(IMAGE["packages"]), "apps": list(IMAGE["apps"])}, "problems": [],
+            "unprepared": [], "notes": [], "next_slot": next(s for s in range(1, 65) if s not in slots)}
+
+
+def _upload_package(query: str, body: bytes) -> tuple[int, Any]:
+    """PUT /api/packages?kind=...&name=...: anything that is not an ar archive is refused, as debpkg does."""
+    from urllib.parse import parse_qs
+
+    q = parse_qs(query)
+    kind = (q.get("kind") or [""])[0]
+    name = (q.get("name") or ["package.deb"])[0]
+    if kind not in ("system", "app"):
+        return 400, {"detail": "package kind must be one of system, app"}
+    if not body.startswith(b"!<arch>\n"):
+        return 400, {"detail": "not a Debian package (no ar archive header)"}
+    pid = hashlib.sha256(body).hexdigest()[:16]
+    old = next((x for x in PACKAGES if x["id"] == pid), None)
+    if old is not None:
+        return 200, {"package": old, "new": False, "job": None}
+    p = _package(pid, kind, name.split("_")[0] or "pkg", prepared=False)
+    job = None
+    if kind == "app":
+        job = p["job"] = _new_job(f"package:{pid}", f"Prepare app {p['deb']['package']}", "running")
+    PACKAGES.insert(0, p)
+    return 200, {"package": p, "new": True, "job": job}
+
+
+def _sandbox(p: dict) -> dict:
+    """GET /api/packages/{id}/sandbox: two of the files, enough for the page."""
+    line = next((x for x in IMAGE["apps"] if x.split()[0] == p["id"]), None)
+    slot = _app_slot(line) if line else packages_status()["next_slot"]
+    uid = 0x100000 + slot * 65536
+    name = "vn-app-" + p["deb"]["package"]
+    return {"app": {"id": p["deb"]["package"], "slot": slot, "uid": uid, "uids": [uid, uid + 65535], "name": name},
+            "in_image": line is not None,
+            "files": {f"etc/containers/systemd/{name}.container": f"[Container]\nUIDMap=0:{uid}:65536\nNetwork=none\n",
+                      f"etc/apparmor.d/{name}": f"profile {name} flags=(attach_disconnected,mediate_deleted) {{\n}}\n"}}
+
+
+def _packages_route(method: str, rest: list[str], path: str, body: bytes) -> tuple[int, Any] | None:
+    """The /api/packages endpoints (None: not one of them)."""
+    if method == "GET" and rest == ["packages"]:
+        return 200, packages_status()
+    if method == "PUT" and rest == ["packages"]:
+        return _upload_package(path.split("?", 1)[1] if "?" in path else "", body)
+    if len(rest) < 2 or rest[0] != "packages":
+        return None
+    p = next((x for x in PACKAGES if x["id"] == rest[1]), None)
+    if p is None:
+        return 404, {"detail": f"no package {rest[1]!r}"}
+    if method == "POST" and rest[2:] == ["prepare"]:
+        if p["kind"] != "app":
+            return 400, {"detail": f"{p['name']} is a system package: there is nothing to prepare"}
+        p["job"] = _new_job(f"package:{p['id']}", f"Prepare app {p['deb']['package']}", "running")
+        return 200, {"job": p["job"]}
+    if method == "GET" and rest[2:] == ["sandbox"]:
+        return (200, _sandbox(p)) if p["kind"] == "app" else (404, {"detail": f"no app {p['id']!r}"})
+    if method == "DELETE" and len(rest) == 2:
+        if p["id"] in IMAGE["packages"] or any(x.split()[0] == p["id"] for x in IMAGE["apps"]):
+            return 400, {"detail": "the package is part of the station image (image.packages / image.apps): remove it "
+                                   "there first"}
+        PACKAGES.remove(p)
+        return 200, {"ok": True}
+    return None
 
 
 def _new_job(target: str, title: str, status: str = "queued") -> dict:
@@ -403,8 +527,12 @@ def handle(method: str, path: str, body: bytes) -> tuple[int, Any]:
                               "settings": {"ok": False, "error": "not signed in to Google"}})
         return 200, {"ok": True}
     st = status()
-    if rest[:1] in (["modules"], ["builds"], ["fastboot"], ["image"], ["custom-images"]) and st.get("google_ready") is False:
+    if rest[:1] in (["modules"], ["builds"], ["fastboot"], ["image"], ["custom-images"], ["packages"]) \
+            and st.get("google_ready") is False:
         return 401, {"detail": _google_problem(st)}
+    routed = _packages_route(method, rest, path, body)
+    if routed is not None:
+        return routed
     if method == "GET" and rest == ["image"]:
         return 200, image_view()
     if method == "POST" and rest == ["image"]:

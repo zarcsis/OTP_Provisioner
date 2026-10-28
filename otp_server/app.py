@@ -297,6 +297,16 @@ class Services:
             log.exception("custom image status failed")
             return []
 
+    def packages_status(self) -> dict | None:
+        """System packages and sandboxed apps for the station image (None when they cannot be read)."""
+        if self.artifacts is None or not hasattr(self.artifacts, "packages_status"):
+            return None
+        try:
+            return self.artifacts.packages_status()
+        except Exception:
+            log.exception("package status failed")
+            return None
+
     def jobs_status(self) -> list[dict]:
         """The running job, else the last one, for every target that has jobs (newest first)."""
         if self.jobs is None:
@@ -332,6 +342,7 @@ class Services:
             "usb_driver": self.usb_driver_status(),
             "artifacts": self.artifacts_status(),
             "custom_images": self.custom_images_status(),
+            "packages": self.packages_status(),
             "jobs": self.jobs_status(),
         }
 

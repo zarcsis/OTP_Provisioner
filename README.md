@@ -308,6 +308,89 @@ script or tools image marks the sets stale; with `builds.auto` the chosen image 
 preparation is not retried by itself: fix the cause and click Prepare). Disk use: the upload plus about its
 used size per set, plus each secure board's container.
 
+## System packages and sandboxed apps
+
+The station image can carry Debian packages of your own, of two kinds, chosen under **Applications** in the
+**OS image** panel. Both are built into the image (a change rebuilds it); custom images (`image.custom`) do not
+get them.
+
+* A **system package** (`image.packages`) is trusted: rpi-image-gen installs it like the image's own packages
+  (`packages:` with the `.deb` from the config dir; apt resolves its dependencies from the image's sources), its
+  maintainer scripts run in the image build and its services run as whatever they ask for, root included. A
+  system package may **offer permissions to apps**: a JSON file in `/usr/share/vn-apps/permissions/` says which
+  D-Bus method calls each permission lets through.
+* An **app** (`image.apps`) is any ordinary package: its own dependencies, systemd units, users, maintainer
+  scripts. Nothing in it is restricted; it runs **sandboxed** instead, like an Android app: one container per app,
+  isolated from the host and from every other app.
+
+**Upload** with **Upload system package…** / **Upload app…** (an arm64 or `all` `.deb`; gzip, xz or, with Python
+3.14+, zstd). The station reads its metadata only (`otp_server/debpkg.py`) and keeps it under the first 16 hex
+digits of its SHA-256 in `<work>/artifacts/packages/`. Tick **in the image** to put it in. For an app, tick the
+**permissions** it gets (those the system packages in the image offer; the ones the package asks for in an
+optional `X-Sandbox-Permissions` control field are marked *requested*, nothing is granted by itself) and set its
+limits (memory, CPUs, tasks); **Sandbox** shows the files the board will get for it. Save.
+
+**An app is installed on the station, before the image is built** (a job per app, the `otp-app-builder` image,
+`docker/apps.Dockerfile`; the image build prepares any app that is not prepared yet):
+
+1. `app-vmkit.sh` (once): the installer VM's kernel and initramfs, Debian trixie's arm64 kernel with the modules a
+   virtio disk with ext4 needs, and busybox (downloaded with apt, signatures checked).
+2. `app-rootfs.sh` (privileged, network): Debian trixie arm64, minbase + systemd, plus the app's `Pre-Depends` and
+   `Depends` from Debian (`apt-get satisfy`): only Debian's own maintainer scripts run here. The result is an
+   ext4 disk image with the app's `.deb` in `/vn-install`.
+3. `app-install.sh` (no network, no capabilities, `no-new-privileges`): `qemu-system-aarch64` (TCG, no KVM) boots
+   that kit with two disks and nothing else; its `/init` (`app-vm-init`) runs `dpkg -i` in a chroot of the disk,
+   so **the app's maintainer scripts run only inside this throwaway VM**, then writes the root file system as a
+   tar archive to the second disk and powers off. About 20 s for the demo app.
+4. `otp_server/rootfs_tar.py` reads that archive as untrusted and writes the prepared `rootfs.tar`: normalised
+   names, no `..`, no member twice, nothing below a symbolic link, no device nodes, nothing below `dev/`,
+   `proc/`, `sys/`, owners 0..65535 only, set-ID bits kept (they only switch between the app's own users),
+   file capabilities rewritten as namespaced (v3) ones and every other extended attribute dropped.
+
+**On the board** (layer `otp-apps`, files from `otp_server/sandbox.py`), app *N* (its slot, 1..64) gets:
+
+* host UIDs/GIDs `0x100000 + N·65536` .. `+65535`: its container's 0..65535 (root included) are those, so
+  nothing in it is root on the host. The base UID is the user `vnapp<N>`, member of `vnapps`;
+* `/var/lib/vn-apps/vn-app-<package>/rootfs` (the parent `/var/lib/vn-apps` is `0711`, the app's directory `0700`
+  for its base UID): its root file system, owners already moved into its range at image build time; it keeps
+  its state there across boots;
+* a rootful podman container (quadlet `/etc/containers/systemd/vn-app-<package>.container`, `Rootfs=`, systemd as
+  init, so the package's units start as it enabled them): `Network=none`, its own AppArmor profile
+  (`/etc/apparmor.d/vn-app-<package>`: podman's default plus mount and user namespaces for systemd, minus IP and
+  packet sockets), CAP_SYS_ADMIN valid in its own user namespace only (systemd sandboxes the package's services),
+  no devices (no `/dev/vcio`, so no firmware HMAC and no LUKS key), its own PID, IPC and mount namespaces,
+  `MemoryMax`, `CPUQuota`, `TasksMax` in `vnapps.slice`;
+* the system bus only through **its own xdg-dbus-proxy** (`vn-app-<package>-bus.service`, as `vnapp<N>`,
+  `--filter` with one `--call=` rule per granted method), mounted at `/run/dbus` in the container: the app sees
+  only the names it may call, owns none, and the services see the proxy's UID, i.e. the app's;
+* an entry in `/etc/vn-apps/registry.json` (UID → app, version, permissions) for the trusted services to check
+  every caller a second time.
+
+The image also gets podman, crun, conmon, catatonit and xdg-dbus-proxy, and `cgroup_enable=memory` on the kernel
+command line (the Raspberry Pi kernel disables the memory cgroup by default, the limits need it).
+
+**What an app cannot do there, by design:** anything that needs the board's hardware, the network, the host's
+configuration (udev, kernel modules, `cmdline.txt`), or another app. Its postinst sees an ordinary arm64 VM, not
+the board: no serial number, no network; device-specific setup belongs in the service's start. While it is
+installed, systemd does not run, so units are enabled but not started (as in any image build).
+
+**The demo** (`examples/apps`, built with `python -B examples/apps/build.py`: standard library only, the `.deb`
+files land in `<temp>/otp-example-debs`):
+
+* `vn-demo-provider` (system package): a synthetic camera, a bright blob moving over a gradient, 320×240 grey at
+  30 Hz, in a sealed memfd ring (camhub's seqlock layout in miniature). D-Bus `io.github.DetectInt.Demo`:
+  `GetFrameHandle() -> h` hands out a read-only descriptor (O_RDONLY, the memfd 0444, `F_SEAL_FUTURE_WRITE`),
+  `ReportDetection(t frame, i x, i y, d score) -> b` scores a detection against the true position. It offers
+  `demo.frames.read` and `demo.detections.report`, checks callers by UID against the registry and logs every
+  app's detections and error.
+* `vn-demo-detector` (app): finds the blob five times a second and reports it; a second unit checks once at
+  start what its sandbox lets through (`podman exec vn-app-vn-demo-detector journalctl -u
+  vn-demo-detector-probe`).
+
+Upload both, put the provider and the detector in the image, grant the detector both permissions, save; the
+image is rebuilt. On a board flashed from it: `journalctl -u vn-demo-provider` shows `vn-demo-detector (uid
+1114112): 25 detections in 5 s, mean error 0.0 px`.
+
 ## The image file for Raspberry Pi Imager
 
 A board whose OTP holds its key, whose OTP device key the station holds and whose SD card the station knows
@@ -511,6 +594,8 @@ is shown on the page; unknown keys produce a warning.
 | `provisioning.boot_conf` | `[all]`, `BOOT_UART=1`, `POWER_OFF_ON_HALT=1`, `BOOT_ORDER=0xf2461` | EEPROM `boot.conf` written in stage 1 (multi-line) |
 | `image.name` | `rpios-trixie-arm64-lite` | name of the OS image (part of the image set names; a new name rebuilds it). The other `image.*` settings are written to each board at stage 3 and rebuild nothing |
 | `image.custom` | (none) | the custom image stage 3 writes instead of the station image: the id of an image uploaded on the page (empty = the station image) |
+| `image.packages` | (none) | system packages built into the station image, one package id per line (see *System packages and sandboxed apps*); a change rebuilds the image |
+| `image.apps` | (none) | sandboxed apps built into the station image, one per line: `<package id> slot=<1..64> [grant=<permission>,...] [memory=<MiB>] [cpus=<n>] [tasks=<n>]` (defaults 256 MiB, 1 CPU, 512 tasks); a change rebuilds the image |
 | `image.hostname` | `pi5-{serial}` | host name of the boards; `{serial}` = the board's 8-hex serial |
 | `image.timezone` | `Europe/Kyiv` | time zone of the image's tzdata (the page offers the list) |
 | `image.keyboard` | `us` | keyboard layout of the boards' console (xkb `us`, `gb`, `ua`, …; the page offers the list) |
@@ -629,6 +714,11 @@ docs are at `/api/docs`.
 | PUT | `/api/custom-images?name=<file>` | upload an image: the raw `.img` as the body (`Content-Length` required) → `{image, new, job}`; 400 with the reason for a file the station cannot take |
 | POST | `/api/custom-images/{id}/prepare` | `{force}` → prepare it (again) |
 | DELETE | `/api/custom-images/{id}` | remove it and its sets (400 for the image stage 3 writes) |
+| GET | `/api/packages` | system packages and apps on the station (also in `/api/status` as `packages`): metadata, permissions offered or requested, preparation state, job; the permissions the selected system packages offer, the next free slot, problems of the saved selection |
+| PUT | `/api/packages?kind=system\|app&name=<file>` | upload a `.deb` as the body → `{package, new, job}` (an app is prepared right away); 400 with the reason for a file the station cannot take |
+| POST | `/api/packages/{id}/prepare` | `{force}` → prepare an app (again) |
+| GET | `/api/packages/{id}/sandbox` | the files of an app's sandbox as the image would get them now |
+| DELETE | `/api/packages/{id}` | remove a package (400 while it is in `image.packages` / `image.apps`) |
 | POST | `/api/modules/{serial}/imager-image` | `{"source": "" \| "<id>" \| null}`: prepare the board's image file for Raspberry Pi Imager → `{ready, name, size, url, partitions, mmc_cid, notes}`, or 409 while parts are built |
 | GET | `/api/modules/{serial}/imager-image/{name}` | the prepared image file (streamed, `Content-Length`, attachment) |
 | GET | `/api/modules` | registry, newest first (public view, no secrets) |
@@ -676,7 +766,10 @@ otp_server/
   __main__.py              CLI; app.py (services, FastAPI app); api.py (routes)
   config.py                defaults, validation, merging (no config file)
   settings.py              the settings worksheet (read, complete with defaults, write)
-  imageconfig.py           OS image settings -> rpi-image-gen config + secret files
+  imageconfig.py           OS image settings -> rpi-image-gen config + secret files (+ image.apps lines)
+  debpkg.py                metadata of an uploaded .deb (control fields, scripts, files), nothing unpacked
+  sandbox.py               the files of every sandboxed app on the board (quadlet, proxy, AppArmor, users, registry)
+  rootfs_tar.py            the check of an app's installed root file system and the shift of its owners
   image_choices.py/.json   time zones and Wi-Fi countries of the image (from Debian tzdata, wireless-regdb, iso-codes)
   passhash.py              SHA-512 crypt ($6$) for the account password
   google_account.py        Google OAuth login, token, the station spreadsheet
@@ -684,7 +777,8 @@ otp_server/
   modules.py               board registry logic, scenarios, device key, stage verdicts
   storage/                 base.py (record schema), gsheets.py (the modules worksheet)
   docker.py, jobs.py       Docker CLI runner; background jobs with logs and SSE
-  artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3, custom images (custom.py)
+  artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3, custom images (custom.py),
+                           system packages and apps (packages.py: upload, the app's install in a VM)
   imagejson.py, sparse.py  rpi-image-gen image.json helpers (+ the custom image's); Android sparse validation and expansion
   diskimage.py             the checks of an uploaded .img; the disk image assembled from sparse pieces (Imager file)
   winusb.py                Windows WinUSB driver-package check (read-only)
@@ -693,13 +787,15 @@ docker/
   scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, root-luks.sh (+ luks_encrypt.py), image-collect.sh
   scripts/custom-image.sh (+ ext4_sparse.py, custom-crypt/: otp-hwkey, the initramfs hook, otp-growroot)
   gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder (+ rpi-fastbootd build stage)
+  apps.Dockerfile                           otp-app-builder: qemu-system-aarch64, mmdebstrap, mke2fs
+  scripts/app-vmkit.sh, app-vm-init, app-rootfs.sh, app-install.sh   an app's root file system, installed in a VM
   gadget-helpers/otp-keyexport/             pi-gen-micro helper package: OTP device key export
   fastbootd/otp-station.patch               our changes to rpi-fastbootd (command allowlist, cryptcheck, USB only)
   fastbootd/station-test.sh, station_test.cpp  build-time self-test of the compiled daemon
 image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
-  layer/                   station layers: otp-rpios-packages (generated), otp-rpios-lite, otp-rpios-setup
+  layer/                   station layers: otp-rpios-packages (generated), otp-rpios-lite, otp-rpios-setup, otp-apps
   rpios_packages.py        writes otp-rpios-packages.yaml from a Raspberry Pi OS Lite release's .info file
   example.yaml             the config of the default OS image settings
   rpi-image-gen/           submodule
@@ -707,6 +803,7 @@ index.html, css/app.css
 js/server.js               API client; flow.js provisioning state machine; app.js UI
 js/rpiboot.js              rpiboot protocol (port of usbboot main.c); bootdir.js, tar.js, duid.js
 js/fastboot.js             WebUSB fastboot client + IDP + device key export
+examples/apps/             the demo packages (vn-demo-provider, vn-demo-detector) and build.py
 tests/                     pytest suites; tests/web/ page self-test and end-to-end test (headless Chrome)
 external/                  submodules (usbboot, pi-gen-micro)
 ```
