@@ -280,9 +280,10 @@ through the page once (secure, first run) and that is the accepted weak point of
   `cryptcheck`, `upload-file`/`download-file` of the three helper files only. No `cryptopen`, `mount`,
   `cryptsetpassword`, `fwcrypto sign-hash`, `eeprom-*`, `mac`/`otp` (upstream's, they program OTP rows),
   `getvar:private-key`; USB only; `shutdown` really powers off. `station-test.sh` links `station_test.cpp`
-  with the daemon's objects and drives the compiled dispatcher (55 checks) before the deb is kept; `tests/test_artifacts.py` checks the patch against what
-  `js/fastboot.js` sends. A signature cannot be withdrawn: gadgets signed for a board with the stock daemon
-  stay valid for it, so rebuild before boards go out.
+  with the daemon's objects and drives the compiled dispatcher (54 checks) before the deb is kept;
+  `tests/test_artifacts.py` checks the patch against what `js/fastboot.js` sends. A signature cannot be
+  withdrawn: gadgets signed for a board with the stock daemon stay valid for it, so rebuild before boards go
+  out.
 
 ## What went wrong, and how it was fixed
 
