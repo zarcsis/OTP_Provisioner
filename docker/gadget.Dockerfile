@@ -88,14 +88,14 @@ EOF
 
 # ---------------------------------------------------------------------------
 # Stage 3 (arm64): rpi-fastbootd for the gadget, built from the revision pi-gen-micro vendors
-# (internal/packages/rpi-fastbootd_14.0.0~git20260902.cca05b2_arm64.deb) with our station patch
+# (internal/packages/rpi-fastbootd_14.0.0~git20261026.adf29cb_arm64.deb) with our station patch
 # (fastbootd/otp-station.patch: command allowlist, oem cryptcheck, USB only). fastbootd/station-test.sh then
 # runs the compiled dispatcher against fastbootd/station_test.cpp (and a real LUKS2 header); a failed check
 # fails the image build. The deb is versioned <upstream>+otp1; the entrypoint puts it in place of the
 # vendored one.
 FROM rpi AS fastbootd
 ARG FASTBOOTD_REPO=https://github.com/raspberrypi/rpi-fastbootd.git
-ARG FASTBOOTD_COMMIT=cca05b29f3ce1276151973398867b5c82c38ae40
+ARG FASTBOOTD_COMMIT=adf29cbf48a383ddaa3109422d7e6f6dde7f6b84
 ARG OTP_FASTBOOTD_SUFFIX=+otp1
 # Build-Depends of debian/control at that revision (+ uuid-dev for <uuid/uuid.h>, cryptsetup-bin for the
 # self-test's LUKS2 header).

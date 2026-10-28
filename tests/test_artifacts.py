@@ -1388,11 +1388,11 @@ def test_fastbootd_patch_allows_what_the_page_sends():
     assert "-        {FB_VAR_PRIVKEY, {GetPrivkey, nullptr}}," in text
 
 
-#: Every OEM command of rpi-fastbootd cca05b2 (OemCmdHandler).
+#: Every OEM command of rpi-fastbootd adf29cb (OemCmdHandler).
 UPSTREAM_OEM = {"led", "cryptinit", "cryptopen", "cryptsetpassword", "partinit", "partapp", "mount", "umount",
                 "download-file", "upload-file", "gpioset", "veritysetup", "verityappend", "idpinit", "idpwrite",
                 "idpgetblk", "idpdone", "fwcrypto", "bmap-load", "bmap-verify", "eeprom-update", "eeprom-verify",
-                "eeprom-read"}
+                "eeprom-read", "mac", "otp"}
 
 
 def test_fastbootd_station_test_covers_every_refused_command():
@@ -1431,7 +1431,7 @@ def test_fastbootd_build_is_pinned_to_the_vendored_revision():
     vendored = sorted((REAL_REPO / "external" / "pi-gen-micro" / "internal" / "packages").glob("rpi-fastbootd_*.deb"))
     if not vendored:
         pytest.skip("external/pi-gen-micro is not checked out")
-    assert [v.name for v in vendored] == [f"rpi-fastbootd_14.0.0~git20260902.{commit[:7]}_arm64.deb"]
+    assert [v.name for v in vendored] == [f"rpi-fastbootd_14.0.0~git20261026.{commit[:7]}_arm64.deb"]
 
 
 def test_key_export_paths_match_the_gadget_helper():

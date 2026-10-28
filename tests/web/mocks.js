@@ -422,7 +422,7 @@
                     'max-download-size': '0x' + this.o.maxDownload.toString(16).toUpperCase(),
                     product: 'Raspberry Pi 5 Model B Rev 1.0\0',
                     'version-bootloader': '2026/06/03',
-                    'version-fastbootd': '14.0.0~git20260902.cca05b2',
+                    'version-fastbootd': '14.0.0~git20261026.adf29cb',
                     secure: 'no', 'secure-otp': 'not present', 'secure-devkey': 'present',
                     'mmc-cid': '1b534d4542345154c0a1b2c301a4ce00\n',   // sysfs text: 32 hex + newline, as rpi-fastbootd returns it
                     'mac-ethernet': '2c:cf:67:70:76:f3',

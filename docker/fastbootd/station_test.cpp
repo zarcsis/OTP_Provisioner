@@ -124,7 +124,8 @@ int main(int argc, char* argv[]) {
              "oem upload-file /etc/passwd", "oem upload-file /dev/mmcblk0", "oem upload-file /dev/mapper/x",
              "oem upload-file /run/otp-keyexport/request", "oem upload-file /run/otp-keyexport/../../etc/passwd",
              "oem upload-file /run/otp-keyexport/status extra", "oem download-file /run/otp-keyexport/key.der",
-             "oem download-file /etc/passwd", "oem ", "oem nope"}) {
+             "oem download-file /etc/passwd", "oem mac get ethernet", "oem mac set ethernet 02:00:00:00:00:01",
+             "oem otp get 36", "oem otp set 36 1", "oem ", "oem nope"}) {
         ExpectRefused(c, kUnknownOem);
     }
     for (const char* c : {"oem cryptcheck", "oem cryptcheck ../sda", "oem cryptcheck mapper/x",

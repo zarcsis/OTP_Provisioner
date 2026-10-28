@@ -1,7 +1,7 @@
 OTP_Provisioner station gadget: rpi-fastbootd that cannot read the board back
 
-Applied by docker/gadget.Dockerfile to rpi-fastbootd cca05b29f3ce1276151973398867b5c82c38ae40, the
-revision pi-gen-micro vendors (internal/packages/rpi-fastbootd_14.0.0~git20260902.cca05b2_arm64.deb).
+Applied by docker/gadget.Dockerfile to rpi-fastbootd adf29cbf48a383ddaa3109422d7e6f6dde7f6b84, the
+revision pi-gen-micro vendors (internal/packages/rpi-fastbootd_14.0.0~git20261026.adf29cb_arm64.deb).
 The signed gadget a board boots from the station is driven by whoever runs the provisioning page, so
 the daemon in it only does what that page needs:
 
@@ -11,7 +11,7 @@ the daemon in it only does what that page needs:
 * oem: idpinit/idpwrite/idpgetblk/idpdone, fwcrypto init, the new cryptcheck, and upload-file /
   download-file for the otp-keyexport helper's files only (/run/otp-keyexport/{key.der,status,request});
   cryptopen, mount, partinit/partapp, cryptinit/cryptsetpassword, verity*, gpioset, led, bmap-*,
-  eeprom-* and the other fwcrypto operations are refused;
+  eeprom-*, mac and otp (both can program OTP rows) and the other fwcrypto operations are refused;
 * oem cryptcheck <blkdev>: checks that the LUKS key the board derives from OTP opens the container
   (crypt_activate_by_passphrase without a name), so no decrypted device is ever created;
 * oem fwcrypto init and cryptcheck ask the firmware again instead of trusting the key status cached at
@@ -47,10 +47,10 @@ index 9b1632b..cf0f993 100755
  mapfile -t COMMITS < <(git rev-list ${BASELINE_COMMIT}^..HEAD 2>/dev/null || true)
  
 diff --git a/fastboot/device/commands.cpp b/fastboot/device/commands.cpp
-index e199e01..95c5c57 100644
+index 5bb1334..d8b3c9d 100644
 --- a/fastboot/device/commands.cpp
 +++ b/fastboot/device/commands.cpp
-@@ -213,7 +213,6 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
+@@ -217,7 +217,6 @@ const std::unordered_map<std::string, VariableHandlers> kVariableMap = {
          {FB_VAR_EEPROM_UNIQUE_ID, {GetEepromUniqueId, nullptr}},
          {FB_VAR_EEPROM_SPI_SPEED, {GetEepromSpiSpeed, nullptr}},
          {FB_VAR_BOOTLOADER_BUILD_TIMESTAMP, {GetBootloaderBuildTimestamp, nullptr}},
@@ -58,7 +58,7 @@ index e199e01..95c5c57 100644
          {FB_VAR_IPV4_ADDRESS, {GetIpv4Address, nullptr}},
          {FB_VAR_IPV4_GATEWAY, {GetIpv4Gateway, nullptr}},
          {FB_VAR_IPV4_NETMASK, {GetIpv4Netmask, nullptr}},
-@@ -1740,6 +1739,13 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
+@@ -1745,6 +1744,13 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
              // strings to tell "the key is there" apart from "I failed to
              // put one there."
              auto status = crypto.GetCachedProvisioningStatus();
@@ -72,9 +72,9 @@ index e199e01..95c5c57 100644
              if (status && *status) {
                  return device->WriteOkay("Key already provisioned");
              }
-@@ -1895,6 +1901,58 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
-         return device->WriteOkay("eeprom-read: " + std::to_string(image.size()) +
-                                  " bytes staged for upload");
+@@ -2051,6 +2057,58 @@ ssize_t bulk_write(int bulk_in, const char *buf, size_t length)
+         return device->WriteOkay(android::base::StringPrintf("otp set: customer rows %u-%zu%s",
+                                                              start, last_row, verb));
      }
 +
 +    // A bare kernel block device name ("mmcblk0p2"): no path, no "..", nothing under /dev/mapper.
@@ -131,7 +131,7 @@ index e199e01..95c5c57 100644
  } //namespace anonymous
  
  bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args) {
-@@ -1909,56 +1967,37 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
+@@ -2065,60 +2123,37 @@ bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args)
  
      // device->WriteInfo(message);
      std::vector<std::string> split_args = android::base::Split(args[0], " ");
@@ -183,6 +183,10 @@ index e199e01..95c5c57 100644
 -        return oem_cmd_eeprom_verify(device, split_args);
 -    } else if (command_name == "eeprom-read") {
 -        return oem_cmd_eeprom_read(device, split_args);
+-    } else if (command_name == "mac") {
+-        return oem_cmd_mac(device, split_args);
+-    } else if (command_name == "otp") {
+-        return oem_cmd_otp(device, split_args);
 -    }
  
 +    // OTP_Provisioner station gadget: the OEM commands the provisioning page sends, each with the
@@ -218,7 +222,7 @@ index e199e01..95c5c57 100644
      return device->WriteFail("Unknown OEM command.");
  }
  
-@@ -2082,10 +2121,22 @@ bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& ar
+@@ -2242,10 +2277,22 @@ bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& ar
      return device->WriteStatus(FastbootResult::FAIL, "Unable to set slot");
  }
  
@@ -244,10 +248,10 @@ index e199e01..95c5c57 100644
      return result;
  }
 diff --git a/fastboot/device/crypto_native.cpp b/fastboot/device/crypto_native.cpp
-index 90f9245..3956c75 100644
+index 793d09f..7a2432b 100644
 --- a/fastboot/device/crypto_native.cpp
 +++ b/fastboot/device/crypto_native.cpp
-@@ -84,6 +84,35 @@ bool CryptInitNative(const std::string& device_path, const std::string& label,
+@@ -92,6 +92,35 @@ bool CryptInitNative(const std::string& device_path, const std::string& label,
      return CryptInitNative(device_path, params, key_data, error_msg);
  }
  
@@ -284,10 +288,10 @@ index 90f9245..3956c75 100644
                      const std::string& key_data, std::string* error_msg) {
      struct crypt_device *cd = NULL;
 diff --git a/fastboot/device/crypto_native.h b/fastboot/device/crypto_native.h
-index ebb4731..320681e 100644
+index 69ace44..d7295d2 100644
 --- a/fastboot/device/crypto_native.h
 +++ b/fastboot/device/crypto_native.h
-@@ -31,6 +31,11 @@ bool CryptOpenNative(const std::string& device_path, const std::string& mapped_n
+@@ -34,6 +34,11 @@ bool CryptOpenNative(const std::string& device_path, const std::string& mapped_n
  
  bool CryptCloseNative(const std::string& mapped_name, std::string* error_msg);
  

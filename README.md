@@ -840,7 +840,7 @@ container instead (see below).
 The signed gadget runs whatever the person at the page asks of it, and stock rpi-fastbootd can decrypt the
 board's root (`oem cryptopen` with the key it derives from OTP), mount it and upload any file or block device.
 So the gadget gets our build: `docker/gadget.Dockerfile` clones `raspberrypi/rpi-fastbootd` at
-`FASTBOOTD_COMMIT` (the revision pi-gen-micro vendors, `cca05b2`), applies
+`FASTBOOTD_COMMIT` (the revision pi-gen-micro vendors, `adf29cb`), applies
 `docker/fastbootd/otp-station.patch` and builds `rpi-fastbootd_<upstream version>+otp1_arm64.deb`;
 `gadget-entrypoint.sh` puts it in place of the vendored deb in its staged pi-gen-micro copy, pins it
 (priority 1001) and fails the build unless that exact version ended up in the gadget (`fastbootd_version` in
@@ -849,7 +849,8 @@ So the gadget gets our build: `docker/gadget.Dockerfile` clones `raspberrypi/rpi
 * answers only `download`, `upload`, `getvar`, `shutdown`, `reboot`, `erase`, `flash` and `oem` (no
   `set_active`, `fetch`), and only these OEM commands: `idpinit`, `idpwrite`, `idpgetblk`, `idpdone`,
   `fwcrypto init`, `cryptcheck`, `upload-file` of `/run/otp-keyexport/{key.der,status}` and `download-file`
-  of `/run/otp-keyexport/request`;
+  of `/run/otp-keyexport/request` (upstream's `oem mac set` and `oem otp set`, which program OTP rows, are
+  refused with the rest);
 * adds `oem cryptcheck <partition>`: the LUKS key the board derives from OTP is checked against the
   container (`crypt_activate_by_passphrase` without a device name), answering `keyslot N`;
 * makes `shutdown` power the board off (`systemctl poweroff`; upstream answered OKAY and only paused the

@@ -46,7 +46,7 @@ _ARTIFACTS: dict[str, dict[str, Any]] = {
               "size": 412_000_000, "built": "2026-09-30T10:55:31Z", "detail": "debian:trixie-slim + rpi-eeprom tools", "job": None},
     "gadget": {"target": "gadget", "ready": True, "source": "built", "version": "5d0c1e7a9b3f-c3833052-pi5-family",
                "path": "", "size": 27_632_640, "built": "2026-09-30T11:19:45Z",
-               "detail": "pi-gen-micro fastboot pi5-family, rpi-fastbootd 14.0.0~git20260902, helpers: otp-keyexport",
+               "detail": "pi-gen-micro fastboot pi5-family, rpi-fastbootd 14.0.0~git20261026, helpers: otp-keyexport",
                "job": _JOBS["a1b2c3d4"]},
     "image": {"target": "image", "ready": False, "source": "built", "version": "368e8f0", "path": "", "size": 2_934_000_000,
               "built": "2026-09-30T09:01:12Z",

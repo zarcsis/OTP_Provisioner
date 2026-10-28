@@ -274,13 +274,13 @@ through the page once (secure, first run) and that is the accepted weak point of
   sectors; pinned by a dm-crypt test vector in `tests/test_luks_encrypt.py`). `imagejson.station_luks()`
   rewrites the board's `image.json` so the encrypted block is a plain `expand-to-fit` partition: the gadget
   only partitions, the ciphertext goes raw to `mmcblk0p2`, `rpi-resize` grows the FS at first boot.
-* **The gadget's rpi-fastbootd** (`docker/fastbootd/`): upstream commit `cca05b2` (the one pi-gen-micro
+* **The gadget's rpi-fastbootd** (`docker/fastbootd/`): upstream commit `adf29cb` (the one pi-gen-micro
   vendors) + `otp-station.patch`, built inside `gadget.Dockerfile` as version `…+otp1`. Allowlist:
   `download upload getvar shutdown reboot erase flash oem`; OEM `idp*`, `fwcrypto init`, the new
   `cryptcheck`, `upload-file`/`download-file` of the three helper files only. No `cryptopen`, `mount`,
-  `cryptsetpassword`, `fwcrypto sign-hash`, `eeprom-*`, `getvar:private-key`; USB only; `shutdown` really
-  powers off. `station-test.sh` links `station_test.cpp` with the daemon's objects and drives the compiled
-  dispatcher (51 checks) before the deb is kept; `tests/test_artifacts.py` checks the patch against what
+  `cryptsetpassword`, `fwcrypto sign-hash`, `eeprom-*`, `mac`/`otp` (upstream's, they program OTP rows),
+  `getvar:private-key`; USB only; `shutdown` really powers off. `station-test.sh` links `station_test.cpp`
+  with the daemon's objects and drives the compiled dispatcher (55 checks) before the deb is kept; `tests/test_artifacts.py` checks the patch against what
   `js/fastboot.js` sends. A signature cannot be withdrawn: gadgets signed for a board with the stock daemon
   stay valid for it, so rebuild before boards go out.
 
