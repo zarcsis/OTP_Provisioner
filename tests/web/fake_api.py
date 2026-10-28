@@ -278,7 +278,7 @@ def status() -> dict[str, Any]:
         "config": {"settings": "Google Sheets (worksheet settings)",
                    "provisioning": {"default_mode": DEFAULT_MODE, "modes": list(MODES), "jtag_lock": False,
                                     "recovery_passphrase": False, "confirm_irreversible": True, "erase_storage": True,
-                                    "firmware_channel": "default", "max_piece_size": 268435456}},
+                                    "firmware_channel": "latest", "max_piece_size": 268435456}},
         "storage": {"backend": "gsheets", "ok": True, "location": SPREADSHEET_URL,
                     "detail": f"{len(MODULES)} module record(s) in worksheet modules"},
         "docker": {"ok": True, "version": "29.6.0", "detail": "Docker Desktop, linux engine", "arm64": True},

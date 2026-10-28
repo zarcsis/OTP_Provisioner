@@ -444,12 +444,12 @@ def test_stage1_unsigned_shared_dir(make_env):
     assert m["source"]["pieeprom"] == "pieeprom-2026-09-25.bin"
     f0 = m["files"][0]
     assert f0["url"] == f"http://127.0.0.1:8765/api/modules/{SERIAL}/stage/1/files/bootcode5.bin"
-    assert f0["origin"] == "rpi-eeprom firmware-2712/default/recovery.bin"
+    assert f0["origin"] == "rpi-eeprom firmware-2712/latest/recovery.bin"
     runs = env.docker.runs_of("stage1.sh")
     assert len(runs) == 1
     r = runs[0]
     assert r["image"] == TOOLS_TAG and r["args"] == ["stage1.sh"]
-    assert r["env"] == {"MODE": "unsigned", "CHANNEL": "default", "SIGN_RECOVERY": "0"}
+    assert r["env"] == {"MODE": "unsigned", "CHANNEL": "latest", "SIGN_RECOVERY": "0"}
     assert r["mounts"]["/scripts"].readonly and r["mounts"]["/ext"].readonly
     assert Path(r["mounts"]["/ext"].source) == env.cfg.repo_root / "external"
     assert not r["mounts"]["/out"].readonly and "/keys" not in r["mounts"]
@@ -483,7 +483,7 @@ def test_stage1_signed_secure_scenario(make_env):
     assert "OTP" in m["irreversible"][0]["why"]
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]}
     r = env.docker.runs_of("stage1.sh")[0]
-    assert base_env(r) == {"MODE": "signed", "CHANNEL": "default", "SIGN_RECOVERY": "0"}
+    assert base_env(r) == {"MODE": "signed", "CHANNEL": "latest", "SIGN_RECOVERY": "0"}
     assert r["env"]["EXPECT_CKH"] == rec["customer_key_hash"]
     assert r["mounts"]["/keys"].readonly and r["keys_files"] == ["private.pem", "public.pem"]
     assert not r["keys_dir"].exists()                       # temp key dir removed after the run
@@ -533,7 +533,7 @@ def test_stage1_locked_to_our_key(make_env, chosen):
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "signed" and m["config_txt"] == config_txt(False, False) and m["irreversible"] == []
     assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
-    assert base_env(env.docker.runs_of("stage1.sh")[0]) == {"MODE": "signed", "CHANNEL": "default",
+    assert base_env(env.docker.runs_of("stage1.sh")[0]) == {"MODE": "signed", "CHANNEL": "latest",
                                                              "SIGN_RECOVERY": "1"}
     assert "counter-signed" in m["files"][0]["origin"]
 
@@ -580,12 +580,12 @@ def test_stage1_jtag_lock_follows_the_scenario(make_env):
     assert not any("jtag_lock only applies" in n for n in m2["notes"])
 
 
-def test_stage1_latest_channel(make_env):
-    env = make_env(provisioning={"firmware_channel": "latest"})
+def test_stage1_default_channel(make_env):
+    env = make_env(provisioning={"firmware_channel": "default"})
     env.board()
     m = env.arts.stage_manifest(SERIAL, 1)
-    assert m["source"]["channel"] == "latest"
-    assert env.docker.runs_of("stage1.sh")[0]["env"]["CHANNEL"] == "latest"
+    assert m["source"]["channel"] == "default"
+    assert env.docker.runs_of("stage1.sh")[0]["env"]["CHANNEL"] == "default"
 
 
 @pytest.mark.parametrize("chosen", ["", "secure"])

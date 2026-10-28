@@ -592,7 +592,7 @@ is shown on the page; unknown keys produce a warning.
 | `provisioning.recovery_passphrase` | `false` | secure scenario: add a server-derived LUKS passphrase as keyslot 1 |
 | `provisioning.confirm_irreversible` | `true` | the page asks the operator to type the serial before OTP writes / erase |
 | `provisioning.erase_storage` | `true` | stage 3: erase the storage device before the image is written |
-| `provisioning.firmware_channel` | `default` | rpi-eeprom firmware channel for stage 1: `default` or `latest` |
+| `provisioning.firmware_channel` | `latest` | rpi-eeprom firmware channel for stage 1: `latest` or `default` |
 | `provisioning.max_piece_size` | `268435456` | largest sparse piece sent to the board (bytes, rpi-fastbootd max-download-size) |
 | `provisioning.boot_conf` | `[all]`, `BOOT_UART=1`, `POWER_OFF_ON_HALT=1`, `BOOT_ORDER=0xf2461` | EEPROM `boot.conf` written in stage 1 (multi-line) |
 | `image.name` | `rpios-trixie-arm64-lite` | name of the OS image (part of the image set names; a new name rebuilds it). The other `image.*` settings are written to each board at stage 3 and rebuild nothing |

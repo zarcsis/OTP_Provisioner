@@ -37,7 +37,7 @@ def make_repo(base: Path) -> Path:
     for name in ("tools.Dockerfile", "tools-entrypoint.sh", "gadget.Dockerfile", "gadget-entrypoint.sh"):
         (repo / "docker" / name).write_text(f"# {name}\n", encoding="utf-8")
     (repo / "docker" / "scripts" / "stage1.sh").write_text("#!/bin/bash\n# stage1.sh\n", encoding="utf-8")
-    d = repo / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712" / "default"
+    d = repo / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712" / "latest"
     d.mkdir(parents=True)
     (d / "pieeprom-2026-09-25.bin").write_bytes(b"\2" * 2097152)
     (d / "recovery.bin").write_bytes(b"\4" * 104314)
@@ -402,7 +402,7 @@ def test_same_size_firmware_change_rebuilds(make_env, which):
     env = make_env()
     env.board()
     env.arts.stage_manifest(SERIAL, 1)
-    fw = env.cfg.repo_root / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712" / "default"
+    fw = env.cfg.repo_root / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712" / "latest"
     path = (env.cfg.repo_root / "external" / "usbboot" / "tools" / which) if which.endswith(".sh") else fw / which
     data = bytearray(path.read_bytes())
     data[-2] ^= 0x01                                            # same name, same size, other content
@@ -441,7 +441,7 @@ def _run_script(tmp_path: Path, env_extra: dict, boot_conf: str, config_txt: str
     (ext / "usbboot" / "rpi-eeprom").mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if k != "EXPECT_CKH"}
     env.update({"EXT": ext.as_posix(), "OUT": out.as_posix(), "KEYS": (tmp_path / "keys").as_posix(),
-                "CHANNEL": "default", **env_extra})
+                "CHANNEL": "latest", **env_extra})
     script = (REPO_ROOT / "docker" / "scripts" / "stage1.sh").as_posix()
     probe = subprocess.run([bash, "-c", f'[ -f "{script}" ]'], capture_output=True)
     if probe.returncode != 0:

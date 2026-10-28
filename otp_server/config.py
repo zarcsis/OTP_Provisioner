@@ -57,7 +57,7 @@ DEFAULTS: dict[str, Any] = {
         "recovery_passphrase": False,
         "confirm_irreversible": True,
         "erase_storage": True,
-        "firmware_channel": "default",
+        "firmware_channel": "latest",
         "max_piece_size": 268435456,
         "boot_conf": DEFAULT_BOOT_CONF,
     },

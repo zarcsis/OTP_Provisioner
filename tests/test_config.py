@@ -69,7 +69,7 @@ def test_defaults(tmp_path):
     p = cfg.provisioning
     assert p.default_mode == "open"
     assert (p.jtag_lock, p.recovery_passphrase, p.confirm_irreversible, p.erase_storage) == (False, False, True, True)
-    assert p.firmware_channel == "default"
+    assert p.firmware_channel == "latest"
     assert p.max_piece_size == 268435456
     assert p.boot_conf == DEFAULT_BOOT_CONF
     assert "BOOT_ORDER=0xf2461" in p.boot_conf
@@ -218,14 +218,14 @@ def test_env_port_is_range_checked(monkeypatch):
 
 
 def test_overrides_beat_settings(tmp_path):
-    settings = {"provisioning": {"default_mode": "secure", "firmware_channel": "latest", "jtag_lock": "true"},
+    settings = {"provisioning": {"default_mode": "secure", "firmware_channel": "default", "jtag_lock": "true"},
                 "builds": {"image": {"overrides": ["A=1"], "keep_raw_image": "true"}}}
     cfg = load(tmp_path, settings=settings)
     assert cfg.provisioning.default_mode == "secure" and cfg.provisioning.jtag_lock is True
     assert cfg.builds.image.overrides == ["A=1"] and cfg.builds.image.keep_raw_image is True
     cfg = load(tmp_path, settings=settings, provisioning={"default_mode": "open"}, builds={"auto": False})
     assert cfg.provisioning.default_mode == "open"            # override wins
-    assert cfg.provisioning.firmware_channel == "latest"      # the rest of the sheet still applies
+    assert cfg.provisioning.firmware_channel == "default"     # the rest of the sheet still applies
     assert cfg.provisioning.jtag_lock is True
     assert cfg.builds.auto is False
     assert cfg.builds.image.overrides == ["A=1"] and cfg.builds.image.keep_raw_image is True
@@ -322,14 +322,14 @@ def test_empty_desktop_path_means_standard_location(tmp_path):
 def test_text_values_from_cells(tmp_path):
     settings = {
         "provisioning": {"default_mode": " SECURE ", "jtag_lock": "TRUE", "recovery_passphrase": "yes",
-                         "confirm_irreversible": "off", "erase_storage": "0", "firmware_channel": "Latest",
+                         "confirm_irreversible": "off", "erase_storage": "0", "firmware_channel": "Default",
                          "max_piece_size": "0x8000000", "boot_conf": "[all]\r\nBOOT_ORDER=0xf1"},
         "builds": {"auto": "no", "image": {"overrides": ["A=1", " ", "B=2 "], "keep_raw_image": "y"}},
         "docker": {"start_desktop": "n", "idle_timeout": " 60 "},
     }
     cfg = load(tmp_path, settings=settings, server={"port": " 9000 ", "open_browser": "false"})
     p = cfg.provisioning
-    assert p.default_mode == "secure" and p.firmware_channel == "latest"
+    assert p.default_mode == "secure" and p.firmware_channel == "default"
     assert (p.jtag_lock, p.recovery_passphrase, p.confirm_irreversible, p.erase_storage) == (True, True, False, False)
     assert p.max_piece_size == 0x8000000
     assert p.boot_conf == "[all]\nBOOT_ORDER=0xf1\n"            # CRLF -> LF, trailing newline added
@@ -663,7 +663,7 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     server_before = copy.deepcopy(cfg.server)
     new = load_config(
         repo_root=repo,
-        settings={"provisioning": {"default_mode": "secure", "jtag_lock": "true", "firmware_channel": "latest"},
+        settings={"provisioning": {"default_mode": "secure", "jtag_lock": "true", "firmware_channel": "default"},
                   "image": {"hostname": "drone9", "wifi_ssid": "Field"},
                   "builds": {"auto": "false", "image": {"overrides": ["A=1"]}},
                   "docker": {"binary": "podman", "idle_timeout": "5"},
@@ -675,7 +675,7 @@ def test_apply_settings_replaces_sheet_backed_parts_only(tmp_path):
     assert id(cfg) == cfg_id
     assert cfg.image == new.image and cfg.image.hostname == "drone9" and cfg.image.wifi_ssid == "Field"
     assert cfg.provisioning == new.provisioning and cfg.provisioning.default_mode == "secure"
-    assert cfg.provisioning.jtag_lock is True and cfg.provisioning.firmware_channel == "latest"
+    assert cfg.provisioning.jtag_lock is True and cfg.provisioning.firmware_channel == "default"
     assert cfg.builds == new.builds and cfg.builds.auto is False and cfg.builds.image.overrides == ["A=1"]
     assert cfg.docker == new.docker and cfg.docker.binary == "podman" and cfg.docker.idle_timeout == 5
     assert cfg.unknown_keys == ["typo"] and cfg.unknown_keys is not new.unknown_keys

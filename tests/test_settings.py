@@ -316,7 +316,7 @@ def test_decoded_values_are_validated_end_to_end(tmp_path):
         "provisioning.recovery_passphrase": "yes",
         "provisioning.confirm_irreversible": "FALSE",
         "provisioning.erase_storage": "0",
-        "provisioning.firmware_channel": "latest",
+        "provisioning.firmware_channel": "default",
         "provisioning.max_piece_size": "0x8000000",
         "builds.auto": "no",
         "builds.image.overrides": "A=1\nB=2",
@@ -335,7 +335,7 @@ def test_decoded_values_are_validated_end_to_end(tmp_path):
     assert unknown == []
     cfg = load(tmp_path, tree)
     p = cfg.provisioning
-    assert p.default_mode == "secure" and p.firmware_channel == "latest" and p.max_piece_size == 0x8000000
+    assert p.default_mode == "secure" and p.firmware_channel == "default" and p.max_piece_size == 0x8000000
     assert (p.jtag_lock, p.recovery_passphrase, p.confirm_irreversible, p.erase_storage) == (True, True, False, False)
     assert cfg.builds.auto is False and cfg.builds.image.keep_raw_image is True
     assert cfg.builds.image.overrides == ["A=1", "B=2"]
@@ -464,7 +464,7 @@ def test_operator_values_are_never_overwritten(tmp_path):
     assert unknown == []
     cfg = load(tmp_path, tree)
     assert cfg.provisioning.default_mode == "secure"
-    assert cfg.provisioning.firmware_channel == "default"
+    assert cfg.provisioning.firmware_channel == "latest"
     assert cfg.builds.image.overrides == ["A=1", "B=2"]
     assert cfg.docker.idle_timeout == 90
 
