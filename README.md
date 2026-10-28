@@ -44,9 +44,9 @@ keyslot 0) and the power-off at the end. The notes on what the first secure run 
 * **Chrome or Edge** (any Chromium browser with WebUSB). Firefox and Safari have no WebUSB.
 * **[uv](https://docs.astral.sh/uv/getting-started/installation/)** (Windows: `winget install --id=astral-sh.uv -e`,
   Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`). The first `uv run` brings the Python of
-  `.python-version` (3.15.1; the code needs 3.11+) and the packages pinned in `uv.lock` into `.venv`. The Python
-  is uv's own build (`python-preference = "only-managed"`, kept in uv's directory, not in the repository): a
-  system Python is neither needed nor used, and nothing is installed into one.
+  `.python-version` (3.15, its newest patch release; the code needs 3.11+) and the packages pinned in `uv.lock`
+  into `.venv`. The Python is uv's own build (`python-preference = "only-managed"`, kept in uv's directory, not in
+  the repository): a system Python is neither needed nor used, and nothing is installed into one.
 * **A Google OAuth client** (once per team, about five minutes; operators then only click
   *Sign in with Google*):
   1. [console.cloud.google.com](https://console.cloud.google.com/): create a project.

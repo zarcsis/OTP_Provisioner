@@ -91,7 +91,7 @@ and its C++ test) and 16.4 k lines of tests.
 
 ```
 server.py                     launcher (uv run server.py); uv run -m otp_server for login/build/modules/status
-pyproject.toml, uv.lock       dependencies for uv (dev group: pytest, httpx2, PyYAML); .python-version = 3.15.1
+pyproject.toml, uv.lock       dependencies for uv (dev group: pytest, httpx2, PyYAML); .python-version = 3.15
 otp_server/
   app.py, api.py              FastAPI factory + routes; 401 until Google is signed in and the settings sheet read
   config.py, settings.py      DEFAULTS tree; the settings worksheet (re-read every 15 s; retired keys removed)
@@ -476,7 +476,8 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
 
 ## Conventions
 
-* Python 3.11+ (uv runs its own 3.15.1 of `.python-version`, never a system one), 4-space indent, type hints,
+* Python 3.11+ (uv runs its own newest 3.15.x of `.python-version`, never a system one; the pin is a minor
+  version on purpose, an exact one broke `.venv` when uv removed that patch release), 4-space indent, type hints,
   docstrings that say why. Everything that touches secrets lives in `secrets_gen.py`/`modules.py`. Run tests
   with `uv run --group dev python -B -m pytest -q` (`pytest.ini` adds `-p no:cacheprovider`).
 * Dependencies live in `pyproject.toml` and `uv.lock` only (no `requirements.txt`): change them with
