@@ -344,9 +344,12 @@ def test_image_build_with_a_system_package_and_an_app(penv, debs):
 def test_apps_layer_hook_checks():
     text = (REPO / "image" / "layer" / "otp-apps.yaml").read_text(encoding="utf-8")
     for needle in ("X-Env-VarPrefix: otpapps", "- podman", "- xdg-dbus-proxy", "chroot \"$1\" systemd-sysusers",
-                   "apparmor_parser -Q -K", "cgroup_enable=memory", "--xattrs-include=security.capability",
+                   "apparmor_parser -Q -K", "--xattrs-include=security.capability",
                    'install -d -m 0711 -o 0 -g 0 "$1/var/lib/vn-apps"'):
         assert needle in text, needle
+    # the memory cgroup comes from a linux-base fragment (tests/test_imageconfig.py runs the assembler)
+    fragment = REPO / "image" / "layer" / "otp-apps.d" / "for" / "linux-base" / "cmdline.d" / "60-memcg"
+    assert fragment.read_bytes() == b"cgroup_enable=memory\n"
 
 
 # ---------------------------------------------------------------------- the HTTP API

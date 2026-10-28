@@ -108,17 +108,11 @@ mmdebstrap:
     - |-
       # AppArmor on, as on Debian. The apparmor package (in the Raspberry Pi OS Lite package set) loads the
       # profiles at boot, but the Raspberry Pi kernel builds AppArmor in with an empty default LSM list
-      # (CONFIG_LSM=""), so it stays off until the kernel command line selects it. boot-slot.sh keeps these
-      # words when it appends a board's own parameters; on a secure board they are inside the signed boot.img.
+      # (CONFIG_LSM=""), so it stays off until the kernel command line selects it: the fragment
+      # otp-rpios-setup.d/for/linux-base/cmdline.d/60-apparmor does (linux-base assembles cmdline.txt after
+      # every customize hook). boot-slot.sh keeps these words when it appends a board's own parameters; on a
+      # secure board they are inside the signed boot.img.
       set -eu
-      f=$1/boot/firmware/cmdline.txt
-      [ -s "$f" ] || { echo "otp-rpios-setup: $f missing" >&2; exit 1; }
-      set -f
-      words=
-      for w in $(cat "$f"); do
-         case "$w" in apparmor=*|security=*|lsm=*) ;; *) words="$words $w" ;; esac
-      done
-      printf '%s\n' "${words# } apparmor=1 security=apparmor" > "$f"
       chroot "$1" systemctl enable apparmor.service
     - |-
       # A secure board's bootloader is signed for that board: Raspberry Pi's automatic EEPROM update

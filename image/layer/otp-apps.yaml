@@ -73,15 +73,5 @@ mmdebstrap:
          n=${n%.container}
          [ -f "$1/etc/systemd/system/$n-bus.service" ] || { echo "otp-apps: $n has no D-Bus proxy unit" >&2; exit 1; }
       done
-    - |-
-      # The memory cgroup: off by default in the Raspberry Pi kernel (cgroup_disable=memory), needed for the
-      # apps' MemoryMax. Same treatment of cmdline.txt as AppArmor's in otp-rpios-setup.
-      set -eu
-      f=$1/boot/firmware/cmdline.txt
-      [ -s "$f" ] || { echo "otp-apps: $f missing" >&2; exit 1; }
-      set -f
-      words=
-      for w in $(cat "$f"); do
-         case "$w" in cgroup_enable=memory) ;; *) words="$words $w" ;; esac
-      done
-      printf '%s\n' "${words# } cgroup_enable=memory" > "$f"
+# The memory cgroup (off by default in the Raspberry Pi kernel, cgroup_disable=memory; the apps' MemoryMax
+# needs it): otp-apps.d/for/linux-base/cmdline.d/60-memcg, which linux-base adds to cmdline.txt.

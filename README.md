@@ -238,9 +238,10 @@ worksheet. Open and secure boards get the same settings.
   `/boot/firmware`, and no `apt`/`dpkg` leftovers of the build (recommends are installed again, as on
   Raspberry Pi OS). The differences from the official image: no Pi 3/4 kernel, `cryptsetup` added (the
   secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, **AppArmor on**
-  (`apparmor=1 security=apparmor` in `cmdline.txt`, `apparmor.service` enabled: the Raspberry Pi kernel has
-  AppArmor built in but selects no LSM by default, so Raspberry Pi OS ships the package with it off;
-  `aa-status` on a board lists the loaded profiles), and on the
+  (`apparmor=1 security=apparmor` in `cmdline.txt` from the fragment
+  `layer/otp-rpios-setup.d/for/linux-base/cmdline.d/60-apparmor`, `apparmor.service` enabled: the Raspberry
+  Pi kernel has AppArmor built in but selects no LSM by default, so Raspberry Pi OS ships the package with it
+  off; `aa-status` on a board lists the loaded profiles), and on the
   **secure** (crypt) image `rpi-eeprom-update.service` is off (that bootloader is signed for the board,
   and only the station updates it) and `otp-growroot.service` grows the encrypted root to the whole card at
   the first boot (the partition when it ends before the card does, the LUKS2 mapping, the ext4 inside).
@@ -370,7 +371,8 @@ limits (memory, CPUs, tasks); **Sandbox** shows the files the board will get for
   every caller a second time.
 
 The image also gets podman, crun, conmon, catatonit and xdg-dbus-proxy, and `cgroup_enable=memory` on the kernel
-command line (the Raspberry Pi kernel disables the memory cgroup by default, the limits need it).
+command line (the Raspberry Pi kernel disables the memory cgroup by default, the limits need it; the fragment
+`layer/otp-apps.d/for/linux-base/cmdline.d/60-memcg`).
 
 **What an app cannot do there, by design:** anything that needs the board's hardware, the network, the host's
 configuration (udev, kernel modules, `cmdline.txt`), or another app. Its postinst sees an ordinary arm64 VM, not

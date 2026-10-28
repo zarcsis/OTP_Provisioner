@@ -172,7 +172,8 @@ def test_otp_rpios_setup_layer():
     assert "systemctl disable ssh.service" in text and 'rm -f "$1"/etc/ssh/ssh_host_*_key*' in text
     assert "WirelessEnabled=false" in text and "99-default.link" in text
     assert "systemctl disable rpi-eeprom-update.service" in text and '"${IGconf_image_pmap:-clear}" = crypt' in text
-    assert "apparmor=1 security=apparmor" in text and "systemctl enable apparmor.service" in text
+    assert "systemctl enable apparmor.service" in text and "cmdline.d/60-apparmor" in text   # + the fragment
+    assert (LAYERS / "otp-rpios-setup.d" / "for" / "linux-base" / "cmdline.d" / "60-apparmor").is_file()
     for name in ("meta-data", "network-config", "user-data"):
         assert f'"$1/boot/firmware/{name}"' in text
     assert 'rm -f "$1/etc/apt/apt.conf.d/99mmdebstrap" "$1/etc/dpkg/dpkg.cfg.d/99mmdebstrap"' in text
@@ -187,40 +188,70 @@ printf '%s\\n' "$*" >> "$HOOK_CALLS"
 
 
 @pytest.mark.skipif(SH is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
-def test_otp_rpios_setup_turns_apparmor_on(tmp_path):
-    """The Raspberry Pi kernel has AppArmor built in but an empty default LSM list (CONFIG_LSM=""): the image's
-    cmdline.txt selects it, replacing any earlier choice, and apparmor.service loads the profiles."""
+def test_otp_rpios_setup_enables_apparmor_service(tmp_path):
+    """apparmor.service loads the profiles at boot (the kernel command line is the fragment's job, below)."""
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load((LAYERS / "otp-rpios-setup.yaml").read_text(encoding="utf-8"))
-    hook = next(h for h in doc["mmdebstrap"]["customize-hooks"] if "security=apparmor" in h)
+    hook = next(h for h in doc["mmdebstrap"]["customize-hooks"] if "apparmor.service" in h)
+    assert "cmdline.txt\n" not in hook and "boot/firmware/cmdline" not in hook   # not there yet at customize time
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "chroot").write_bytes(CHROOT_STUB.encode())
     (bindir / "chroot").chmod(0o755)
     calls = tmp_path / "calls"
-    root = tmp_path / "root"
-    (root / "boot" / "firmware").mkdir(parents=True)
-    cmdline = root / "boot" / "firmware" / "cmdline.txt"
+    calls.write_bytes(b"")
     env = dict(os.environ, HOOK_CALLS=str(calls).replace("\\", "/"),
                PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run([SH, "-c", hook, "sh", str(tmp_path / "root").replace("\\", "/")], capture_output=True,
+                       env=env, timeout=60)
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+    assert calls.read_text().splitlines() == ["systemctl enable apparmor.service"]
 
-    def run() -> subprocess.CompletedProcess:
-        calls.write_bytes(b"")
-        return subprocess.run([SH, "-c", hook, "sh", str(root).replace("\\", "/")], capture_output=True, env=env,
-                              timeout=60)
 
-    cmdline.write_bytes(b"console=serial0,115200 console=tty1 root=ROOTDEV lsm=yama security=selinux "
-                        b"fsck.repair=yes rootwait\n")
-    want = b"console=serial0,115200 console=tty1 root=ROOTDEV fsck.repair=yes rootwait apparmor=1 security=apparmor\n"
-    for _ in range(2):                                    # the same line when it is already there
-        r = run()
-        assert r.returncode == 0, r.stderr.decode(errors="replace")
-        assert cmdline.read_bytes() == want
-        assert calls.read_text().splitlines() == ["systemctl enable apparmor.service"]
+#: rpi-image-gen's linux-base assembles /etc/kernel/cmdline from every layer's cmdline.d fragments (late hook,
+#: after all customize hooks); rpi-linux-base installs it as /boot/firmware/cmdline.txt.
+CMDLINE_HOOK = REPO_ROOT / "image" / "rpi-image-gen" / "layer" / "base" / "linux-base.d" / "hooks" / "late" / "preimage10-cmdline"
+BASH = shutil.which("bash")
+CMDLINE_FRAGMENTS = {
+    "apparmor": LAYERS / "otp-rpios-setup.d" / "for" / "linux-base" / "cmdline.d" / "60-apparmor",
+    "memcg": LAYERS / "otp-apps.d" / "for" / "linux-base" / "cmdline.d" / "60-memcg",
+}
 
-    cmdline.unlink()                                      # rpi-boot-firmware has not run: the build stops
-    r = run()
-    assert r.returncode != 0 and b"cmdline.txt missing" in r.stderr and not cmdline.exists()
+
+def assemble_cmdline(tmp_path: Path, *fragments: Path) -> str:
+    """The kernel command line rpi-image-gen's own assembler makes of these fragments, in this order."""
+    if not CMDLINE_HOOK.is_file():
+        pytest.skip(f"{CMDLINE_HOOK} not available (image/rpi-image-gen submodule not checked out)")
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True, exist_ok=True)
+    out = root / "etc" / "kernel" / "cmdline"
+    out.unlink(missing_ok=True)
+    wrapper = ('die() { echo "$*" >&2; exit 1; }; msg() { :; }\n'
+               'foreach_dropin() { local f; for f in $FRAGS; do "$4" "$f"; done; }\n'
+               'LAYER_NAME=linux-base LAYER_VERSION=1.0.0\n'
+               '. "$HOOK" "$ROOT"\n')
+    posix = lambda p: str(p).replace("\\", "/")  # noqa: E731
+    env = dict(os.environ, HOOK=posix(CMDLINE_HOOK), ROOT=posix(root), FRAGS=" ".join(posix(f) for f in fragments))
+    r = subprocess.run([BASH, "-c", wrapper], capture_output=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+    return out.read_bytes().decode("utf-8")
+
+
+@pytest.mark.skipif(BASH is None, reason="no bash on PATH (on Windows Git Bash provides one)")
+def test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on(tmp_path):
+    """The Raspberry Pi kernel has AppArmor built in but an empty default LSM list (CONFIG_LSM=""), and the
+    firmware disables the memory cgroup: the station's fragments select AppArmor (replacing any earlier LSM
+    choice) and turn the memory cgroup on (layer otp-apps only), through rpi-image-gen's own assembler."""
+    for f in CMDLINE_FRAGMENTS.values():
+        assert len(f.read_bytes().decode("utf-8").splitlines()) == 1, f     # linux-base: one line per fragment
+    base = tmp_path / "10-base"
+    base.write_bytes(b"console=serial0,115200 console=tty1 root=ROOTDEV lsm=yama security=selinux fsck.repair=yes "
+                     b"rootwait\n")
+    plain = "console=serial0,115200 console=tty1 root=ROOTDEV fsck.repair=yes rootwait"
+    assert assemble_cmdline(tmp_path, base, CMDLINE_FRAGMENTS["apparmor"]) == f"{plain} apparmor=1 security=apparmor\n"
+    apps = assemble_cmdline(tmp_path, base, CMDLINE_FRAGMENTS["apparmor"], CMDLINE_FRAGMENTS["memcg"],
+                            CMDLINE_FRAGMENTS["memcg"])                    # the same word only once
+    assert apps == f"{plain} apparmor=1 security=apparmor cgroup_enable=memory\n"
 
 
 def test_layers_are_valid_yaml():

@@ -377,7 +377,7 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
   writing through `/proc/self/fd`. The provider makes it 0444 (another UID's container root has no CAP_FOWNER
   over it) and seals it with `F_SEAL_FUTURE_WRITE` (writes and writable mappings fail with EPERM).
 * **The Raspberry Pi kernel disables the memory cgroup** (`cgroup_disable=memory` from the firmware): layer
-  otp-apps adds `cgroup_enable=memory`. **A dash in a slice name means a parent slice**: `vn-apps.slice` landed in
+  otp-apps adds `cgroup_enable=memory` (a linux-base fragment, see below). **A dash in a slice name means a parent slice**: `vn-apps.slice` landed in
   `vn.slice`; it is `vnapps.slice`.
 * **Debian's arm64 kernel builds virtio_blk and ext4 as modules** (virtio-pci is built in) and a kernel package
   has no `modules.dep` (depmod writes it in postinst): `app-vmkit.sh` reads dependencies with
@@ -571,9 +571,14 @@ For the planned split (server on another machine, Sheets replaced, the open scen
   `instance-id` must change when the files change (it is a hash of them) or cloud-init ignores the new
   seed. Secrets in those files (account hash, Wi-Fi PMK) sit on an unencrypted FAT partition on every
   board.
-* AppArmor is on in the station image only through `cmdline.txt` (`apparmor=1 security=apparmor`, written by
-  `otp-rpios-setup`): the Raspberry Pi kernel has `CONFIG_SECURITY_APPARMOR=y` but `CONFIG_LSM=""`. Anything
-  that rewrites the boot partition's `cmdline.txt` instead of editing it drops it; custom images keep their own.
+* AppArmor is on in the station image only through `cmdline.txt` (`apparmor=1 security=apparmor`, the
+  fragment `otp-rpios-setup.d/for/linux-base/cmdline.d/60-apparmor`): the Raspberry Pi kernel has
+  `CONFIG_SECURITY_APPARMOR=y` but `CONFIG_LSM=""`. Anything that rewrites the boot partition's `cmdline.txt`
+  instead of editing it drops it; custom images keep their own.
+* Since rpi-image-gen v2.9.0 a layer never edits `/boot/firmware/cmdline.txt` in a customize hook (it does not
+  exist yet: linux-base assembles `/etc/kernel/cmdline` from every layer's `<layer>.d/for/linux-base/cmdline.d/`
+  fragments in a late hook and rpi-linux-base installs it). A fragment is one line: `-glob` drops words, a
+  word is added once. `tests/test_imageconfig.py` runs our fragments through upstream's assembler.
 * The package set is pinned to one Raspberry Pi OS Lite release `.info`; regenerate
   `otp-rpios-packages.yaml` with `image/rpios_packages.py` when the base release moves, and re-verify
   the first boot on hardware (cloud-init, NetworkManager and raspi-config behaviour all changed between
