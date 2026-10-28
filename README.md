@@ -694,9 +694,11 @@ More rules of the secure scenario:
   <serial>` records `otp_key_hash = customer_key_hash` and `secure_boot_provisioned = true`, so all later stages
   are served signed; it never generates a key. `modules mark-unlocked <serial>` undoes it. Both also clear the
   assumption. When a server is running both send the change through it (`POST /api/modules/{serial}/otp`).
-* A board whose OTP is **locked to our key** always gets signed files: a counter-signed `bootcode5.bin`, a
-  signed EEPROM, a `boot.sig` for the gadget, and a boot partition re-signed per board in stage 3, whose
-  `boot.img` sets `lock_device_private_key=1` (see "The secure scenario and the device key export").
+* A board whose OTP is **locked to our key** always gets signed files: a counter-signed `bootcode5.bin` (with
+  our public key as `pubkey.bin` next to it in `bootfiles.bin`: the bootloader of usbboot 2026-10-23 reads the
+  key that verifies `boot.img` over rpiboot), a signed EEPROM, a `boot.sig` for the gadget, and a boot
+  partition re-signed per board in stage 3, whose `boot.img` sets `lock_device_private_key=1` (see "The secure
+  scenario and the device key export").
 * A board **locked to a different key** is refused (HTTP 409, "board OTP is locked to a different key").
 
 ## HTTP API

@@ -13,7 +13,11 @@
 # Outputs: /out/boot.sig       rpi-eeprom-digest -k over boot.img, verified with public.pem
 #          /out/boot.img       only with CMDLINE_APPEND: the gadget with the board's cmdline.txt
 #          /out/bootfiles.bin  same tar, same member order, only 2712/bootcode5.bin replaced by
-#                              its customer counter-signed version (rpi-sign-bootcode -c 2712 -n 16 -v 0)
+#                              its customer counter-signed version (rpi-sign-bootcode -c 2712 -n 16 -v 0),
+#                              plus <chip>/pubkey.bin appended for each chip directory: public.pem in the
+#                              bootloader's binary form (rpi-bootloader-key-convert). The bootloader of
+#                              usbboot 2026-10-23 reads the key that verifies boot.img over rpiboot
+#                              instead of from SPI flash.
 # Same commands as usbboot mass-storage-gadget64/sign.sh.
 set -euo pipefail
 
@@ -33,7 +37,8 @@ trap 'rm -rf "${WORK}"' EXIT
 stage_tools() {
     local bin="${WORK}/bin" src name
     mkdir -p "${bin}"
-    for src in "${EEPROM_DIR}/rpi-eeprom-digest" "${EEPROM_DIR}/tools/rpi-sign-bootcode"; do
+    for src in "${EEPROM_DIR}/rpi-eeprom-digest" "${EEPROM_DIR}/tools/rpi-sign-bootcode" \
+               "${EEPROM_DIR}/tools/rpi-bootloader-key-convert"; do
         [ -f "${src}" ] || die "tool not found: ${src} (are the submodules checked out?)"
         [ "$(stat -c %s "${src}")" -gt 200 ] || die "tool ${src} looks like an unresolved git symlink"
         name="$(basename "${src}")"
@@ -102,7 +107,8 @@ step "counter-signing ${MEMBER} inside bootfiles.bin"
 tar -tf "${IN}/bootfiles.bin" > "${WORK}/members.txt"
 grep -qx "${MEMBER}" "${WORK}/members.txt" || die "bootfiles.bin has no ${MEMBER}"
 [ "$(sort "${WORK}/members.txt" | uniq -d | wc -l)" -eq 0 ] || die "bootfiles.bin has duplicate members"
-# Keep the archive's owner so the re-packed tar differs from the original only in bootcode5.bin.
+# Keep the archive's owner so the re-packed tar differs from the original only in bootcode5.bin (and
+# the appended pubkey.bin files).
 # (awk consumes all input: head would SIGPIPE tar under pipefail)
 owner="$(tar --numeric-owner -tvf "${IN}/bootfiles.bin" | awk 'NR == 1 {print $2}')"
 names="$(tar -tvf "${IN}/bootfiles.bin" | awk 'NR == 1 {print $2}')"
@@ -124,6 +130,21 @@ touch -r "${WORK}/tree/${MEMBER}" "${WORK}/bootcode5.bin.signed"
 chmod --reference="${WORK}/tree/${MEMBER}" "${WORK}/bootcode5.bin.signed"
 mv -f "${WORK}/bootcode5.bin.signed" "${WORK}/tree/${MEMBER}"
 
+step "the public key for the bootloader: <chip>/pubkey.bin"
+rpi-bootloader-key-convert "${KEYS}/public.pem" --output "${WORK}/pubkey.bin"
+[ "$(stat -c %s "${WORK}/pubkey.bin")" -eq 264 ] || die "pubkey.bin is not 264 bytes"
+echo "    pubkey.bin sha256 $(sha256sum "${WORK}/pubkey.bin" | awk '{print $1}') (the key hash in the board's OTP)"
+cp "${WORK}/members.txt" "${WORK}/members.out"
+for chip in 2711 2712; do
+    [ -d "${WORK}/tree/${chip}" ] || continue
+    ! grep -qx "${chip}/pubkey.bin" "${WORK}/members.txt" || die "bootfiles.bin already has ${chip}/pubkey.bin"
+    cp "${WORK}/pubkey.bin" "${WORK}/tree/${chip}/pubkey.bin"
+    touch -r "${WORK}/tree/${MEMBER}" "${WORK}/tree/${chip}/pubkey.bin"
+    chmod --reference="${WORK}/tree/${MEMBER}" "${WORK}/tree/${chip}/pubkey.bin"
+    echo "${chip}/pubkey.bin" >> "${WORK}/members.out"
+done
+grep -qx "2712/pubkey.bin" "${WORK}/members.out" || die "bootfiles.bin has no 2712 directory"
+
 owner_args=()
 if [[ "${uid}" =~ ^[0-9]+$ ]] && [[ "${gid}" =~ ^[0-9]+$ ]]; then
     [ -n "${uname}" ] && [[ ! "${uname}" =~ ^[0-9]+$ ]] && uid="${uname}:${uid}"
@@ -131,11 +152,11 @@ if [[ "${uid}" =~ ^[0-9]+$ ]] && [[ "${gid}" =~ ^[0-9]+$ ]]; then
     owner_args=(--owner="${uid}" --group="${gid}")
 fi
 tar -C "${WORK}/tree" --format=gnu --no-recursion "${owner_args[@]}" \
-    -cf "${WORK}/bootfiles.bin" -T "${WORK}/members.txt"
+    -cf "${WORK}/bootfiles.bin" -T "${WORK}/members.out"
 
 step "self-check"
 tar -tf "${WORK}/bootfiles.bin" > "${WORK}/members.new"
-cmp -s "${WORK}/members.txt" "${WORK}/members.new" || die "re-packed bootfiles.bin lists different members / order"
+cmp -s "${WORK}/members.out" "${WORK}/members.new" || die "re-packed bootfiles.bin lists different members / order"
 mkdir -p "${WORK}/orig" "${WORK}/new"
 tar -C "${WORK}/orig" -xf "${IN}/bootfiles.bin"
 tar -C "${WORK}/new" -xf "${WORK}/bootfiles.bin"
@@ -148,7 +169,11 @@ while IFS= read -r m; do
     fi
 done < "${WORK}/members.txt"
 [ "${changed}" -eq 1 ] || die "expected exactly ${MEMBER} to change, ${changed} members changed"
-echo "    $(wc -l < "${WORK}/members.txt") members, same order, only ${MEMBER} changed"
+while IFS= read -r m; do
+    cmp -s "${WORK}/pubkey.bin" "${WORK}/new/${m}" || die "appended ${m} is not the converted public.pem"
+done < <(comm -13 <(sort "${WORK}/members.txt") <(sort "${WORK}/members.out"))
+echo "    $(wc -l < "${WORK}/members.txt") members, same order, only ${MEMBER} changed;" \
+     "appended: $(comm -13 <(sort "${WORK}/members.txt") <(sort "${WORK}/members.out") | tr '\n' ' ')"
 
 cp "${WORK}/boot.sig" "${WORK}/bootfiles.bin" "${OUT}/"
 if [ "${BOOT_IMG}" != "${IN}/boot.img" ]; then cp "${BOOT_IMG}" "${OUT}/boot.img"; fi

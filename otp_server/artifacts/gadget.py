@@ -288,12 +288,12 @@ class GadgetBuilder:
                                                  f"fastboot gadget ({source}: {version}) with {cmdline}")
             files = [
                 self.hashes.stage_file("bootfiles.bin", out_dir / "bootfiles.bin",
-                                       "usbboot firmware/bootfiles.bin (2712/bootcode5.bin counter-signed)"),
+                                       "usbboot firmware/bootfiles.bin (2712/bootcode5.bin counter-signed, pubkey.bin added)"),
                 boot_sf,
                 self.hashes.stage_file("boot.sig", out_dir / "boot.sig", "rpi-eeprom-digest -k <board key>"),
                 self.hashes.stage_file("config.txt", cfg_path, "generated"),
             ]
-            notes.append("board OTP is locked to our key: boot.img signed, bootcode5.bin counter-signed")
+            notes.append("board OTP is locked to our key: boot.img signed, bootcode5.bin counter-signed, pubkey.bin added")
             if cmdline:
                 notes.append(f"the station holds this board's OTP device key: the gadget never exports it again "
                              f"({cmdline} in the signed boot.img)")

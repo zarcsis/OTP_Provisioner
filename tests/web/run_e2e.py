@@ -684,6 +684,13 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
         C.check("stage 2: boot.sig has an rsa2048 signature line", re.search(r"^rsa2048: ?[0-9a-f]{512}$", sig, re.M) is not None)
         C.check("stage 2: bootfiles.bin differs from the unsigned one", server2["bootfiles.bin"][1] != repo_bf and
                 server2["bootfiles.bin"][1] != shared.get("A_bootfiles_sha", repo_bf))
+        # the bootloader reads the key that verifies boot.img over rpiboot (usbboot 2026-10-23)
+        with tarfile.open(fileobj=io.BytesIO(bf)) as tf:
+            pk_member = next((m for m in tf.getmembers() if m.name.lower().lstrip("./") == "2712/pubkey.bin"), None)
+            pk = tf.extractfile(pk_member).read() if pk_member else b""
+        C.check("stage 2: bootfiles.bin carries 2712/pubkey.bin, whose sha256 is the key hash in OTP",
+                len(pk) == 264 and hashlib.sha256(pk).hexdigest() == rep.get("registryKeyHash"),
+                f"{len(pk)} bytes, sha256 {hashlib.sha256(pk).hexdigest()[:16]}, registry {str(rep.get('registryKeyHash'))[:16]}")
     else:
         C.eq("stage 2: mode", m2["mode"], "unsigned")
         C.eq("stage 2: bootfiles.bin is the repo file", server2["bootfiles.bin"][1], repo_bf, show=False)
