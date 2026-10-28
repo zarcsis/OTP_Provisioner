@@ -4,7 +4,7 @@
 Raspberry Pi publishes a ``.info`` file next to every image (``dpkg -l`` of the finished image)::
 
     python image/rpios_packages.py https://downloads.raspberrypi.com/raspios_lite_arm64/images/\
-raspios_lite_arm64-2026-09-15/2026-09-15-raspios-trixie-arm64-lite.info
+raspios_lite_arm64-2026-10-06/2026-10-06-raspios-trixie-arm64-lite.info
 
 (a local path works too). Every installed package is listed, dependencies included: pi-gen installs with
 recommends and rpi-image-gen without, so naming only pi-gen's top-level lists would give a smaller system.

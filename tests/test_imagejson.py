@@ -11,8 +11,8 @@ from otp_server import imagejson
 
 REPO = Path(__file__).resolve().parent.parent
 RIG = (REPO / "image" / "rpi-image-gen").resolve()
-RPIOS_DEV = RIG / "image" / "mbr" / "simple_dual" / "device"
-ROTA_DEV = RIG / "image" / "gpt" / "ab_userdata" / "device"
+RPIOS_DEV = RIG / "image" / "mbr" / "simple_dual" / "image.d" / "device"
+ROTA_DEV = RIG / "image" / "gpt" / "ab_userdata" / "image.d" / "device"
 
 SUBST = {"LUKS_KEYSIZE": "512", "LUKS_CIPHER": "aes-xts-plain64", "LUKS_HASH": "sha256",
          "CRYPT_UUID": "0b7f3c1e-5d9a-4c7e-9f59-1f6c2a8d9e11", "BOOT_UUID": "1A2B-3C4D",
@@ -21,7 +21,7 @@ SUBST = {"LUKS_KEYSIZE": "512", "LUKS_CIPHER": "aes-xts-plain64", "LUKS_HASH": "
 
 
 def load_pmap(path: Path) -> list:
-    """Read a provisionmap template the way customize10-pmap renders it (envsubst of ${VARS})."""
+    """Read a provisionmap template the way the image layout's customize05-pmap hook renders it (envsubst of ${VARS})."""
     if not path.is_file():
         pytest.skip(f"{path} not available (image/rpi-image-gen submodule not checked out)")
     text = re.sub(r"\$\{(\w+)\}", lambda m: SUBST[m.group(1)], path.read_text(encoding="utf-8"))

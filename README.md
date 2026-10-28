@@ -819,7 +819,7 @@ external/                  submodules (usbboot, pi-gen-micro)
 | --- | --- | --- |
 | `external/usbboot` (+ nested `rpi-eeprom`) | raspberrypi/usbboot | `firmware/bootfiles.bin`, EEPROM images and recovery, `update-pieeprom.sh`, `rpi-eeprom-digest`, `rpi-sign-bootcode`, `rpi-make-boot-image` |
 | `external/pi-gen-micro` | raspberrypi/pi-gen-micro | source of the fastboot gadget |
-| `image/rpi-image-gen` | raspberrypi/rpi-image-gen (`v2.8.0`) | the image generator of stage 3 (mmdebstrap + genimage + IDP) |
+| `image/rpi-image-gen` | raspberrypi/rpi-image-gen (`v2.9.0`) | the image generator of stage 3 (mmdebstrap + genimage + IDP) |
 
 The rpi-image-gen submodule pins the generator: to move to a newer release run
 `git -C image/rpi-image-gen fetch --tags` and `git -C image/rpi-image-gen checkout <tag>`, then commit

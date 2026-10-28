@@ -134,7 +134,7 @@ image/
   layer/otp-rpios-*.yaml      the three station layers = Raspberry Pi OS Lite; rpios_packages.py regenerates one
   layer/otp-apps.yaml         the sandboxed apps (in the config only when image.apps is set)
 examples/apps/                the demo: vn-demo-provider (system), vn-demo-detector (app), build.py (stdlib .deb builder)
-  rpi-image-gen/              submodule (v2.8.0)
+  rpi-image-gen/              submodule (v2.9.0)
 external/usbboot, external/pi-gen-micro   submodules (shallow); usbboot carries rpi-eeprom
 tests/                        pytest (server), tests/web/ (page self-test, e2e with a real server + mock board)
 ```

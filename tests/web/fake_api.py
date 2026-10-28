@@ -602,15 +602,15 @@ def job_log_lines(job: dict[str, Any]) -> list[str]:
     """A plausible log for the SSE endpoint."""
     if job["target"] == "image":
         return [
-            "==> OS image (crypt) already built: deb13-arm64-min-crypt-v2.8.0-e2798183",
+            "==> OS image (crypt) already built: deb13-arm64-min-crypt-v2.9.0-e2798183",
             "==> ensure docker daemon: ok (29.6.0)",
             "==> ensure arm64 emulation: aarch64",
             "==> docker build -t otp-image-builder:trixie image/docker",
             "#8 [5/7] RUN apt-get install -y --no-install-recommends mmdebstrap genimage ...",
             "#8 DONE 41.2s",
-            "==> rpi-image-gen v2.8.0 (clear): IGconf_image_pmap=clear",
+            "==> rpi-image-gen v2.9.0 (clear): IGconf_image_pmap=clear",
             "==> otp-image.yaml (from the image.* settings):",
-            "I: rpi-image-gen v2.8.0, config otp-image.yaml, layer image-rpios (pmap clear)",
+            "I: rpi-image-gen v2.9.0, config otp-image.yaml, layer image-rpios (pmap clear)",
             "I: bdebstrap: resolving 412 packages",
             "I: Retrieved 412 packages (138 MB)",
             "I: Unpacking base system ...",

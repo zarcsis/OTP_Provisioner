@@ -21,7 +21,7 @@ ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Package list = rpi-image-gen/depends (v2.8.0) + tools its scripts call without
+# Package list = rpi-image-gen/depends (v2.9.0) + tools its scripts call without
 # declaring (zstd, file, git) + foreign-arch helpers (qemu-user-static, arch-test)
 # + setuptools/wheel so pip can build the bdebstrap wheel without downloading them
 # + tini (PID 1 that forwards signals to the whole build) + openssl (password
