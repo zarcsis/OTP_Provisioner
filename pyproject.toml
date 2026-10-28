@@ -27,3 +27,6 @@ dev = [
 package = false
 # A station runs the server only; the tests ask for their group (--group dev).
 default-groups = []
+# Only uv's own Python builds (python-build-standalone), the exact version of .python-version: every station
+# runs the same interpreter, and a system Python (installed, updated or removed) changes nothing.
+python-preference = "only-managed"
