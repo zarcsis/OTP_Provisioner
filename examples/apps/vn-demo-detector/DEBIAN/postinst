@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ]; then
+    systemd-sysusers vn-demo-detector.conf
+    for unit in vn-demo-detector.service vn-demo-detector-probe.service; do
+        deb-systemd-helper unmask "$unit" >/dev/null || true
+        if deb-systemd-helper --quiet was-enabled "$unit"; then
+            deb-systemd-helper enable "$unit" >/dev/null || true
+        else
+            deb-systemd-helper update-state "$unit" >/dev/null || true
+        fi
+    done
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        deb-systemd-invoke restart vn-demo-detector-probe.service vn-demo-detector.service >/dev/null || true
+    fi
+fi
+exit 0

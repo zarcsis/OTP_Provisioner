@@ -66,6 +66,8 @@ DEFAULTS: dict[str, Any] = {
     "image": {
         "name": "rpios-trixie-arm64-lite",
         "custom": "",
+        "packages": [],
+        "apps": [],
         "hostname": "pi5-{serial}",
         "timezone": "Europe/Kyiv",
         "keyboard": "us",
@@ -156,6 +158,11 @@ class ImageCfg:
     #: The custom OS image stage 3 writes instead of the station's (the id of an image uploaded on the page;
     #: "" = the station image). :mod:`otp_server.artifacts.custom`.
     custom: str = ""
+    #: System packages (ids of uploaded trusted .debs) and sandboxed apps (``image.apps`` lines,
+    #: :func:`otp_server.imageconfig.parse_app_line`) built into the station image.
+    #: :mod:`otp_server.artifacts.packages`.
+    packages: list[str] = field(default_factory=list)
+    apps: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -555,7 +562,14 @@ def parse_image(img: Mapping) -> ImageCfg:
         wifi_country=_checked("image.wifi_country", imageconfig.check_country, text("wifi_country")),
         wifi_hidden=_bool(img.get("wifi_hidden"), "image.wifi_hidden"),
         custom=_checked("image.custom", imageconfig.check_custom, text("custom")),
+        packages=_unique(_checked("image.packages", lambda v: [imageconfig.check_package_id(p) for p in v],
+                                  _str_list(img.get("packages"), "image.packages", "package ids"))),
+        apps=_checked("image.apps", imageconfig.check_apps, _str_list(img.get("apps"), "image.apps", "app lines")),
     )
+
+
+def _unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
 def _default_desktop_path() -> Path | None:

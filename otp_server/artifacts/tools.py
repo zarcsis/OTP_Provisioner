@@ -19,13 +19,19 @@ LogFn = Callable[[str], None]
 
 
 class ToolsImage:
-    """Builds and runs the otp-tools image."""
+    """Builds and runs the otp-tools image (or, in a subclass, another image of docker/ that runs
+    docker/scripts through the same entry point)."""
+
+    DOCKERFILE = "tools.Dockerfile"
+    LABEL = LABEL
+    TITLE = TITLE
+    TARGET = "tools"
 
     def __init__(self, cfg: Any, docker: Any):
         self.cfg = cfg
         self.docker = docker
         self.docker_dir = Path(cfg.repo_root) / "docker"
-        self.dockerfile = self.docker_dir / "tools.Dockerfile"
+        self.dockerfile = self.docker_dir / self.DOCKERFILE
         self.entrypoint = self.docker_dir / "tools-entrypoint.sh"
         self.scripts_dir = self.docker_dir / "scripts"
         self._lock = threading.Lock()
@@ -44,7 +50,7 @@ class ToolsImage:
 
     def ready(self) -> bool:
         """True when the image exists and carries the current hash label."""
-        return self.docker.image_label(self.tag, LABEL) == self.hash()
+        return self.docker.image_label(self.tag, self.LABEL) == self.hash()
 
     def ensure(self, log: LogFn | None = None, force: bool = False) -> None:
         """Build the image when missing, outdated, or ``force``."""
@@ -59,13 +65,13 @@ class ToolsImage:
             if log:
                 log(f"==> building tools image {self.tag}")
             self.docker.build_image(self.tag, self.dockerfile, self.docker_dir,
-                                    labels={LABEL: self.hash()}, log=log)
+                                    labels={self.LABEL: self.hash()}, log=log)
 
     def require(self, jobs: Any) -> None:
         """Raise NotReady (starting the tools build job) unless the image is ready for a quick build."""
         if self.ready():
             return
-        job = jobs.submit("tools", TITLE, lambda job: self.ensure(job.log), dedupe=True)
+        job = jobs.submit(self.TARGET, self.TITLE, lambda job: self.ensure(job.log), dedupe=True)
         raise NotReady("the otp-tools Docker image is being built (needed to prepare this board's files)", job)
 
     def standard_mounts(self) -> list[Mount]:
@@ -74,11 +80,14 @@ class ToolsImage:
                 Mount.bind(Path(self.cfg.repo_root) / "external", "/ext", readonly=True)]
 
     def run_script(self, script: str, args: Sequence[str] = (), *, mounts: Sequence[Mount] = (),
-                   env: dict[str, str] | None = None, log: LogFn | None = None, privileged: bool = False) -> int:
+                   env: dict[str, str] | None = None, log: LogFn | None = None, privileged: bool = False,
+                   isolated: bool = False) -> int:
         """Run ``otp-run <script> [args]`` in the tools image (raises DockerError on failure). ``privileged``
-        only for scripts that loop-mount and chroot (custom-image.sh)."""
+        only for scripts that loop-mount and chroot (custom-image.sh); ``isolated`` (no network, no
+        capabilities) for one that runs code the station does not trust (app-install.sh)."""
+        kw = {"isolated": True} if isolated else {}
         return self.docker.run(self.tag, [script, *args], mounts=[*self.standard_mounts(), *mounts],
-                               env=env, log=log, check=True, privileged=privileged)
+                               env=env, log=log, check=True, privileged=privileged, **kw)
 
     def status(self, job: Any = None) -> dict:
         """Artifact status dict (SPEC §8) for target ``tools``."""
@@ -90,7 +99,7 @@ class ToolsImage:
         if not st.get("ok"):
             base["detail"] = f"Docker is not available: {st.get('detail') or 'not running'}"
             return base
-        label = self.docker.image_label(self.tag, LABEL)
+        label = self.docker.image_label(self.tag, self.LABEL)
         if label is None:
             base["detail"] = f"image {self.tag} is not built yet"
             return base

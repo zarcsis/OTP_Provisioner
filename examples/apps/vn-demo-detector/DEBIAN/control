@@ -1,0 +1,14 @@
+Package: vn-demo-detector
+Version: 1.0.0
+Architecture: all
+Maintainer: OTP_Provisioner demo <demo@localhost>
+Section: misc
+Priority: optional
+Depends: python3, python3-gi, gir1.2-glib-2.0, systemd
+X-Sandbox-Permissions: demo.frames.read, demo.detections.report
+Description: untrusted half of the OTP_Provisioner sandboxed-app demo
+ An ordinary Debian package with its own system user and systemd units. It
+ reads the frames of the trusted provider (io.github.DetectInt.Demo) through
+ the read-only shared memory handle it gets over D-Bus, finds the bright blob
+ and reports where it is, five times a second. A second unit checks once at
+ start what its sandbox lets through.

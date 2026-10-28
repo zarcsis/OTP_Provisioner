@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -38,12 +39,14 @@ from .. import diskimage
 from .. import firstboot
 from .. import imageconfig
 from .. import imagejson
+from .. import rootfs_tar
 from .. import sparse
 from ..docker import Mount
 from .common import (NotReady, StageFile, TempFiles, TempKeys, commit_partial, file_url, fingerprint, fresh_partial,
                      git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, rmtree,
                      write_json)
 from .custom import CustomImages
+from .packages import Packages
 
 WHY_FWCRYPTO = ("generates the board's device-unique private key in OTP (the key the LUKS root is bound to; "
                 "a copy is exported to the station); it can never be changed or erased")
@@ -84,6 +87,7 @@ class ImageBuilder:
         self.tools = tools
         self.hashes = hashes
         self.custom = CustomImages(cfg, docker, jobs, tools, hashes)
+        self.packages = Packages(cfg, docker, jobs, hashes)
 
     # ------------------------------------------------------------------ paths / identity
     @property
@@ -112,8 +116,11 @@ class ImageBuilder:
         return self.source_dir / "rpi-image-gen"
 
     def rendered(self) -> imageconfig.RenderedConfig:
-        """The rpi-image-gen config of the station image (``image.name``)."""
-        return imageconfig.render(self.cfg.image, mount=CFG_MOUNT)
+        """The rpi-image-gen config of the station image (``image.name``, and the system packages and sandboxed
+        apps of ``image.packages`` / ``image.apps``)."""
+        img = self.cfg.image
+        inputs = self.packages.image_inputs(img) if (img.packages or img.apps) else None
+        return imageconfig.render(img, mount=CFG_MOUNT, inputs=inputs)
 
     def overrides(self, variant: str) -> list[str]:
         """``builds.image.overrides`` plus the variant's provisioning map (``IGconf_image_pmap``, last)."""
@@ -177,6 +184,15 @@ class ImageBuilder:
             f = where / rel
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(data)
+        for rel, blob in rendered.blobs.items():
+            f = where / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            if self.hashes.sha256(blob.source) != blob.sha256:
+                raise RuntimeError(f"{blob.source} changed since it was prepared (sha256 mismatch)")
+            if blob.uid_base is None:
+                shutil.copyfile(blob.source, f)
+            else:                    # an app's root file system: checked again, its owners moved to its UID range
+                rootfs_tar.sanitize(blob.source, f, uid_base=blob.uid_base)
         return where
 
     # ------------------------------------------------------------------ current sets
@@ -299,6 +315,12 @@ class ImageBuilder:
         version = self.version(max_age=0)
         commit = git_output(self.rig_dir, "rev-parse", "HEAD") or ""
         rendered = self.rendered()
+        if rendered.problems:
+            for pid in self.packages.image_inputs(self.cfg.image)["missing"]:
+                self.packages.prepare(job, pid, locked=True)       # we hold the heavy lock
+            rendered = self.rendered()
+        if rendered.problems:
+            raise RuntimeError("the image cannot be built: " + "; ".join(rendered.problems))
         cfg_hash = self._config_hash(rendered, variant)
         cfg_dir = self.write_config_dir(rendered, self.root / "cfg" / f"{job.id}-{variant}")
         try:

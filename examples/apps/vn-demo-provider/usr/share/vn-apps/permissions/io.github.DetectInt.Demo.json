@@ -1,0 +1,15 @@
+{
+  "service": "io.github.DetectInt.Demo",
+  "permissions": {
+    "demo.frames.read": {
+      "description": "Read the provider's camera frames (a read-only handle to its shared memory)",
+      "calls": [{"interface": "io.github.DetectInt.Demo1", "method": "GetFrameHandle",
+                 "path": "/io/github/DetectInt/Demo"}]
+    },
+    "demo.detections.report": {
+      "description": "Report detections to the provider",
+      "calls": [{"interface": "io.github.DetectInt.Demo1", "method": "ReportDetection",
+                 "path": "/io/github/DetectInt/Demo"}]
+    }
+  }
+}

@@ -19,8 +19,11 @@ The value checks (``check_*``) are shared with :mod:`otp_server.config`, which v
 from __future__ import annotations
 
 import hashlib
+import io
 import re
+import tarfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import firstboot, image_choices
@@ -38,6 +41,11 @@ IMAGE_USER_GROUPS = "adm,dialout,cdrom,audio,users,video,games,plugdev,input,gpi
 
 _IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _CUSTOM_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_PACKAGE_ID_RE = _CUSTOM_ID_RE
+_PERMISSION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#: Below the config dir: the sandboxed apps (the otp-apps layer's ``IGconf_otpapps_dir``) and the system packages.
+APPS_DIR = "apps"
+SYSTEM_DIR = "system"
 _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -71,6 +79,82 @@ def check_custom(v: str) -> str:
     if v and not _CUSTOM_ID_RE.fullmatch(v):
         raise ValueError(f"custom image {v!r}: the id of an uploaded image (16 hex digits), or empty for the station image")
     return v
+
+
+def check_package_id(v: str) -> str:
+    """The id of an uploaded package (16 lowercase hex, the start of its sha256)."""
+    v = str(v).strip().lower()
+    if not _PACKAGE_ID_RE.fullmatch(v):
+        raise ValueError(f"package {v!r}: the id of an uploaded package (16 hex digits)")
+    return v
+
+
+_APP_KEYS = {"slot": "slot", "grant": "grant", "memory": "memory_mb", "cpus": "cpus", "tasks": "tasks"}
+
+
+def parse_app_line(line: str) -> dict:
+    """One ``image.apps`` line: ``<package id> slot=<1..64> [grant=<perm>,...] [memory=<MiB>] [cpus=<n>]
+    [tasks=<n>]`` -> ``{"id", "slot", "grant": [...], "memory_mb", "cpus", "tasks"}`` (ValueError when wrong)."""
+    from . import sandbox
+
+    words = str(line).split()
+    if not words:
+        raise ValueError("empty app line")
+    out: dict[str, Any] = {"id": check_package_id(words[0]), "slot": None, "grant": [], **sandbox.DEFAULT_LIMITS}
+    seen: set[str] = set()
+    for w in words[1:]:
+        key, sep, value = w.partition("=")
+        if not sep or key not in _APP_KEYS or key in seen:
+            raise ValueError(f"app {words[0]}: {w!r} (expected slot=, grant=, memory=, cpus=, tasks=, once each)")
+        seen.add(key)
+        try:
+            if key == "grant":
+                out["grant"] = sorted({g for g in value.split(",") if g})
+                bad = [g for g in out["grant"] if not _PERMISSION_RE.fullmatch(g)]
+                if bad:
+                    raise ValueError(f"permission {bad[0]!r}")
+            elif key == "cpus":
+                out["cpus"] = float(value)
+            else:
+                out[_APP_KEYS[key]] = int(value)
+        except ValueError as exc:
+            raise ValueError(f"app {words[0]}: {w!r}: {exc}") from None
+    if out["slot"] is None:
+        raise ValueError(f"app {words[0]}: no slot= (its UID range on the board)")
+    try:
+        sandbox.App("app", "0", out["slot"], tuple(out["grant"]), out["memory_mb"], out["cpus"], out["tasks"]).check()
+    except sandbox.SandboxError as exc:
+        raise ValueError(f"app {words[0]}: {str(exc).removeprefix('app: ')}") from None
+    return out
+
+
+def format_app_line(entry: dict) -> str:
+    """The ``image.apps`` line of :func:`parse_app_line`'s result (default limits left out)."""
+    from . import sandbox
+
+    words = [entry["id"], f"slot={entry['slot']}"]
+    if entry.get("grant"):
+        words.append("grant=" + ",".join(sorted(entry["grant"])))
+    for word, key in (("memory", "memory_mb"), ("cpus", "cpus"), ("tasks", "tasks")):
+        value = entry.get(key, sandbox.DEFAULT_LIMITS[key])
+        if value != sandbox.DEFAULT_LIMITS[key]:
+            words.append(f"{word}={value:g}" if key == "cpus" else f"{word}={value}")
+    return " ".join(words)
+
+
+def check_apps(lines: list[str]) -> list[str]:
+    """The ``image.apps`` lines, normalised; no package and no slot twice."""
+    out, ids, slots = [], set(), set()
+    for line in lines:
+        e = parse_app_line(line)
+        if e["id"] in ids:
+            raise ValueError(f"app {e['id']} is listed twice")
+        if e["slot"] in slots:
+            raise ValueError(f"slot {e['slot']} is given to two apps")
+        ids.add(e["id"])
+        slots.add(e["slot"])
+        out.append(format_app_line(e))
+    return out
 
 
 def check_hostname(v: str) -> str:
@@ -160,6 +244,8 @@ def public_view(img: Any) -> dict:
     return {
         "name": img.name,
         "custom": getattr(img, "custom", ""),
+        "packages": list(getattr(img, "packages", []) or []),
+        "apps": list(getattr(img, "apps", []) or []),
         "hostname": img.hostname,
         "timezone": img.timezone,
         "keyboard": img.keyboard,
@@ -197,20 +283,39 @@ def warnings(img: Any) -> list[str]:
 
 
 # ------------------------------------------------------------------ rendering
+@dataclass(frozen=True)
+class Blob:
+    """A large file next to the config, known by its sha256 and copied only when a build writes the config dir.
+    ``uid_base``: an app's root file system archive, whose owners move to that base on the way
+    (:func:`otp_server.rootfs_tar.sanitize`)."""
+
+    source: Path
+    sha256: str
+    uid_base: int | None = None
+
+
 @dataclass
 class RenderedConfig:
-    """The config text, the files it needs next to it (path relative to the config dir -> bytes; none at
-    the moment) and a public summary."""
+    """The config text, the files it needs next to it (path relative to the config dir -> bytes, the large ones
+    as :class:`Blob`) and a public summary. ``problems``: why this config cannot be built yet."""
 
     text: str
     files: dict[str, bytes] = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
+    blobs: dict[str, Blob] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
 
     def digest(self) -> str:
-        """sha256 over the config and every file (names and contents): changes whenever the image would."""
+        """sha256 over the config and every file (names and contents; blobs by their sha256): changes whenever
+        the image would."""
         h = hashlib.sha256(self.text.encode("utf-8"))
         for name in sorted(self.files):
             h.update(b"\0" + name.encode("utf-8") + b"\0" + self.files[name])
+        for name in sorted(self.blobs):
+            b = self.blobs[name]
+            h.update(f"\0blob\0{name}\0{b.sha256}\0{b.uid_base}".encode("utf-8"))
+        for p in self.problems:
+            h.update(b"\0problem\0" + p.encode("utf-8"))
         return h.hexdigest()
 
 
@@ -221,10 +326,11 @@ def _q(value: str) -> str:
     return f'"{value}"'
 
 
-def render(img: Any, *, mount: str = "/cfg") -> RenderedConfig:
-    """The rpi-image-gen config of the station image named ``img.name``. ``mount`` (where the build
-    container sees the config dir) is unused while the config needs no files next to it."""
-    del mount
+def render(img: Any, *, mount: str = "/cfg", inputs: dict | None = None) -> RenderedConfig:
+    """The rpi-image-gen config of the station image named ``img.name``; ``mount`` is where the build
+    container sees the config dir. ``inputs`` (:meth:`otp_server.artifacts.packages.Packages.image_inputs`): the
+    system packages (``packages:``, installed like the image's own) and the sandboxed apps (layer ``otp-apps``)
+    the settings put into the image."""
     lines = [
         "# rpi-image-gen config written by OTP_Provisioner: Raspberry Pi OS Lite for the Raspberry Pi 5.",
         "# The same image for every board; stage 3 writes each board's account, SSH, Wi-Fi, host name and",
@@ -246,5 +352,65 @@ def render(img: Any, *, mount: str = "/cfg") -> RenderedConfig:
         "  base: otp-rpios-lite",
         "  station: otp-rpios-setup",
     ]
+    files: dict[str, bytes] = {}
+    blobs: dict[str, Blob] = {}
+    summary: dict[str, Any] = {"name": img.name, "base": "Raspberry Pi OS Lite"}
+    problems: list[str] = []
+    if inputs and (inputs.get("system") or inputs.get("apps")):
+        problems += list(inputs.get("problems") or [])
+        if inputs.get("apps"):
+            lines += ["  apps: otp-apps", "", "otpapps:", f"  dir: {_q(mount + '/' + APPS_DIR)}"]
+            _render_apps(inputs, files, blobs, summary, problems)
+        if inputs.get("system"):
+            lines += ["", "packages:"]
+            for n, p in enumerate(inputs["system"], 1):
+                rel = f"{SYSTEM_DIR}/{p['package']}_{p['id']}.deb"
+                lines.append(f"  local{n}: {_q(mount + '/' + rel)}")
+                blobs[rel] = Blob(Path(p["path"]), str(p["sha256"]))
+            summary["packages"] = [f"{p['package']} {p['version']}" for p in inputs["system"]]
     text = "\n".join(lines) + "\n"
-    return RenderedConfig(text=text, files={}, summary={"name": img.name, "base": "Raspberry Pi OS Lite"})
+    return RenderedConfig(text=text, files=files, summary=summary, blobs=blobs, problems=problems)
+
+
+def _render_apps(inputs: dict, files: dict[str, bytes], blobs: dict[str, Blob], summary: dict,
+                 problems: list[str]) -> None:
+    """``apps/sandbox.tar`` (every app's sandbox files, :func:`otp_server.sandbox.render`), ``apps/apps.list``
+    (``<name> <base UID>`` per line, for the layer) and each app's root file system as a blob."""
+    from . import sandbox
+
+    problems += [f"app {pid} is not prepared yet" for pid in inputs.get("missing") or []]
+    try:
+        rendered = sandbox.render(inputs["apps"], inputs.get("permissions") or {})
+    except sandbox.SandboxError as exc:
+        problems.append(str(exc))
+        return
+    files[f"{APPS_DIR}/sandbox.tar"] = _tar(rendered.files)
+    listing = []
+    for app in sorted(inputs["apps"], key=lambda a: a.slot):
+        if app.name in (inputs.get("rootfs") or {}):
+            path, sha = inputs["rootfs"][app.name]
+            blobs[f"{APPS_DIR}/{app.name}.tar"] = Blob(Path(path), sha, app.uid)
+        listing.append(f"{app.name} {app.uid}\n")
+    files[f"{APPS_DIR}/apps.list"] = "".join(listing).encode("ascii")
+    summary["apps"] = rendered.apps
+
+
+def _tar(files: dict[str, tuple[bytes, int]]) -> bytes:
+    """A reproducible tar of ``{path: (bytes, mode)}``: root:root, mtime 0, every parent before its children."""
+    buf = io.BytesIO()
+    dirs: set[str] = set()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as t:
+        for path in sorted(files):
+            parts = path.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in dirs:
+                    dirs.add(d)
+                    info = tarfile.TarInfo(f"./{d}")
+                    info.type, info.mode = tarfile.DIRTYPE, 0o755
+                    t.addfile(info)
+            data, mode = files[path]
+            info = tarfile.TarInfo(f"./{path}")
+            info.size, info.mode = len(data), mode
+            t.addfile(info, io.BytesIO(data))
+    return buf.getvalue()

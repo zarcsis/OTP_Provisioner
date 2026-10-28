@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+for unit in vn-demo-detector.service vn-demo-detector-probe.service; do
+    if [ "$1" = remove ]; then
+        deb-systemd-helper mask "$unit" >/dev/null || true
+    fi
+    if [ "$1" = purge ]; then
+        deb-systemd-helper purge "$unit" >/dev/null || true
+        deb-systemd-helper unmask "$unit" >/dev/null || true
+    fi
+done
+exit 0

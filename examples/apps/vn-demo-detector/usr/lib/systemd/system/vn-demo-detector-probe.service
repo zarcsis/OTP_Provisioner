@@ -1,0 +1,11 @@
+[Unit]
+Description=VN demo detector: what its sandbox lets through (one line per attempt)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/lib/vn-demo-detector/detector.py --probe
+SuccessExitStatus=1
+
+[Install]
+WantedBy=multi-user.target

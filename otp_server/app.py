@@ -171,7 +171,8 @@ class Services:
 
     # ------------------------------------------------------------------ image settings (the page's form)
     #: Fields of POST /api/image besides the two passwords.
-    IMAGE_FIELDS = ("name", "custom", "hostname", "timezone", "keyboard", "user", "ssh", "ssh_password_login",
+    IMAGE_FIELDS = ("name", "custom", "packages", "apps", "hostname", "timezone", "keyboard", "user", "ssh",
+                    "ssh_password_login",
                     "ssh_authorized_keys", "wifi_ssid", "wifi_country", "wifi_hidden")
 
     def image_settings(self) -> dict:
@@ -228,7 +229,7 @@ class Services:
                 raise StoreError(self.settings_error or "the settings sheet could not be read back")
         log.info("image settings saved: %s", ", ".join(sorted(updates)))
         want = self.cfg.builds.auto if self.auto_build is None else self.auto_build
-        if want and self.artifacts is not None and ("name" in changed or "custom" in changed):
+        if want and self.artifacts is not None and changed.keys() & {"name", "custom", "packages", "apps"}:
             threading.Thread(target=self.run_auto_build, name="image-settings-build", daemon=True).start()
         return {**self.image_settings(), "saved": sorted(updates)}
 

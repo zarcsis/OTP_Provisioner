@@ -73,6 +73,11 @@ DESCRIPTIONS: dict[str, str] = {
                   "The other image.* settings are written to each board at stage 3 and rebuild nothing",
     "image.custom": "custom OS image stage 3 writes instead of the station's Raspberry Pi OS Lite: the id of an image "
                     "uploaded on the page (empty = the station image). Uploads stay on this station's disk",
+    "image.packages": "system packages built into the station image (trusted: installed as root like its own), the ids "
+                      "of packages uploaded on the page, one per line; a change rebuilds the image",
+    "image.apps": "sandboxed apps built into the station image, one per line: <package id> slot=<1..64> "
+                  "[grant=<permission>,...] [memory=<MiB>] [cpus=<n>] [tasks=<n>]; each runs in its own container "
+                  "with its own UID range (the slot); a change rebuilds the image",
     "image.hostname": "host name of the boards; {serial} = the board's 8-hex serial (pi5-{serial})",
     "image.timezone": "time zone of the image's tzdata (Europe/Kyiv, UTC, ...; the page offers the list)",
     "image.keyboard": "keyboard layout of the boards' console (xkb: us, gb, ua, ...; the page offers the list). "

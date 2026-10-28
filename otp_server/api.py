@@ -452,6 +452,67 @@ def api_router(svc: Any) -> APIRouter:
         call(artifacts().custom.delete, cid)
         return {"ok": True}
 
+    # ---------------------------------------------------------------- packages for the station image
+    @r.get("/packages")
+    def list_packages() -> JSONResponse:
+        return JSONResponse(call(artifacts().packages_status), headers=NO_STORE)
+
+    @r.put("/packages")
+    async def upload_package(request: Request, name: str = "", kind: str = "") -> JSONResponse:
+        """Upload a Debian package: ``?kind=system`` (trusted, installed into the image as root) or ``?kind=app``
+        (sandboxed: prepared in its own root file system right away). The .deb is the request body."""
+        await run_in_threadpool(require_google)
+        arts = await run_in_threadpool(artifacts)
+        length = request.headers.get("content-length", "")
+        if not length.isdigit():
+            raise HTTPException(411, detail="the upload needs a Content-Length")
+        try:
+            up = await run_in_threadpool(arts.packages.begin_upload, name, int(length), kind)
+        except ValueError as exc:
+            raise HTTPException(400, detail=_exc_text(exc)) from None
+        done = False
+        try:
+            buf = bytearray()
+            async for chunk in request.stream():
+                buf += chunk
+                if len(buf) >= UPLOAD_BUFFER:
+                    data, buf = bytes(buf), bytearray()
+                    await run_in_threadpool(up.write, data)
+            if buf:
+                await run_in_threadpool(up.write, bytes(buf))
+            info, new = await run_in_threadpool(up.finish)
+            done = True
+        except ValueError as exc:
+            raise HTTPException(400, detail=_exc_text(exc)) from None
+        finally:
+            if not done:
+                await run_in_threadpool(up.abort)
+        job = None
+        if info["kind"] == "app" and await run_in_threadpool(arts.packages.prepared, info["id"]) is None:
+            job = await run_in_threadpool(arts.packages.start_prepare, info["id"])
+        log.info("package %s uploaded (%s %s, %s)%s", info["id"], info["deb"]["package"], info["deb"]["version"],
+                 info["kind"], "" if new else ", already on the station")
+        return JSONResponse({"package": info, "new": new, "job": job.to_dict() if job is not None else None},
+                            headers=NO_STORE)
+
+    @r.post("/packages/{pid}/prepare")
+    def prepare_package(pid: str, body: Any = Body(default=None)) -> dict:
+        b = body_dict(body)
+        force = b.get("force", False)
+        if not isinstance(force, bool):
+            raise HTTPException(400, detail="force must be true or false")
+        job = call(artifacts().packages.start_prepare, pid, force)
+        return {"job": job.to_dict()}
+
+    @r.get("/packages/{pid}/sandbox")
+    def package_sandbox(pid: str) -> JSONResponse:
+        return JSONResponse(call(artifacts().packages.sandbox_preview, pid), headers=NO_STORE)
+
+    @r.delete("/packages/{pid}")
+    def delete_package(pid: str) -> dict:
+        call(artifacts().packages.delete, pid)
+        return {"ok": True}
+
     # ---------------------------------------------------------------- fastboot
     @r.post("/fastboot/identify")
     def fastboot_identify(body: Any = Body(default=None)) -> dict:

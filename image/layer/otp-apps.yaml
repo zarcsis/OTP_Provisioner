@@ -1,0 +1,87 @@
+# METABEGIN
+# X-Env-Layer-Name: otp-apps
+# X-Env-Layer-Category: container
+# X-Env-Layer-Desc: Sandboxed apps of the station image (image.apps): each one an
+#  ordinary Debian package, installed on the station into its own root file
+#  system, run on the board in its own rootful podman container (quadlet) with
+#  systemd inside, its own range of 65536 host UIDs, no network, its own
+#  AppArmor profile and limits, and the system bus only through its own
+#  xdg-dbus-proxy. The station writes everything into $IGconf_otpapps_dir:
+#  sandbox.tar (quadlets, proxy units, AppArmor profiles, sysusers, tmpfiles,
+#  the slice, /etc/vn-apps/registry.json), apps.list (<name> <base UID> per
+#  line) and <name>.tar per app (its root file system, owners already in its
+#  UID range). Also turns the memory cgroup on (cgroup_enable=memory): the
+#  Raspberry Pi kernel disables it by default and the apps' limits need it.
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Requires: otp-rpios-setup
+#
+# X-Env-VarPrefix: otpapps
+#
+# X-Env-Var-dir:
+# X-Env-Var-dir-Desc: Directory with sandbox.tar, apps.list and the apps' root
+#  file systems, as the build container sees it (the station's config dir).
+# X-Env-Var-dir-Required: y
+# X-Env-Var-dir-Valid: string
+# X-Env-Var-dir-Set: y
+# METAEND
+---
+mmdebstrap:
+  packages:
+    - podman
+    - crun
+    - conmon
+    - catatonit
+    - xdg-dbus-proxy
+  customize-hooks:
+    - |-
+      # The sandboxes: the station's files, then every app's root file system in /var/lib/vn-apps/<name>/rootfs
+      # (0711 above it: podman enters it as the app's base UID; 0700 on the app's own directory).
+      set -eu
+      src=$IGconf_otpapps_dir
+      for f in sandbox.tar apps.list; do
+         [ -s "$src/$f" ] || { echo "otp-apps: $src/$f missing" >&2; exit 1; }
+      done
+      tar -xf "$src/sandbox.tar" -C "$1" --no-overwrite-dir
+      install -d -m 0711 -o 0 -g 0 "$1/var/lib/vn-apps"
+      while read -r name uid; do
+         case "$name" in vn-app-[a-z0-9]*) ;; *) echo "otp-apps: bad app name '$name'" >&2; exit 1 ;; esac
+         case "$name" in */*|*..*) echo "otp-apps: bad app name '$name'" >&2; exit 1 ;; esac
+         case "$uid" in ''|*[!0-9]*) echo "otp-apps: bad UID '$uid' of $name" >&2; exit 1 ;; esac
+         [ -s "$src/$name.tar" ] || { echo "otp-apps: $src/$name.tar missing" >&2; exit 1; }
+         d=$1/var/lib/vn-apps/$name
+         rm -rf "$d"
+         install -d -m 0700 -o "$uid" -g "$uid" "$d"
+         install -d -m 0755 -o "$uid" -g "$uid" "$d/rootfs"
+         tar --numeric-owner --xattrs --xattrs-include=security.capability -xpf "$src/$name.tar" -C "$d/rootfs"
+         owner=$(stat -c %u:%g "$d/rootfs")
+         [ "$owner" = "$uid:$uid" ] || { echo "otp-apps: $name rootfs is owned by $owner, not $uid" >&2; exit 1; }
+         [ -x "$d/rootfs/sbin/init" ] || [ -L "$d/rootfs/sbin/init" ] || { echo "otp-apps: $name has no /sbin/init" >&2; exit 1; }
+         echo "otp-apps: $name ($uid): $(du -sh "$d/rootfs" | cut -f1)"
+      done < "$src/apps.list"
+    - |-
+      # The apps' users and groups (sysusers.d from sandbox.tar), the AppArmor profiles compiled once here so a
+      # broken one stops the build instead of an app at boot, and the units in place.
+      set -eu
+      chroot "$1" systemd-sysusers
+      for p in "$1"/etc/apparmor.d/vn-app-*; do
+         [ -f "$p" ] || continue
+         chroot "$1" apparmor_parser -Q -K "/etc/apparmor.d/${p##*/}" || { echo "otp-apps: AppArmor profile ${p##*/} does not compile" >&2; exit 1; }
+      done
+      for q in "$1"/etc/containers/systemd/vn-app-*.container; do
+         [ -f "$q" ] || continue
+         n=${q##*/}
+         n=${n%.container}
+         [ -f "$1/etc/systemd/system/$n-bus.service" ] || { echo "otp-apps: $n has no D-Bus proxy unit" >&2; exit 1; }
+      done
+    - |-
+      # The memory cgroup: off by default in the Raspberry Pi kernel (cgroup_disable=memory), needed for the
+      # apps' MemoryMax. Same treatment of cmdline.txt as AppArmor's in otp-rpios-setup.
+      set -eu
+      f=$1/boot/firmware/cmdline.txt
+      [ -s "$f" ] || { echo "otp-apps: $f missing" >&2; exit 1; }
+      set -f
+      words=
+      for w in $(cat "$f"); do
+         case "$w" in cgroup_enable=memory) ;; *) words="$words $w" ;; esac
+      done
+      printf '%s\n' "${words# } cgroup_enable=memory" > "$f"

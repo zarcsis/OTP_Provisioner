@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ]; then
+    systemd-sysusers vn-demo-provider.conf
+    if [ -d /run/systemd/system ]; then
+        systemctl reload dbus.service >/dev/null 2>&1 || true
+    fi
+    deb-systemd-helper unmask vn-demo-provider.service >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled vn-demo-provider.service; then
+        deb-systemd-helper enable vn-demo-provider.service >/dev/null || true
+    else
+        deb-systemd-helper update-state vn-demo-provider.service >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        deb-systemd-invoke restart vn-demo-provider.service >/dev/null || true
+    fi
+fi
+exit 0

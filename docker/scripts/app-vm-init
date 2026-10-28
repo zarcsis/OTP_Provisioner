@@ -1,0 +1,72 @@
+#!/bin/busybox sh
+# app-vm-init - /init of the station's installer VM (packed into its initramfs by app-vmkit.sh).
+#
+# The VM has two disks and nothing else (no network): /dev/vda is the app's root file system (ext4, made
+# by app-rootfs.sh: Debian with the app's dependencies, the app's .debs in /vn-install), /dev/vdb takes the
+# result. This installs the .debs with dpkg in a chroot of vda, so the packages' maintainer scripts run as
+# root inside this VM and nowhere else; then it writes vda as a tar archive (numeric owners, file
+# capabilities) to vdb and powers off. The station treats that archive as untrusted (otp_server.rootfs_tar).
+#
+# The console carries the log; the last line app-install.sh looks for is
+#   vn-install: result dpkg=<status> tar=<status>
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec >/dev/console 2>&1
+
+say() { echo "vn-install: $*"; }
+finish() {
+    sync
+    say "result dpkg=${dpkg_rc:-none} tar=${tar_rc:-none}"
+    poweroff -f
+}
+trap finish EXIT
+
+for m in $(cat /modules.order); do
+    insmod "/lib/modules/$m.ko" || say "insmod $m failed"
+done
+n=0
+while [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; do
+    n=$((n + 1))
+    [ "$n" -gt 50 ] && { say "the VM's disks did not appear"; exit 1; }
+    sleep 0.2
+done
+
+mount -t ext4 /dev/vda /target || { say "cannot mount the root file system"; exit 1; }
+mount -t proc proc /target/proc
+mount -t sysfs sysfs /target/sys
+mount -o bind /dev /target/dev
+mount -t tmpfs -o mode=0755 tmpfs /target/run
+mount -t tmpfs -o mode=1777 tmpfs /target/tmp
+
+debs=""
+for f in /target/vn-install/*.deb; do
+    [ -f "$f" ] && debs="$debs /vn-install/${f##*/}"
+done
+if [ -z "$debs" ]; then
+    say "no package in /vn-install"
+    exit 1
+fi
+say "installing:$debs"
+# No systemd runs here: deb-systemd-helper enables the package's units, deb-systemd-invoke skips starting
+# them (as in any image build); the container starts them at its first boot.
+chroot /target /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    dpkg --force-confdef --force-confold -i $debs
+dpkg_rc=$?
+say "dpkg exited with $dpkg_rc"
+if [ "$dpkg_rc" = 0 ]; then
+    chroot /target /usr/bin/dpkg --audit && say "dpkg --audit: nothing half-installed"
+fi
+
+rm -rf /target/vn-install
+umount /target/tmp /target/run /target/dev /target/sys /target/proc
+if [ "$dpkg_rc" = 0 ]; then
+    # The root file system's own GNU tar: busybox tar keeps no file capabilities.
+    chroot /target /usr/bin/tar --numeric-owner --xattrs --xattrs-include=security.capability \
+        --sort=name -C / -cf - . > /dev/vdb
+    tar_rc=$?
+fi
+umount /target

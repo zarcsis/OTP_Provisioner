@@ -36,6 +36,7 @@ from otp_server.secrets_gen import luks_key, luks_passphrase
 SERIAL = "a7eb274c"
 SERIAL2 = "0badc0de"
 BLK = 4096
+APP_TAG = "otp-app-builder:trixie"
 TOOLS_TAG = "otp-tools:latest"
 BUILDER_TAG = "otp-image-builder:trixie"
 GADGET_TAG = "otp-gadget-builder:trixie"
@@ -110,9 +111,11 @@ HELPER_FILES = {
 def make_repo(base: Path) -> tuple[Path, Path]:
     repo = base / "repo"
     (repo / "docker" / "scripts").mkdir(parents=True)
-    for name in ("tools.Dockerfile", "tools-entrypoint.sh", "gadget.Dockerfile", "gadget-entrypoint.sh"):
+    for name in ("tools.Dockerfile", "tools-entrypoint.sh", "gadget.Dockerfile", "gadget-entrypoint.sh",
+                 "apps.Dockerfile"):
         (repo / "docker" / name).write_text(f"# {name}\n", encoding="utf-8")
-    for name in ("stage1.sh", "stage2-sign.sh", "boot-slot.sh", "image-collect.sh", "root-luks.sh", "luks_encrypt.py"):
+    for name in ("stage1.sh", "stage2-sign.sh", "boot-slot.sh", "image-collect.sh", "root-luks.sh", "luks_encrypt.py",
+                 "app-vmkit.sh", "app-vm-init", "app-rootfs.sh", "app-install.sh"):
         (repo / "docker" / "scripts" / name).write_text(f"#!/bin/bash\n# {name}\n", encoding="utf-8")
     helpers = repo / "docker" / "gadget-helpers" / "otp-keyexport"
     helpers.mkdir(parents=True)
@@ -191,10 +194,10 @@ class FakeDocker:
         return True
 
     def run(self, image, args=(), *, mounts=(), env=None, privileged=False, platform=None, entrypoint=None,
-            hostname=None, log=None, check=True, interactive=False) -> int:
+            hostname=None, log=None, check=True, interactive=False, isolated=False) -> int:
         call = {"image": image, "args": list(args), "mounts": {m.target: m for m in mounts},
                 "env": dict(env or {}), "privileged": privileged, "platform": platform, "hostname": hostname,
-                "interactive": interactive, "docker": self}
+                "interactive": interactive, "isolated": isolated, "docker": self}
         if "/keys" in call["mounts"]:
             kdir = Path(call["mounts"]["/keys"].source)
             call["keys_dir"] = kdir
@@ -202,7 +205,7 @@ class FakeDocker:
         if "/in" in call["mounts"]:
             call["in_files"] = sorted(os.listdir(call["mounts"]["/in"].source))
         self.runs.append(call)
-        name = args[0] if image == TOOLS_TAG and args else image
+        name = args[0] if image in (TOOLS_TAG, APP_TAG) and args else image
         if name in self.fail:
             from otp_server.docker import DockerError
             raise DockerError(f"docker run {image} exited with 1", 1)
@@ -214,7 +217,8 @@ class FakeDocker:
         return 0
 
     def runs_of(self, name: str) -> list[dict]:
-        return [r for r in self.runs if (r["args"][:1] == [name] if r["image"] == TOOLS_TAG else r["image"] == name)]
+        return [r for r in self.runs
+                if (r["args"][:1] == [name] if r["image"] in (TOOLS_TAG, APP_TAG) else r["image"] == name)]
 
 
 def base_env(call) -> dict:

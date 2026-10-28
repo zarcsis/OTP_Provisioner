@@ -1,0 +1,16 @@
+[Unit]
+Description=VN demo detector: finds the blob in the provider's frames and reports it
+After=vn-demo-detector-probe.service
+
+[Service]
+User=vn-detector
+ExecStart=/usr/bin/python3 -I /usr/lib/vn-demo-detector/detector.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

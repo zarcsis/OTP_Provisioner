@@ -30,6 +30,7 @@ from typing import Any
 from .common import HashCache, NotReady, StageFile, sweep_stale_temp
 from .gadget import GadgetBuilder
 from .image import ImageBuilder
+from .packages import next_free_slot
 from .stage1 import Stage1Builder
 from .tools import TITLE as TOOLS_TITLE, ToolsImage
 
@@ -123,6 +124,29 @@ class Artifacts:
 
     def custom_images(self) -> list[dict]:
         return self.custom.status()
+
+    # ------------------------------------------------------------------ packages for the station image
+    @property
+    def packages(self) -> Any:
+        """System packages and sandboxed apps (:class:`otp_server.artifacts.packages.Packages`)."""
+        return self.image.packages
+
+    def packages_status(self) -> dict:
+        """The uploads, the permissions the selected system packages declare, and what the image gets."""
+        pk = self.packages
+        img = self.cfg.image
+        inputs = pk.image_inputs(img)
+        perms = {name: {"description": p.description, "provider": p.provider,
+                        "calls": [f"{c.interface}.{c.method}" for c in p.calls]}
+                 for name, p in sorted(inputs["permissions"].items())}
+        notes = []
+        if getattr(img, "custom", "") and (img.packages or img.apps):
+            notes.append("stage 3 writes a custom image (image.custom): system packages and apps are built into the "
+                         "station image only")
+        return {"packages": pk.status(), "permissions": perms, "selected": {"packages": list(img.packages),
+                                                                             "apps": list(img.apps)},
+                "problems": list(inputs["problems"]), "unprepared": list(inputs["missing"]), "notes": notes,
+                "next_slot": next_free_slot(img.apps)}
 
     # ------------------------------------------------------------------ stages
     def _board(self, record: dict) -> bool:

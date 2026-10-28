@@ -408,8 +408,11 @@ class DockerRunner:
     def run_argv(image: str, args: Iterable[str] = (), *, mounts: Iterable[Mount] = (),
                  env: dict[str, str] | None = None, privileged: bool = False, platform: str | None = None,
                  entrypoint: str | None = None, hostname: str | None = None,
-                 interactive: bool = False, name: str | None = None) -> list[str]:
-        """The docker argv (without the binary) :meth:`run` executes."""
+                 interactive: bool = False, name: str | None = None, isolated: bool = False) -> list[str]:
+        """The docker argv (without the binary) :meth:`run` executes. ``isolated``: no network, no capabilities,
+        no new privileges (for a container that runs code the station does not trust)."""
+        if isolated and privileged:
+            raise ValueError("a container cannot be both privileged and isolated")
         argv = ["run", "--rm"]
         if name:
             argv += ["--name", name]
@@ -417,6 +420,8 @@ class DockerRunner:
             argv.append("-i")
         if privileged:
             argv.append("--privileged")
+        if isolated:
+            argv += ["--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
         if platform:
             argv += ["--platform", platform]
         if hostname:
@@ -434,12 +439,13 @@ class DockerRunner:
     def run(self, image: str, args: Sequence[str] = (), *, mounts: Sequence[Mount] = (),
             env: dict[str, str] | None = None, privileged: bool = False, platform: str | None = None,
             entrypoint: str | None = None, hostname: str | None = None, log: LogFn | None = None,
-            check: bool = True, interactive: bool = False) -> int:
+            check: bool = True, interactive: bool = False, isolated: bool = False) -> int:
         """``docker run --rm ...``; streams output to ``log``; returns the exit code.
 
         With ``check`` a non-zero exit raises :class:`DockerError`.
         """
         name = _container_name()
         argv = self.run_argv(image, args, mounts=mounts, env=env, privileged=privileged, platform=platform,
-                             entrypoint=entrypoint, hostname=hostname, interactive=interactive, name=name)
+                             entrypoint=entrypoint, hostname=hostname, interactive=interactive, name=name,
+                             isolated=isolated)
         return self._stream(argv, log, check=check, what=f"docker run {image}", container=name)
