@@ -91,7 +91,7 @@ and its C++ test) and 16.4 k lines of tests.
 
 ```
 server.py                     launcher (uv run server.py); uv run -m otp_server for login/build/modules/status
-pyproject.toml, uv.lock       dependencies for uv (dev group: pytest, httpx, PyYAML); .python-version = 3.15.1
+pyproject.toml, uv.lock       dependencies for uv (dev group: pytest, httpx2, PyYAML); .python-version = 3.15.1
 otp_server/
   app.py, api.py              FastAPI factory + routes; 401 until Google is signed in and the settings sheet read
   config.py, settings.py      DEFAULTS tree; the settings worksheet (re-read every 15 s; retired keys removed)

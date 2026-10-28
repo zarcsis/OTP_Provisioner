@@ -1,4 +1,4 @@
-"""HTTP API tests (SPEC section 8) with fastapi's TestClient and httpx.ASGITransport.
+"""HTTP API tests (SPEC section 8) with fastapi's TestClient and httpx2.ASGITransport.
 
 The module registry is real (ModuleService on the in-memory store of ``tests/memstore.py``); Docker,
 the artifacts facade and the Google account are fakes, except in the integration tests, which use the
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from memstore import MemoryStore
@@ -885,8 +885,8 @@ def test_stage_file_raw_dot_dot_paths(env):
     hello(env.client)
 
     async def go():
-        transport = httpx.ASGITransport(app=env.app)
-        async with httpx.AsyncClient(transport=transport, base_url=BASE) as c:
+        transport = httpx2.ASGITransport(app=env.app)
+        async with httpx2.AsyncClient(transport=transport, base_url=BASE) as c:
             out = []
             for url in (f"/api/modules/{SERIAL}/stage/1/files/../../../../../index.html",
                         f"/api/modules/{SERIAL}/stage/1/files/../files/secret.pem",
@@ -994,8 +994,8 @@ def test_job_log_sse_follows_live_job(env):
     job = env.client.post("/api/builds/image").json()["job"]
 
     async def go():
-        transport = httpx.ASGITransport(app=env.app)
-        async with httpx.AsyncClient(transport=transport, base_url=BASE, timeout=20) as c:
+        transport = httpx2.ASGITransport(app=env.app)
+        async with httpx2.AsyncClient(transport=transport, base_url=BASE, timeout=20) as c:
             chunks = []
             async with c.stream("GET", f"/api/jobs/{job['id']}/log") as r:
                 assert r.status_code == 200

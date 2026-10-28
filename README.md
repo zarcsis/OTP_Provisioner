@@ -884,7 +884,7 @@ The suites test the Google code against fakes (no network access); the station i
 Google (sign-in, spreadsheet, settings, registry). `OTP_DOCKER_TESTS=1` enables a smoke test against the real Docker engine. The page runners find
 Chrome via `--chrome`, `$OTP_CHROME`, the default Windows path or `PATH`. The repository has no `.gitignore`
 on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycache__` directories appear.
-`.venv` stays out of git through the `.gitignore` uv writes inside it. The `dev` group (pytest, httpx, PyYAML) is
+`.venv` stays out of git through the `.gitignore` uv writes inside it. The `dev` group (pytest, httpx2, PyYAML) is
 installed only for `--group dev`; a station's `uv run server.py` does not need it.
 
 ## Troubleshooting
