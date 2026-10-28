@@ -1,4 +1,4 @@
-"""Command line: ``python -m otp_server <command>`` (``python server.py`` is ``serve``).
+"""Command line: ``uv run -m otp_server <command>`` (``uv run server.py`` is ``serve``).
 
 Commands::
 
@@ -62,7 +62,7 @@ def _add_serve_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-auto-build", action="store_true", help="do not start missing builds after signing in")
 
 
-def build_parser(prog: str = "python -m otp_server") -> argparse.ArgumentParser:
+def build_parser(prog: str = "uv run -m otp_server") -> argparse.ArgumentParser:
     """The CLI parser (``serve`` is the default command)."""
     parser = argparse.ArgumentParser(prog=prog, description="OTP_Provisioner server and tools")
     parser.add_argument("--version", action="version", version=f"OTP_Provisioner {__version__}")
@@ -98,7 +98,7 @@ def build_parser(prog: str = "python -m otp_server") -> argparse.ArgumentParser:
     return parser
 
 
-def parse_args(argv: Sequence[str] | None = None, *, prog: str = "python -m otp_server") -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None, *, prog: str = "uv run -m otp_server") -> argparse.Namespace:
     """Parse ``argv``; with no command (or only serve options) the command is ``serve``."""
     args_list = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser(prog)
@@ -547,7 +547,7 @@ def cmd_status(ns: argparse.Namespace, cfg) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str = "python -m otp_server") -> int:
+def main(argv: Sequence[str] | None = None, *, prog: str = "uv run -m otp_server") -> int:
     """CLI entry point; returns the process exit code."""
     ns = parse_args(argv, prog=prog)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

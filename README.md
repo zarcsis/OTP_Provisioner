@@ -42,7 +42,10 @@ keyslot 0) and the power-off at the end. The notes on what the first secure run 
 ## Requirements
 
 * **Chrome or Edge** (any Chromium browser with WebUSB). Firefox and Safari have no WebUSB.
-* **Python 3.11+** with the packages from `requirements.txt`.
+* **[uv](https://docs.astral.sh/uv/getting-started/installation/)** (Windows: `winget install --id=astral-sh.uv -e`,
+  Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`). The first `uv run` brings the Python of
+  `.python-version` (3.15; the code needs 3.11+) and the packages pinned in `uv.lock` into `.venv`; nothing is
+  installed into a system Python.
 * **A Google OAuth client** (once per team, about five minutes; operators then only click
   *Sign in with Google*):
   1. [console.cloud.google.com](https://console.cloud.google.com/): create a project.
@@ -78,12 +81,11 @@ keyslot 0) and the power-off at the end. The notes on what the first secure run 
 git clone <this repo> OTP_Provisioner
 cd OTP_Provisioner
 git submodule update --init --recursive
-python -m pip install -r requirements.txt
 # put google-oauth-client.json (Desktop app OAuth client) into the repository root
-python server.py
+uv run server.py
 ```
 
-`python server.py` serves `http://127.0.0.1:8765/` and opens the page in Chrome (Edge if Chrome is missing,
+`uv run server.py` serves `http://127.0.0.1:8765/` and opens the page in Chrome (Edge if Chrome is missing,
 otherwise the default browser; `--browser EXE` picks another one). If an OTP_Provisioner is already running
 on that port, it just opens the page and exits. Options: `--host H`, `--port N`, `--browser EXE`,
 `--no-browser`, `--no-auto-build`, `--work DIR`.
@@ -136,7 +138,7 @@ Build rules worth knowing:
   `<key>-r2`, `-r3`, …; the newest complete version is served and older ones are kept (they are never pruned,
   so disk use grows with forced rebuilds).
 * **One heavy build at a time, across processes.** Gadget and image builds take `<work>/tmp/heavy.lock`.
-  `python -m otp_server build …` started while the server builds waits ("waiting for another image/gadget
+  `uv run -m otp_server build …` started while the server builds waits ("waiting for another image/gadget
   build to finish …") and skips the build if the other process finished it meanwhile.
 * **No-output watchdog.** A streamed `docker build`/`docker run` that prints nothing for `docker.idle_timeout`
   seconds (default 1800; 0 disables it) is stopped: the container (always started as `--name otp-<id>`) is
@@ -217,7 +219,7 @@ worksheet. Open and secure boards get the same settings.
   with the current UTC offset; legacy names such as `Europe/Kiev` live in `tzdata-legacy`, which the image
   does not have), the countries of `wireless-regdb` (`00` = world), named from `iso-codes`, and the layouts
   of `xkb-data`. The server accepts
-  only values from these lists; `python -m otp_server.image_choices` regenerates the file (its docstring
+  only values from these lists; `uv run -m otp_server.image_choices` regenerates the file (its docstring
   has the commands).
 * **Passwords.** The account password is stored only as a SHA-512 crypt hash (`$6$…`, made by the server
   when you save it). The Wi-Fi password is stored as typed (8-63 characters, or a 64-digit hex key; empty =
@@ -374,7 +376,7 @@ configuration (udev, kernel modules, `cmdline.txt`), or another app. Its postins
 the board: no serial number, no network; device-specific setup belongs in the service's start. While it is
 installed, systemd does not run, so units are enabled but not started (as in any image build).
 
-**The demo** (`examples/apps`, built with `python -B examples/apps/build.py`: standard library only, the `.deb`
+**The demo** (`examples/apps`, built with `uv run python -B examples/apps/build.py`: standard library only, the `.deb`
 files land in `<temp>/otp-example-debs`):
 
 * `vn-demo-provider` (system package): a synthetic camera, a bright blob moving over a gradient, 320×240 grey at
@@ -687,7 +689,7 @@ More rules of the secure scenario:
     assumption. A board that refuses both second stages stops stage 1 with the reason (OTP locked to another
     key, or not really in RPIBOOT mode).
 
-  This happened to ebbdf4fd on 2026-10-06. The manual override stays: `python -m otp_server modules mark-locked
+  This happened to ebbdf4fd on 2026-10-06. The manual override stays: `uv run -m otp_server modules mark-locked
   <serial>` records `otp_key_hash = customer_key_hash` and `secure_boot_provisioned = true`, so all later stages
   are served signed; it never generates a key. `modules mark-unlocked <serial>` undoes it. Both also clear the
   assumption. When a server is running both send the change through it (`POST /api/modules/{serial}/otp`).
@@ -742,15 +744,15 @@ Outside `/api`, only `/` (which also receives Google's OAuth redirect), `/css/*`
 ## CLI
 
 ```
-python server.py [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build] [--work DIR]
-python -m otp_server serve  ...                 # same as server.py
-python -m otp_server login                      # sign in to Google from a terminal (opens the browser)
-python -m otp_server build tools|gadget|image [--force]   # run one build, stream its log, exit with its result
-python -m otp_server modules [--json]           # registry table / public JSON (no secrets)
-python -m otp_server modules mark-locked <serial> [--yes]    # record that the board OTP holds our key hash
-python -m otp_server modules mark-unlocked <serial> [--yes]  # undo mark-locked
-python -m otp_server status                     # the /api/status document
-python -m otp_server --version
+uv run server.py [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build] [--work DIR]
+uv run -m otp_server serve  ...                 # same as server.py
+uv run -m otp_server login                      # sign in to Google from a terminal (opens the browser)
+uv run -m otp_server build tools|gadget|image [--force]   # run one build, stream its log, exit with its result
+uv run -m otp_server modules [--json]           # registry table / public JSON (no secrets)
+uv run -m otp_server modules mark-locked <serial> [--yes]    # record that the board OTP holds our key hash
+uv run -m otp_server modules mark-unlocked <serial> [--yes]  # undo mark-locked
+uv run -m otp_server status                     # the /api/status document
+uv run -m otp_server --version
 ```
 
 Every command except `serve` and `status` reads the settings from the spreadsheet, so it needs the Google
@@ -760,7 +762,7 @@ login; without it the command exits with code 2 and says what is missing.
 
 ```
 server.py                  launcher
-requirements.txt
+pyproject.toml, uv.lock    the dependencies and their locked versions (uv); .python-version picks the Python
 google-oauth-client.json   the Desktop-app OAuth client (you add it)
 otp_server/
   __main__.py              CLI; app.py (services, FastAPI app); api.py (routes)
@@ -821,7 +823,7 @@ The rpi-image-gen submodule pins the generator: to move to a newer release run
 `image/rpi-image-gen`. The image set's version is `git describe` of that checkout: once the pointer moves (or
 the checkout gets uncommitted changes, `-dirty`), the published sets are `rebuild needed` and stage 3 waits
 until the images are rebuilt — automatically with `builds.auto`, or with Build on the page /
-`python -m otp_server build image`. The image build tooling (`image/build.sh`, `image/docker/`) came from the
+`uv run -m otp_server build image`. The image build tooling (`image/build.sh`, `image/docker/`) came from the
 droneos repository, which the station no longer uses.
 
 **rpi-fastbootd is deliberately not a submodule.** Its repository contains the systemd unit
@@ -872,16 +874,17 @@ hashes, so apt would otherwise never notice a new or changed helper package).
 ## Testing
 
 ```
-python -m pip install -r requirements.txt
-python -B -m pytest -q                        # server: config, settings, Google account, secrets, storage, modules, jobs, docker, artifacts, OS image config, password hash, API, CLI, the key export script
-python -B tests/web/run_selftest.py           # page: headless Chrome against a fake API (-v for every line)
-python -B tests/web/run_e2e.py                # page + real server on the real artifacts + a mock board, both scenarios
+uv run --group dev python -B -m pytest -q     # server: config, settings, Google account, secrets, storage, modules, jobs, docker, artifacts, OS image config, password hash, API, CLI, the key export script
+uv run python -B tests/web/run_selftest.py    # page: headless Chrome against a fake API (-v for every line)
+uv run python -B tests/web/run_e2e.py         # page + real server on the real artifacts + a mock board, both scenarios
 ```
 
 The suites test the Google code against fakes (no network access); the station itself has run against real
 Google (sign-in, spreadsheet, settings, registry). `OTP_DOCKER_TESTS=1` enables a smoke test against the real Docker engine. The page runners find
 Chrome via `--chrome`, `$OTP_CHROME`, the default Windows path or `PATH`. The repository has no `.gitignore`
 on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycache__` directories appear.
+`.venv` stays out of git through the `.gitignore` uv writes inside it. The `dev` group (pytest, httpx, PyYAML) is
+installed only for `--group dev`; a station's `uv run server.py` does not need it.
 
 ## Troubleshooting
 
@@ -910,7 +913,7 @@ on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycac
   the fastboot gadget are separate devices, so a new board needs the chooser for each.
 * **"… is still being prepared" / HTTP 409 on a stage.** A build is still in progress. The page polls every 3 s
   and links the job log. A failed job shows its error; fix it and click Rebuild, or run
-  `python -m otp_server build <target> --force` to see the whole log in the terminal.
+  `uv run -m otp_server build <target> --force` to see the whole log in the terminal.
 * **Stage 3: "the OTP device key cannot be exported in this boot".** The key exists but was READ-locked before
   the helper ran (for example the gadget was booted without our helper). Run stage 2 again so the gadget boots
   afresh, then stage 3. "this fastboot gadget has no OTP key export helper" means an old gadget: rebuild it.
@@ -944,6 +947,8 @@ on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycac
   Nothing can be provisioned. Restore the registry row that holds its key.
 * **HTTP 403 "Host … is not allowed" / "cross-site POST rejected".** Open the page at `http://127.0.0.1:<port>/`.
 * **Port 8765 in use.** Another program holds it (exit code 2). Use `--port`.
+* **"No module named 'uvicorn'"** (or another package). The server was started by a Python outside uv
+  (`python server.py`), which does not have the packages. Start it with `uv run server.py`.
 * **The board does not show up in RPIBOOT.** Hold the power button while plugging USB-C, and use a different
   cable or port. Close `rpiboot.exe` and other tabs.
 

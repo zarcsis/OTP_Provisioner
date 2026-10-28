@@ -507,12 +507,12 @@ def test_server_py_help():
     for flag in ("--work", "--host", "--port", "--browser", "--no-browser", "--no-auto-build"):
         assert flag in cp.stdout
     assert "--config" not in cp.stdout
-    assert "python server.py" in cp.stdout
+    assert "uv run server.py" in cp.stdout
 
 
 def test_server_py_rejects_other_commands():
     cp = _run(["server.py", "status"])
-    assert cp.returncode != 0 and "python -m otp_server" in cp.stderr
+    assert cp.returncode != 0 and "uv run -m otp_server" in cp.stderr
 
 
 def test_module_help_and_version():
@@ -907,7 +907,7 @@ def test_cmd_login_failures(gcli, monkeypatch, capsys):
     _write_client(gcli)
 
     def fails(self, **kw):
-        raise StoreError("no answer from the browser within 300 s; run 'python -m otp_server login' again")
+        raise StoreError("no answer from the browser within 300 s; run 'uv run -m otp_server login' again")
 
     monkeypatch.setattr(GoogleAccount, "login_interactive", fails)
     assert cli.main(["login", *gcli.argv]) == 1
@@ -934,7 +934,7 @@ def test_cmd_login_failures(gcli, monkeypatch, capsys):
 
 def test_server_py_rejects_login():
     cp = _run(["server.py", "login"])
-    assert cp.returncode != 0 and "python -m otp_server" in cp.stderr
+    assert cp.returncode != 0 and "uv run -m otp_server" in cp.stderr
 
 
 def test_module_help_lists_new_commands():

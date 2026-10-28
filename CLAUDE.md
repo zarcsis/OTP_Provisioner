@@ -72,7 +72,7 @@ Design decisions that were the owner's and should not be re-litigated:
 * **The open scenario will not exist in the future**; the server will run on another machine; a client
   must only ever receive ciphertext. The secure scenario is the real product, open is a convenience.
 * **No `.gitignore`**, so run Python with `-B` and never leave `__pycache__`, `.pytest_cache` or
-  scratch files in the tree. `google-oauth-client.json` is committed on purpose (Desktop-app client
+  scratch files in the tree (`.venv` is the exception: uv writes a `.gitignore` of its own into it). `google-oauth-client.json` is committed on purpose (Desktop-app client
   secrets are not confidential per Google; the owner allowed it through push protection).
 * Code, comments, commit messages and docs are English.
 * **No manual mode.** The page works only with the server; the serverless rpiboot/fastboot tools are gone
@@ -90,7 +90,8 @@ and its C++ test) and 16.4 k lines of tests.
 ## Repository map
 
 ```
-server.py                     launcher (python server.py); python -m otp_server for login/build/modules/status
+server.py                     launcher (uv run server.py); uv run -m otp_server for login/build/modules/status
+pyproject.toml, uv.lock       dependencies for uv (dev group: pytest, httpx, PyYAML); .python-version = 3.15
 otp_server/
   app.py, api.py              FastAPI factory + routes; 401 until Google is signed in and the settings sheet read
   config.py, settings.py      DEFAULTS tree; the settings worksheet (re-read every 15 s; retired keys removed)
@@ -144,15 +145,15 @@ Build artifacts never live in the repo: `%LOCALAPPDATA%\OTP_Provisioner` on Wind
 ## Run and test
 
 ```
-python -m pip install -r requirements.txt
 git submodule update --init --recursive
-python server.py                              # http://127.0.0.1:8765/, opens Chrome; sign in to Google first
-python -B -m otp_server build tools|gadget|image [--force]
-python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
+uv run server.py                              # http://127.0.0.1:8765/, opens Chrome; sign in to Google first
+uv run python -B -m otp_server build tools|gadget|image [--force]
+uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
+uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-python -B -m pytest -q                        # ~1230 tests, ~1 min; needs no Docker, no Google, no hardware
-python -B tests/web/run_selftest.py           # ~630 checks: the page in headless Chrome against a fake API + mock board
-python -B tests/web/run_e2e.py                # ~240 checks: real server + real artifacts + mock board, both scenarios
+uv run --group dev python -B -m pytest -q     # ~1230 tests, ~1 min; needs no Docker, no Google, no hardware
+uv run python -B tests/web/run_selftest.py    # ~630 checks: the page in headless Chrome against a fake API + mock board
+uv run python -B tests/web/run_e2e.py         # ~240 checks: real server + real artifacts + mock board, both scenarios
 ```
 
 * The e2e runner starts its own server (no Google, in-memory registry) but **reuses the default work
@@ -471,8 +472,12 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
 
 ## Conventions
 
-* Python 3.11+, 4-space indent, type hints, docstrings that say why. Everything that touches secrets lives
-  in `secrets_gen.py`/`modules.py`. Run tests with `python -B -m pytest -q -p no:cacheprovider`.
+* Python 3.11+ (uv runs the 3.15 of `.python-version`), 4-space indent, type hints, docstrings that say why.
+  Everything that touches secrets lives in `secrets_gen.py`/`modules.py`. Run tests with
+  `uv run --group dev python -B -m pytest -q` (`pytest.ini` adds `-p no:cacheprovider`).
+* Dependencies live in `pyproject.toml` and `uv.lock` only (no `requirements.txt`): change them with
+  `uv add` / `uv lock` and commit the lock; every command runs through `uv run`, never a bare `python` (a
+  system Python hid that the tests import PyYAML, which `requirements.txt` never listed).
 * JavaScript is plain ES2020 modules on `window.OTP`, no bundler, no dependencies; tests inject fakes
   through constructor arguments (`usb`, `api`, hooks). Node is not installed; syntax errors surface in
   `run_selftest.py`.

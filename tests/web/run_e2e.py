@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test of the whole station without hardware: real server + real page + mock Raspberry Pi 5.
 
-    python -B tests/web/run_e2e.py [--scenario A|B|both] [--recovery-passphrase] [--scratch DIR] [--keep] [--chrome PATH]
+    uv run python -B tests/web/run_e2e.py [--scenario A|B|both] [--recovery-passphrase] [--scratch DIR] [--keep] [--chrome PATH]
 
 For every scenario the runner
   1. starts ITS OWN server: python -B tests/web/e2e_server.py --port <free> --registry <temp dir> -- the real app

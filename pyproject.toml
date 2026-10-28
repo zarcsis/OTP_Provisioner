@@ -1,0 +1,29 @@
+# OTP_Provisioner server. uv (https://docs.astral.sh/uv/) manages the Python (.python-version) and the
+# packages (uv.lock) in .venv:  uv run server.py   (tests: uv run --group dev python -B -m pytest -q)
+[project]
+name = "otp-provisioner"
+version = "0.2.0"
+description = "Raspberry Pi 5 provisioning station: OTP key, signed boot, encrypted OS image"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "cryptography>=42",
+    # Google sign-in + the station spreadsheet (settings and the board registry live in Google Sheets)
+    "gspread>=6.0",
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+# Not a package: nothing is built or installed from the repository itself, server.py runs from the tree.
+package = false
+# A station runs the server only; the tests ask for their group (--group dev).
+default-groups = []

@@ -12,7 +12,7 @@ anything else works.
 * **Login.** The page sends the operator to ``/api/google/login``; the server answers with a redirect to
   Google's consent screen, Google redirects back to ``http://127.0.0.1:<port>/?state=..&code=..`` (a
   loopback redirect, allowed for desktop clients) and the server exchanges the code (PKCE) for a token.
-  ``python -m otp_server login`` does the same from a terminal.
+  ``uv run -m otp_server login`` does the same from a terminal.
 * **What stays on this machine** (``<work>/google/``): ``token.json`` (the OAuth token) and
   ``spreadsheet.json`` (which spreadsheet belongs to which signed-in account). Nothing else.
 * **One spreadsheet per Google account.** Every operator signs in with their own account and works in
@@ -49,7 +49,7 @@ SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 DRIVE_ABOUT_URL = "https://www.googleapis.com/drive/v3/about"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 LOGIN_PATH = "/api/google/login"
-LOGIN_CMD = "python -m otp_server login"
+LOGIN_CMD = "uv run -m otp_server login"
 #: (connect, read) seconds for every Sheets HTTP request; gspread's own default is no timeout at all.
 HTTP_TIMEOUT = (10, 60)
 #: Pending browser logins are forgotten after this many seconds.
@@ -216,7 +216,7 @@ class GoogleAccount:
         try:
             from google_auth_oauthlib.flow import Flow
         except ImportError:
-            raise StoreError("google-auth-oauthlib is not installed (pip install -r requirements.txt)") from None
+            raise StoreError("google-auth-oauthlib is not installed (start the station with uv: uv run server.py)") from None
         flow = Flow.from_client_secrets_file(str(self.client_file), scopes=SCOPES, redirect_uri=redirect_uri,
                                              autogenerate_code_verifier=True)
         url, state = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true")
@@ -246,12 +246,12 @@ class GoogleAccount:
         self.save_credentials(flow.credentials)
 
     def login_interactive(self, *, timeout: float = 300, open_browser: bool = True) -> None:
-        """Terminal login (``python -m otp_server login``): a loopback browser flow, token saved."""
+        """Terminal login (``uv run -m otp_server login``): a loopback browser flow, token saved."""
         self._require_client_file()
         try:
             from google_auth_oauthlib.flow import InstalledAppFlow
         except ImportError:
-            raise StoreError("google-auth-oauthlib is not installed (pip install -r requirements.txt)") from None
+            raise StoreError("google-auth-oauthlib is not installed (start the station with uv: uv run server.py)") from None
         flow = InstalledAppFlow.from_client_secrets_file(str(self.client_file), SCOPES)
         try:
             creds = flow.run_local_server(port=0, timeout_seconds=max(1, int(timeout)), open_browser=open_browser)
@@ -292,7 +292,7 @@ class GoogleAccount:
             from google.auth.transport.requests import Request
             from google.oauth2.credentials import Credentials
         except ImportError:
-            raise StoreError("google-auth is not installed (pip install -r requirements.txt)") from None
+            raise StoreError("google-auth is not installed (start the station with uv: uv run server.py)") from None
         try:
             creds = Credentials.from_authorized_user_file(str(self.token_file), SCOPES)
         except (OSError, ValueError) as exc:
@@ -327,7 +327,7 @@ class GoogleAccount:
             try:
                 import gspread
             except ImportError:
-                raise StoreError("the gspread package is not installed (pip install -r requirements.txt)") from None
+                raise StoreError("the gspread package is not installed (start the station with uv: uv run server.py)") from None
             gc = gspread.authorize(self.credentials())
             hc = getattr(gc, "http_client", None)
             if hc is not None and hasattr(hc, "set_timeout"):

@@ -18,7 +18,7 @@ Regenerate after a Debian update (from the repository root, with Docker)::
         'cd /tmp && apt-get update && apt-get download tzdata wireless-regdb iso-codes xkb-data &&
          for d in *.deb; do dpkg-deb -x $d /out/root; dpkg-deb -f $d Package Version >> /out/versions; done &&
          dpkg-deb -c tzdata_*.deb > /out/tzdata.list'
-    python -m otp_server.image_choices build-choices > otp_server/image_choices.json
+    uv run -m otp_server.image_choices build-choices > otp_server/image_choices.json
 """
 
 from __future__ import annotations

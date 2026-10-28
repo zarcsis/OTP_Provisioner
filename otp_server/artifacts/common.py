@@ -375,7 +375,7 @@ def heavy_lock(work_dir: Path, log_fn: Callable[[str], None] | None = None, poll
     """One heavy (gadget / OS image) build at a time, in this process and across processes.
 
     The in-process :data:`HEAVY_LOCK` is backed by an OS lock on ``<work>/tmp/heavy.lock``, so
-    ``python -m otp_server build ...`` and a running server never build on the same Docker work volume
+    ``uv run -m otp_server build ...`` and a running server never build on the same Docker work volume
     at once. Waiting is logged to ``log_fn``.
     """
     emit = log_fn or (lambda _l: None)

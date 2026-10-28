@@ -340,7 +340,7 @@ def api_router(svc: Any) -> APIRouter:
 
     @r.post("/modules/{serial}/otp")
     def module_otp(serial: str, body: Any = Body(default=None)) -> dict:
-        """Operator override of the recorded OTP lock state (``python -m otp_server modules
+        """Operator override of the recorded OTP lock state (``uv run -m otp_server modules
         mark-locked|mark-unlocked`` sends it here when a server is running, so the change goes through
         this process's store cache instead of being overwritten by it)."""
         b = body_dict(body)

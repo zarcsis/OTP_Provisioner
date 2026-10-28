@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Headless-Chrome runner for the WebUSB page self-test (tests/web/selftest.js), plus page screenshots.
 
-    python tests/web/run_selftest.py                       # run the self-test, print PASS/FAIL lines, exit 0/1
-    python tests/web/run_selftest.py --screenshot out.png --width 1600 --height 1200 [--state idle|demo|demo-fastboot|offline]
-    python tests/web/run_selftest.py --serve               # serve the page + fake API until Ctrl-C
+    uv run tests/web/run_selftest.py                       # run the self-test, print PASS/FAIL lines, exit 0/1
+    uv run tests/web/run_selftest.py --screenshot out.png --width 1600 --height 1200 [--state idle|demo|demo-fastboot|offline]
+    uv run tests/web/run_selftest.py --serve               # serve the page + fake API until Ctrl-C
 
 A stdlib HTTP server serves the repository read-only (GET/HEAD only, no directory listings, nothing outside the
 repo), the self-test page (/__selftest.html = index.html + tests/web/mocks.js + selftest.js, opened with

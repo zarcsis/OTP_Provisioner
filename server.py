@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """OTP_Provisioner launcher.
 
-    python server.py [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build] [--work DIR]
+    uv run server.py [--host H] [--port N] [--browser EXE] [--no-browser] [--no-auto-build] [--work DIR]
 
 Starts the web server on http://127.0.0.1:8765/ (by default), prints the URL and opens the page in
 Chrome (Edge on Windows when Chrome is missing). There is no config file: sign in to Google on the
 page; the settings and the board registry live in the station spreadsheet. Other commands are available
-through ``python -m otp_server`` (login, build, modules, status).
+through ``uv run -m otp_server`` (login, build, modules, status).
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from otp_server.__main__ import main
-except ImportError as exc:  # most likely the requirements are not installed
-    sys.exit(f"ERROR: {exc}\nInstall the requirements first:  python -m pip install -r requirements.txt")
+except ImportError as exc:  # most likely a Python without the locked packages, not the one uv manages
+    sys.exit(f"ERROR: {exc}\nStart the server with uv, which installs them into .venv:  uv run server.py")
 
 
 if __name__ == "__main__":
@@ -32,5 +32,5 @@ if __name__ == "__main__":
     if args and args[0] == "serve":
         args = args[1:]
     if any(a in ("build", "modules", "status", "login") for a in args):
-        sys.exit("server.py only runs the server; use  python -m otp_server build|modules|status|login")
-    sys.exit(main(["serve", *args], prog="python server.py"))
+        sys.exit("server.py only runs the server; use  uv run -m otp_server build|modules|status|login")
+    sys.exit(main(["serve", *args], prog="uv run server.py"))

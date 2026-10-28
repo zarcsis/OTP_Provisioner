@@ -174,7 +174,7 @@ class Artifacts:
             if self.modules.recovery_refused_both(record):
                 raise NotReady(f"board {serial}: its boot ROM refused both the plain and the counter-signed second "
                                "stage. Its OTP is locked to another key, or it was not in RPIBOOT mode (power button "
-                               "held while plugging in). Check the board, then 'python -m otp_server modules "
+                               "held while plugging in). Check the board, then 'uv run -m otp_server modules "
                                f"mark-unlocked {serial}' (or mark-locked) to try again")
             # A lock the station only assumes (the board has not reported it yet) changes the second stage only:
             # stages 2 and 3 still wait for the board's own report.

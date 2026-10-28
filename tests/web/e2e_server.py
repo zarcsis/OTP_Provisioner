@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """OTP_Provisioner server for the end-to-end test (tests/web/run_e2e.py): no Google, in-memory registry.
 
-    python -B tests/web/e2e_server.py --port N [--work DIR] [--registry DIR] [--set provisioning.KEY=VALUE ...]
+    uv run python -B tests/web/e2e_server.py --port N [--work DIR] [--registry DIR] [--set provisioning.KEY=VALUE ...]
 
 Builds the real app with ``create_app(cfg, store=<MemoryStore>, auto_build=False)``: without a Google account
 nothing is gated (``/api/status`` says ``google: null``, ``google_ready: true``) and no build is started by the

@@ -7,7 +7,7 @@ build is reproducible (fixed mtime from SOURCE_DATE_EPOCH, sorted members, root:
 Windows checkout: text files lose their CR line endings, and a file starting with "#!" (or a maintainer
 script) gets mode 0755, every other file 0644.
 
-    python -B examples/apps/build.py [--out DIR] [package-dir ...]
+    uv run python -B examples/apps/build.py [--out DIR] [package-dir ...]
 
 The packages go to DIR, by default <temp>/otp-example-debs (never into the repository: it has no .gitignore).
 """

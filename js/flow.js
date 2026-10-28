@@ -273,7 +273,7 @@
 
         /** Probe a device (ROM / second stage / fastboot gadget) and fetch or create its server record. */
         async attach(u) {
-            if (!this.api || !this.api.available) throw new Error('the server is not reachable: start it with "python server.py" and reload');
+            if (!this.api || !this.api.available) throw new Error('the server is not reachable: start it with "uv run server.py" and reload');
             if (this.running) throw new Error('a provisioning run is in progress');
             this._rejectedFastboot = null;   // an explicit "Connect board" starts a fresh selection
             for (const n of [1, 2, 3]) this._setStage(n, 'idle', '');

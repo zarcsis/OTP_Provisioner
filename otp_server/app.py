@@ -126,7 +126,7 @@ class Services:
             return (f"no Google OAuth client: save the 'Desktop app' client JSON as {self.account.client_file}, "
                     "then sign in on the page")
         if not self.account.has_token():
-            return "sign in to Google first (button on the page, or python -m otp_server login)"
+            return "sign in to Google first (button on the page, or uv run -m otp_server login)"
         return self.settings_error or self.account.last_error or "the settings sheet has not been read yet"
 
     def finish_google_login(self, state: str, code: str, error: str) -> str:

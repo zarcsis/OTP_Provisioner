@@ -421,7 +421,7 @@ def _google_problem(s: dict) -> str:
     if not g.get("client"):
         return f"no Google OAuth client: save the 'Desktop app' client JSON as {g.get('client_file')}, then sign in on the page"
     if not g.get("signed_in"):
-        return "sign in to Google first (button on the page, or python -m otp_server login)"
+        return "sign in to Google first (button on the page, or uv run -m otp_server login)"
     return (s.get("settings") or {}).get("error") or "the settings sheet has not been read yet"
 
 

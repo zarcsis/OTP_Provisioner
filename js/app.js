@@ -1,5 +1,5 @@
 /*
- * app.js — the station UI, served by `python server.py` (nothing works without the server: it holds the
+ * app.js — the station UI, served by `uv run server.py` (nothing works without the server: it holds the
  * board secrets and builds every file).
  *
  *   Board card (Connect board, the server's record of the board), Registry (all boards on the server),
@@ -251,7 +251,7 @@
         for (const r of document.querySelectorAll('#scenario input')) r.disabled = running || (r.value === 'open' && !!(flow.module && flow.module.mode_locked));
         let hint = '';
         if (checking()) hint = 'checking the server…';
-        else if (!online) hint = 'server offline: start it with "python server.py"';
+        else if (!online) hint = 'server offline: start it with "uv run server.py"';
         else if (!googleReady()) hint = 'sign in to Google first';
         else if (!flow.module) hint = 'connect a board first';
         else if (running) hint = `provisioning ${flow.serial}…`;
@@ -308,7 +308,7 @@
         if (!m) {
             box.replaceChildren(el('p', { class: 'muted' }, checking() ? 'Checking the server…' : api.available
                 ? 'No board connected. Put the board into RPIBOOT mode (hold the power button while connecting USB-C) and click Connect board.'
-                : 'The server is not reachable, so boards cannot be provisioned from here. Start it with "python server.py" and reload.'));
+                : 'The server is not reachable, so boards cannot be provisioned from here. Start it with "uv run server.py" and reload.'));
             return;
         }
         const live = flow.module && flow.module.serial === m.serial;
@@ -1065,7 +1065,7 @@
             return;
         }
         if (!s) {
-            box.replaceChildren(badge('Server offline', 'err', location.protocol === 'file:' ? 'Opened from file:// — start "python server.py" and open http://127.0.0.1:8765/' : 'The server did not answer /api/status'));
+            box.replaceChildren(badge('Server offline', 'err', location.protocol === 'file:' ? 'Opened from file:// — start "uv run server.py" and open http://127.0.0.1:8765/' : 'The server did not answer /api/status'));
             $('#registry-backend').textContent = '';
             return;
         }
@@ -1303,8 +1303,8 @@
             if (googleReady()) await refreshModules();
         } else {
             log('warn', location.protocol === 'file:'
-                ? 'Opened from file://: there is no server. Run "python server.py" and open http://127.0.0.1:8765/.'
-                : 'The server did not answer: start it with "python server.py" and reload the page.');
+                ? 'Opened from file://: there is no server. Run "uv run server.py" and open http://127.0.0.1:8765/.'
+                : 'The server did not answer: start it with "uv run server.py" and reload the page.');
         }
         updateButtons();
         schedulePoll();
