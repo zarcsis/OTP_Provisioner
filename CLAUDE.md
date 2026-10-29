@@ -42,10 +42,18 @@ Imager file of a custom secure image (the owner's bookworm drone image) booted o
 `lock_device_private_key=1`, the initramfs keyscript unlocking the root through the firmware HMAC. Stage 3
 (fastboot) from a custom image and the open custom set are verified with Docker and the test suites only.
 
+**Status (2026-10-28):** the sandboxed apps ran on a second Pi 5 (board `2a03e58f`, open scenario, stages 1-3
+on the updated usbboot, gadget and rpi-image-gen v2.9.0 image): the demo detector in its rootful podman
+container (UID range of slot 1, `Network=none`, AppArmor enforce, cgroup limits), the provider receiving 25
+detections per 5 s with 0.0 px error through the filtering bus proxy, the sandbox probe 23 PASS / 2 INFO / 0
+FAIL. README "Checking a board" (under "System packages and sandboxed apps") lists every check and its expected
+output. The secure scenario has not been on hardware since these updates (only the suites and the e2e runner
+cover it there).
+
 ## How it was written
 
-Ten commits on `master`, each a working increment, all of it written in Claude Code sessions with the
-owner and checked against a real board between steps:
+A series of working increments on `master`, all of it written in Claude Code sessions with the owner and
+checked against a real board between steps:
 
 1. `init`, `gadgets`: WebUSB rpiboot/fastboot in the browser, driven from local boot directories.
 2. `12400b1` the server-driven flow: FastAPI registry, per-board secrets, Docker-built artifacts, stage
@@ -62,6 +70,11 @@ owner and checked against a real board between steps:
    The custom-image chain was run through the real server and Docker on the owner's `os.img` (Raspberry Pi
    OS bookworm with their drone services); the Imager file of its secure set booted on `ebbdf4fd` once the
    keyscript stopped piping into bookworm's `rpi-fw-crypto` (see "What went wrong").
+8. (2026-10-27/28, branch `sandboxed-apps`, merged as it was) AppArmor on in the station image; system packages
+   and sandboxed apps (server side, then the page); uv for the Python and the dependencies (`.python-version`
+   a minor version); usbboot 2026-10-23 (stage 2 carries the public key), pi-gen-micro main with rpi-fastbootd
+   `adf29cb`, rpi-image-gen v2.9.0 with Raspberry Pi OS 2026-10-06, the bootloader from rpi-eeprom's latest
+   channel, kernel command line additions as linux-base fragments. The apps demo ran on `2a03e58f` (Status).
 
 Design decisions that were the owner's and should not be re-litigated:
 
@@ -151,7 +164,7 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1230 tests, ~1 min; needs no Docker, no Google, no hardware
+uv run --group dev python -B -m pytest -q     # ~1210 tests, ~1.5 min; needs no Docker, no Google, no hardware
 uv run python -B tests/web/run_selftest.py    # ~630 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~240 checks: real server + real artifacts + mock board, both scenarios
 ```
@@ -164,6 +177,13 @@ uv run python -B tests/web/run_e2e.py         # ~240 checks: real server + real 
 * The page runners need Chrome (`--chrome`, `$OTP_CHROME`, the default Windows path or `PATH`).
 * `OTP_DOCKER_TESTS=1` adds a smoke test against the real engine. Two `test_keyexport_script.py` cases
   skip on Windows (POSIX permissions); the first-boot block test runs under Git Bash's `sh`.
+* On Windows the shell-code tests take `sh`/`bash` from `PATH`: put `C:\Program Files\Git\usr\bin` first. Without
+  it the `sh` tests skip and `bash` is WSL's `System32\bash.exe` (it gets neither the env nor the `C:/` paths), so
+  `test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on` fails; Git's `bin\sh.exe` puts Git's tools
+  before the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With
+  `usr\bin` first: 1204 passed, 3 skipped (2026-10-28). A tool shell (Claude Code's PowerShell) often lacks it.
+* An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
+  UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
 * Everything else in the suites is mocks: a fake docker runner that writes plausible outputs, an in-memory
   store, a fake Google account, a mock Pi 5 (`tests/web/mocks.js`: boot ROM, second-stage file server,
   the station's fastbootd with its allowlist). When a new behaviour is added, the mock gets it too.
@@ -360,7 +380,8 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
   image keeps in `/boot/firmware` (the owner's has `auth.ini`, `auth.json`, `custom.toml`, `userconf`): custom
   images are signed in place.
 
-**Sandboxed apps (2026-10-27, prototyped by hand on a Pi 5 with trixie and kernel 6.18, then built into the station)**
+**Sandboxed apps (2026-10-27, prototyped by hand on a Pi 5 with trixie and kernel 6.18, then built into the station;
+run from the station image on `2a03e58f` on 2026-10-28)**
 * **podman creates mount targets inside a `Rootfs=` directory** (`run/.containerenv`, `etc/hosts`, ...). One run
   without the user namespace (options after the path: `podman run --rootfs` takes the first non-option as the
   path) left `run/.containerenv` owned by real root, and every run with `UIDMap` then failed with "open
@@ -387,6 +408,19 @@ Listed roughly in the order they bit. Each one is still guarded by a test or a c
   sized from the root image (+512 MiB), not a fixed 16 GiB.
 * **tarfile stops quietly at a damaged header** after the first member (`next()` returns None): `sanitize` requires
   the two zero blocks of a proper end, so a truncated VM result is refused instead of becoming half a rootfs.
+* **The first board flashed "with the demo" had no apps at all** (2026-10-28, `2a03e58f`): no podman, no `vn*`
+  units, no `cgroup_enable=memory`. The operator had ticked *in the image* and pressed **Rebuild** under Server
+  builds without **Save**: the ticks are a page draft (`pkgs.draft` in `js/app.js`), the row's *in the image* badge
+  shows the draft, and Rebuild force-builds the saved settings (same digest, a `-r2` set). The build log's
+  `otp-image.yaml` (no `apps: otp-apps`, no `packages:`) and empty `image.packages`/`image.apps` in the sheet
+  showed it. Saved, the next build had a new digest and the demo ran. The page was left as it is (owner's call);
+  README says Save first.
+* **`podman ps` on a just-flashed board said "Up About an hour".** A Pi 5 without an RTC battery boots at 1970
+  after a power cut; systemd moved the clock to the image's build time (`/var/lib/systemd/timesync/clock`), the
+  container started at 26 s, NTP jumped the clock ~1 h forward at 35 s. podman keeps the start time it read;
+  `ps -o etimes` is the real age. Later boots start from the time timesyncd last saved (every minute). Not
+  fixed on purpose: nothing in the sandbox needs wall-clock time, and waiting for `time-sync.target` would stall
+  apps on a board without network (a drone in the air); an onboard GPS (gpsd + chrony) is the real fix.
 
 **First boot and the image**
 * **A first boot cut short lost Wi-Fi and SSH for good.** The board was unplugged from the station's USB

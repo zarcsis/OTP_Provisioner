@@ -37,7 +37,9 @@ Status: both scenarios have provisioned a real Pi 5 end to end (stages 1-3, boar
 the open one with Wi-Fi, account and SSH set up at first boot, and the secure one with the signed boot
 chain, the locked OTP, the exported device key, the station-built encrypted root (`oem cryptcheck` →
 keyslot 0) and the power-off at the end. The notes on what the first secure run needed are in CLAUDE.md
-("What went wrong").
+("What went wrong"). The sandboxed apps ran from the station image on a second Pi 5 (board `2a03e58f`, open
+scenario, 2026-10-28): the demo detector in its container, the provider counting its detections, the sandbox
+probe 23 PASS / 0 FAIL (see "Checking a board" under "System packages and sandboxed apps").
 
 ## Requirements
 
@@ -332,7 +334,11 @@ get them.
 digits of its SHA-256 in `<work>/artifacts/packages/`. Tick **in the image** to put it in. For an app, tick the
 **permissions** it gets (those the system packages in the image offer; the ones the package asks for in an
 optional `X-Sandbox-Permissions` control field are marked *requested*, nothing is granted by itself) and set its
-limits (memory, CPUs, tasks); **Sandbox** shows the files the board will get for it. Save.
+limits (memory, CPUs, tasks); **Sandbox** shows the files the board will get for it. **Save** (in the header of
+the OS image panel): the ticks are only a draft until then, although the row says *in the image* at once.
+**Rebuild** under Server builds builds the *saved* settings and ignores the draft: ticking and then rebuilding
+makes the same image again, without the packages (this happened on 2026-10-28, see "Checking a board"). Saving
+a change of packages starts the rebuild by itself (`builds.auto`).
 
 **An app is installed on the station, before the image is built** (a job per app, the `otp-app-builder` image,
 `docker/apps.Dockerfile`; the image build prepares any app that is not prepared yet):
@@ -395,6 +401,36 @@ files land in `<temp>/otp-example-debs`):
 Upload both, put the provider and the detector in the image, grant the detector both permissions, save; the
 image is rebuilt. On a board flashed from it: `journalctl -u vn-demo-provider` shows `vn-demo-detector (uid
 1114112): 25 detections in 5 s, mean error 0.0 px`.
+
+**Checking a build.** The settings sheet has `image.packages = <provider id>` and `image.apps = <detector id>
+slot=1 grant=demo.detections.report,demo.frames.read`. The image job's log prints the generated `otp-image.yaml`:
+it must have `apps: otp-apps` under `layer:`, an `otpapps:` block and the provider under `packages:`, followed by
+`files next to it: apps/apps.list, apps/sandbox.tar`. The config dir of that job,
+`<work>/artifacts/image/cfg/<job>-clear/`, holds `system/<provider>.deb`, `apps/vn-app-<package>.tar` (the app's
+root file system, owners inside its slot's range), `apps/apps.list` and `apps/sandbox.tar` (the quadlet, the
+bus proxy unit, the AppArmor profile, `registry.json`, sysusers and tmpfiles). The packages are part of the set's
+digest, so a set with them has a new name: the demo's went from `trixie-arm64-clear-v2.9.0-94cf9a12` to
+`…-98769f76`. The old name (or a `-r<N>` of it) means a set built without them.
+
+**Checking a board** (over SSH; `sudo` for the lines that need root). What the demo board `2a03e58f` showed on
+2026-10-28, which is what a good board shows:
+
+| Check | Expected |
+| --- | --- |
+| `systemctl list-units --all 'vn*'`, `systemctl --failed` | `vn-demo-provider`, `vn-app-vn-demo-detector`, `vn-app-vn-demo-detector-bus` active (running), `vnapps.slice` active; nothing failed |
+| `tr ' ' '\n' < /proc/cmdline \| grep cgroup`, `cat /sys/fs/cgroup/cgroup.controllers` | `cgroup_enable=memory` after the firmware's `cgroup_disable=memory`; `memory` among the controllers |
+| `dpkg-query -W vn-demo-provider podman crun xdg-dbus-proxy` | all installed |
+| `journalctl -u vn-demo-provider` | `registry: 1 app(s)`, `frame ring handed out read-only`, then every 5 s `25 detections in 5 s, mean error 0.0 px; … 0 for unknown frames, 0 over the rate limit` |
+| `ps -eo uid,label,args \| awk '$1>=1114112 && $1<=1179647'` | the container's systemd and journald as UID 1114112, `detector.py` as another UID of the range, all `vn-app-vn-demo-detector (enforce)`; `xdg-dbus-proxy` as `vnapp1` |
+| `cat /sys/fs/cgroup/vnapps.slice/vn-app-vn-demo-detector.service/{memory.max,cpu.max,pids.max}` | `268435456`, `100000 100000`, `512` (the defaults) |
+| `sudo podman inspect vn-app-vn-demo-detector --format '{{.HostConfig.NetworkMode}} {{.HostConfig.IDMappings.UIDMap}} {{.AppArmorProfile}}'` | `none [0:1114112:65536] vn-app-vn-demo-detector` |
+| `sudo podman exec vn-app-vn-demo-detector systemctl is-system-running` | `running` |
+| `sudo podman exec vn-app-vn-demo-detector journalctl -u vn-demo-detector-probe -o cat` | `probe summary: 23 PASS, 2 INFO, 0 FAIL` (the INFO lines: tmpfs mounts and user namespaces are allowed inside its own namespaces) |
+| `sudo aa-status` | the profile `vn-app-vn-demo-detector` in enforce mode, the container's processes under it |
+
+As user `pi` (group `adm`) the journal, `ps` and the cgroup files can be read without `sudo`; `/run/vn-apps` and
+`/var/lib/vn-apps` cannot be listed (`0711`), as intended. A board with no `vn*` units, no podman and no
+`cgroup_enable=memory` was flashed from an image without the packages: check the build as above.
 
 ## The image file for Raspberry Pi Imager
 
@@ -892,6 +928,12 @@ on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycac
 `.venv` stays out of git through the `.gitignore` uv writes inside it. The `dev` group (pytest, httpx2, PyYAML) is
 installed only for `--group dev`; a station's `uv run server.py` does not need it.
 
+On Windows, some tests run shell code with the `sh` and `bash` found on `PATH`. Put Git's Unix tools first
+(PowerShell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`): without them the `sh` tests are skipped
+and `bash` is WSL's launcher (`C:\Windows\System32\bash.exe`), which fails the kernel command line test with
+`/bin/bash: line 4: : No such file or directory`. `C:\Program Files\Git\bin` is not the same: its `sh.exe` puts
+Git's own tools before the test's stubs. With `usr\bin` first: 1204 passed, 3 skipped (2026-10-28).
+
 ## Troubleshooting
 
 * **"No Google OAuth client".** Save the Desktop-app client JSON as `google-oauth-client.json` in the repository
@@ -955,6 +997,18 @@ installed only for `--group dev`; a station's `uv run server.py` does not need i
 * **Port 8765 in use.** Another program holds it (exit code 2). Use `--port`.
 * **"No module named 'uvicorn'"** (or another package). The server was started by a Python outside uv
   (`python server.py`), which does not have the packages. Start it with `uv run server.py`.
+* **`did not find executable at '…\uv\python\cpython-3.15.1-…\python.exe'`.** The `.venv` was made when
+  `.python-version` named an exact patch release, and uv has since removed that release. Delete `.venv`; the next
+  `uv run` makes it again on the newest 3.15 (it then follows uv's patch upgrades by itself).
+* **A board flashed after adding packages has none of them** (no `vn*` units, no podman). The image it got was
+  built without them: most often the ticks were not saved before a Rebuild. See "Checking a build" and "Checking a
+  board" under "System packages and sandboxed apps"; save, wait for the rebuild, run stage 3 again.
+* **`podman ps` on a freshly flashed board says the app has been up for an hour.** The board's clock jumped. A
+  Pi 5 without an RTC battery starts at 1970 after a power cut; systemd-timesyncd moves the clock up to the
+  timestamp of `/var/lib/systemd/timesync/clock` (on the first boot that is the image's build time, later the last
+  time it was saved, at most a minute before the power went), and NTP corrects it once the network is up. A
+  container started before that keeps the earlier start time; `ps -o etimes` shows the real age. Only the time
+  stamps are wrong; the apps do not depend on wall-clock time.
 * **The board does not show up in RPIBOOT.** Hold the power button while plugging USB-C, and use a different
   cable or port. Close `rpiboot.exe` and other tabs.
 
