@@ -75,7 +75,7 @@ def _module(serial: str, stage: str, label: str, updated: str, *, locked: bool =
         "secrets": {"rsa_key": True, "customer_key_hash": khash,
                     "device_secret": True, "rsa_key_fingerprint": "4be1c3f0a9d2e87b61c05f3a2d9e4b7c8a1f0e3d2c5b6a79"},
         "otp": {"customer_key_hash": khash if locked else "", "locked": locked, "locked_to_our_key": locked,
-                "secure_boot_provisioned": locked, "device_key": device_key,
+                "secure_boot_provisioned": locked, "jtag_locked": False, "device_key": device_key,
                 "device_key_fingerprint": "9c0d7e21f4a3b58c6d2e1f0a9b8c7d6e" if device_key else "",
                 "device_key_exported": exported},
         "metadata": {}, "facts": {"fastboot": {"mmc-cid": "035344534333324780b6e2a8d9012d00"}} if exported else {},
@@ -485,7 +485,8 @@ def _manifest(m: dict, n: int) -> dict:
                 "config_txt": "uart_2ndstage=1\nrecovery_reboot=1\n" + ("program_pubkey=1\n" if program else ""),
                 "irreversible": [{"key": "program_pubkey", "value": "1", "why": "burns the key hash into OTP"}] if program else [],
                 "expect": {"secure_boot_provision": program,
-                           "customer_key_hash": m["secrets"]["customer_key_hash"] if program else None},
+                           "customer_key_hash": m["secrets"]["customer_key_hash"] if program else None,
+                           "jtag_lock": False},
                 "notes": []}
     if n == 2:
         return {"stage": 2, "kind": "rpiboot", "title": "Fastboot gadget", "ready": True,

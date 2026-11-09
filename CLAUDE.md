@@ -180,8 +180,8 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1255 tests, ~1.5 min; needs no Docker, no Google, no hardware
-uv run python -B tests/web/run_selftest.py    # ~640 checks: the page in headless Chrome against a fake API + mock board
+uv run --group dev python -B -m pytest -q     # ~1258 tests, ~1.5 min; needs no Docker, no Google, no hardware
+uv run python -B tests/web/run_selftest.py    # ~650 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
 
@@ -200,7 +200,7 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
   it the `sh` tests skip and `bash` is WSL's `System32\bash.exe` (it gets neither the env nor the `C:/` paths), so
   `test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on` fails; Git's `bin\sh.exe` puts Git's tools
   before the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With
-  `usr\bin` first: 1252 passed, 3 skipped (2026-11-09). A tool shell (Claude Code's PowerShell) often lacks it.
+  `usr\bin` first: 1255 passed, 3 skipped (2026-11-09). A tool shell (Claude Code's PowerShell) often lacks it.
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
 * Everything else in the suites is mocks: a fake docker runner that writes plausible outputs, an in-memory
@@ -294,7 +294,9 @@ through the page once (secure, first run) and that is the accepted weak point of
   `device_secret` (32 random bytes) rooting the optional recovery passphrase.
 * **Stage 1** (`stage1.sh`, official `update-pieeprom.sh`): signed `boot.conf` + embedded public key in
   `pieeprom.bin`, `program_pubkey=1` in `config.txt` for a board not yet locked. The board reports
-  `CUSTOMER_KEY_HASH`; the verdict requires it to equal ours.
+  `CUSTOMER_KEY_HASH`; the verdict requires it to equal ours. With `provisioning.jtag_lock`, `program_jtag_lock=1`
+  too (`expect.jtag_lock`), and the verdict requires `JTAG_LOCKED=1`; a board that reported it is
+  `facts.jtag_locked` for good and is not sent the line again.
 * **The two second stages.** The BCM2712 ROM runs the plain `recovery.bin` only while OTP holds no key
   hash, and the counter-signed one only once it holds ours; the wrong one it accepts with status 0 and
   then silently keeps (usbboot `secure-boot-recovery5/README.md`). `Stage1Plan.sign_recovery` follows the

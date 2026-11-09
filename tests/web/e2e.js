@@ -85,6 +85,7 @@
                 ['CUSTOMER_KEY_HASH', this.o.program ? this.o.keyHash : '0'.repeat(64)],
             ];
             if (this.o.program) md.push(['SECURE_BOOT_PROVISION', 'success']);
+            md.push(['JTAG_LOCKED', '0']);              // the e2e server runs without provisioning.jtag_lock
             md.push(['EEPROM_UPDATE', 'success']);
             return md.map(([k, v]) => ({ cmd: 0, name: `*${k}*${v}` }));
         }

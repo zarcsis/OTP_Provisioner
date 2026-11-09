@@ -333,6 +333,7 @@
                 kv('Device secret', sec.device_secret ? '✓ stored' : '—'),
                 kv('OTP', otpText, otp.locked && !otp.locked_to_our_key ? 'bad' : ''),
                 kv('Secure boot', otp.secure_boot_provisioned ? 'provisioned' : 'not provisioned'),
+                kv('JTAG', otp.jtag_locked ? 'VideoCore JTAG locked (permanent)' : 'not locked'),
                 kv('Device key', otp.device_key ? el('span', { title: otp.device_key_fingerprint || '' }, 'ECDSA ✓ ' + shortHex(otp.device_key_fingerprint, 16) + (otp.device_key_exported ? ' · private key on the server' : '')) : '—', 'mono'),
                 kv('DUID', m.duid, 'mono'),
                 kv('MAC', m.mac, 'mono'),

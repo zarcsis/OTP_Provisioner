@@ -152,7 +152,7 @@ def test_signed_passes_expect_ckh_from_the_key(make_env, how):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed"
-    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh, "otp_key_hash": None}
+    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh, "otp_key_hash": None, "jtag_lock": False}
     (run,) = env.docker.runs
     assert run["env"]["EXPECT_CKH"] == ckh and customer_key_hash(run["public_pem"]) == ckh
     assert run["env"]["MODE"] == "signed" and run["env"]["SIGN_RECOVERY"] == "0"
@@ -359,7 +359,7 @@ def test_open_plan_is_unsigned_and_ignores_the_board_key(make_env):
     assert plan.signed is False and plan.customer_key_hash == ""
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "unsigned"
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": None}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": None, "jtag_lock": False}
     (run,) = env.docker.runs
     assert "/keys" not in run["mounts"] and "EXPECT_CKH" not in run["env"]
 
@@ -374,7 +374,7 @@ def test_board_locked_to_our_key_gets_a_signed_stage1(make_env):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed" and m["irreversible"] == []
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": ckh}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": ckh, "jtag_lock": False}
     assert m["notes"][0] == "board OTP is already locked to our key: signed EEPROM and counter-signed recovery"
     assert "program_pubkey" not in m["config_txt"]
     (run,) = env.docker.runs

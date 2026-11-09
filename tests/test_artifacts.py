@@ -455,7 +455,7 @@ def test_stage1_unsigned_shared_dir(make_env):
     assert [f["name"] for f in m["files"]] == ["bootcode5.bin", "pieeprom.bin", "pieeprom.sig", "config.txt"]
     assert m["config_txt"] == "uart_2ndstage=1\nset_reboot_order=0x3\nrecovery_reboot=1\n"
     assert m["irreversible"] == [] and m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,
-                                                       "otp_key_hash": None}
+                                                       "otp_key_hash": None, "jtag_lock": False}
     assert m["source"]["pieeprom"] == "pieeprom-2026-09-25.bin"
     f0 = m["files"][0]
     assert f0["url"] == f"http://127.0.0.1:8765/api/modules/{SERIAL}/stage/1/files/bootcode5.bin"
@@ -497,7 +497,7 @@ def test_stage1_signed_secure_scenario(make_env):
     assert [i["key"] for i in m["irreversible"]] == ["program_pubkey", "program_jtag_lock"]
     assert "OTP" in m["irreversible"][0]["why"]
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
-                           "otp_key_hash": None}
+                           "otp_key_hash": None, "jtag_lock": True}
     r = env.docker.runs_of("stage1.sh")[0]
     assert base_env(r) == {"MODE": "signed", "CHANNEL": "latest", "SIGN_RECOVERY": "0"}
     assert r["env"]["EXPECT_CKH"] == rec["customer_key_hash"]
@@ -519,7 +519,7 @@ def test_stage1_default_mode_and_per_board_choice(make_env):
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "signed" and "program_pubkey=1" in m["config_txt"]
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
-                           "otp_key_hash": None}
+                           "otp_key_hash": None, "jtag_lock": False}
     env.board(SERIAL2, mode="open")                       # the operator's choice wins over the default
     m2 = env.arts.stage_manifest(SERIAL2, 1)
     assert m2["mode"] == "unsigned" and m2["irreversible"] == [] and "program_pubkey=1" not in m2["config_txt"]
@@ -550,7 +550,7 @@ def test_stage1_locked_to_our_key(make_env, chosen):
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "signed" and m["config_txt"] == config_txt(False, False) and m["irreversible"] == []
     assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,
-                           "otp_key_hash": rec["customer_key_hash"]}      # the board must report our hash
+                           "otp_key_hash": rec["customer_key_hash"], "jtag_lock": False}  # the board must report our hash
     assert base_env(env.docker.runs_of("stage1.sh")[0]) == {"MODE": "signed", "CHANNEL": "latest",
                                                              "SIGN_RECOVERY": "1"}
     assert "counter-signed" in m["files"][0]["origin"]
@@ -569,7 +569,7 @@ def test_stage1_after_an_interrupted_secure_run_assumes_the_lock(make_env):
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["recovery"] == "countersigned" and m["mode"] == "signed" and m["irreversible"] == []
     assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,   # no second program_pubkey
-                           "otp_key_hash": env.store.get(SERIAL)["customer_key_hash"]}
+                           "otp_key_hash": env.store.get(SERIAL)["customer_key_hash"], "jtag_lock": False}
     assert any("probably holds our key hash" in n for n in m["notes"])
     assert base_env(env.docker.runs_of("stage1.sh")[-1])["SIGN_RECOVERY"] == "1"
     # stages 2 and 3 still wait for the board's own report
@@ -595,8 +595,24 @@ def test_stage1_jtag_lock_follows_the_scenario(make_env):
     m2 = env.arts.stage_manifest(SERIAL2, 1)
     assert m2["mode"] == "signed" and m2["config_txt"] == config_txt(False, True)
     assert [i["key"] for i in m2["irreversible"]] == ["program_jtag_lock"]
-    assert m2["expect"]["secure_boot_provision"] is False
+    assert m2["expect"]["secure_boot_provision"] is False and m2["expect"]["jtag_lock"] is True
     assert not any("jtag_lock only applies" in n for n in m2["notes"])
+
+
+def test_stage1_jtag_lock_is_not_sent_twice(make_env):
+    env = make_env(provisioning={"jtag_lock": True})
+    env.board(mode="secure", lock="ours")
+    env.modules.record_result(SERIAL, 1, {"ok": True, "metadata": {
+        "EEPROM_UPDATE": "success", "CUSTOMER_KEY_HASH": env.store.get(SERIAL)["customer_key_hash"],
+        "JTAG_LOCKED": "1"}, "files_served": [], "expect": {"jtag_lock": True}})
+    assert env.modules.jtag_locked(env.store.get(SERIAL))
+    m = env.arts.stage_manifest(SERIAL, 1)                # the board said its JTAG is locked: nothing left to burn
+    assert m["mode"] == "signed" and m["config_txt"] == config_txt(False, False) and m["irreversible"] == []
+    assert m["expect"]["jtag_lock"] is False
+    assert ("VideoCore JTAG is locked already (the board reported JTAG_LOCKED=1): program_jtag_lock is not sent "
+            "again") in m["notes"]
+    env.cfg.provisioning.jtag_lock = False                # without the setting there is nothing to say about it
+    assert not any("JTAG" in n for n in env.arts.stage_manifest(SERIAL, 1)["notes"])
 
 
 def test_stage1_default_channel(make_env):
@@ -888,7 +904,7 @@ def test_secure_board_needs_stage1_before_stages_2_and_3(make_env, how):
     m1 = env.arts.stage_manifest(SERIAL, 1)
     assert m1["mode"] == "signed" and [i["key"] for i in m1["irreversible"]] == ["program_pubkey"]
     assert m1["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
-                            "otp_key_hash": None}
+                            "otp_key_hash": None, "jtag_lock": False}
     # the page reports stage 1 done (OTP locked to our key): stages 2 and 3 are served, signed
     env.report_stage1_locked(SERIAL)
     m2 = env.arts.stage_manifest(SERIAL, 2)

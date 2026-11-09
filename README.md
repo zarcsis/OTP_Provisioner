@@ -780,7 +780,7 @@ What the irreversible operations burn (the page lists each one and asks for the 
 | Operation | When | What it does, forever |
 | --- | --- | --- |
 | `program_pubkey=1` (stage 1 `config.txt`) | secure scenario, board not yet locked | Burns the SHA-256 of this board's RSA public key into OTP. From then on the SoC only runs EEPROM and boot images signed with that key. Lose the key and the board is bricked for this station. |
-| `program_jtag_lock=1` (stage 1) | secure scenario **and** `provisioning.jtag_lock` | Permanently disables VideoCore JTAG. |
+| `program_jtag_lock=1` (stage 1) | secure scenario **and** `provisioning.jtag_lock`, board not reported locked yet | Permanently disables VideoCore JTAG. |
 | device key generation (stage 3: the gadget's export request / `oem fwcrypto init`) | secure scenario, blank key slot | The firmware generates the device-unique ECDSA P-256 key in OTP. It cannot be changed or erased; a copy goes to the station. |
 | `erase:<disk>` (stage 3) | `erase_storage: true` | Wipes the SD card / eMMC / NVMe before IDP writes the partition table. |
 
@@ -791,6 +791,11 @@ More rules of the secure scenario:
 * Stage 1 signs the EEPROM config with the board's RSA key (`SIGNED_BOOT=1`, `ENABLE_SELF_UPDATE=0` added to
   `boot_conf`) and adds `program_pubkey=1`. The verdict requires `SECURE_BOOT_PROVISION=success` and
   `CUSTOMER_KEY_HASH` equal to the stored hash.
+* **JTAG lock.** With `provisioning.jtag_lock` the stage also sends `program_jtag_lock=1` (it only takes on a board
+  whose OTP holds a key hash, so a later secure stage 1 of a locked board can still add it; it can never be taken
+  back). The verdict then requires the board to report `JTAG_LOCKED=1`; a missing or `0` report fails the stage
+  ("run stage 1 again"). Once a board has reported `JTAG_LOCKED=1` the record keeps it (`facts.jtag_locked`, the
+  board card's **JTAG** line, an `otp` event) and stage 1 does not send `program_jtag_lock=1` to it again.
 * **Key-hash check before signing or burning.** The server recomputes `customer_key_hash` from the record's
   RSA key. If the stored hash differs, or the record has a hash but lost its PEMs, stage 1 is refused with 409
   ("the board record's customer_key_hash X does not match its RSA key … fix the record in storage first").
@@ -1027,7 +1032,7 @@ On Windows, some tests run shell code with the `sh` and `bash` found on `PATH`. 
 (PowerShell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`): without them the `sh` tests are skipped
 and `bash` is WSL's launcher (`C:\Windows\System32\bash.exe`), which fails the kernel command line test with
 `/bin/bash: line 4: : No such file or directory`. `C:\Program Files\Git\bin` is not the same: its `sh.exe` puts
-Git's own tools before the test's stubs. With `usr\bin` first: 1252 passed, 3 skipped (2026-11-09).
+Git's own tools before the test's stubs. With `usr\bin` first: 1255 passed, 3 skipped (2026-11-09).
 
 ## Troubleshooting
 

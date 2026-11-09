@@ -600,6 +600,8 @@
                         // program: the recovery burnt the key hash (program_pubkey=1); else the OTP stays blank
                         { cmd: 0, name: '*CUSTOMER_KEY_HASH*' + (this.o.program ? this.o.keyHash : '0'.repeat(64)) },
                         ...(this.o.program ? [{ cmd: 0, name: '*SECURE_BOOT_PROVISION*success' }] : []),
+                        // jtagLock: program_jtag_lock=1 took (it only does on a board whose OTP holds a key hash)
+                        { cmd: 0, name: '*JTAG_LOCKED*' + (this.o.jtagLock && this.o.program ? '1' : '0') },
                         { cmd: 0, name: '*EEPROM_UPDATE*success' },
                         { cmd: 2, name: 'done', after: () => this._reboot(fs) },
                     ],
@@ -673,7 +675,7 @@
                 m = { serial, stage: 'new', stage_label: LABELS.new, mode: this.defaultMode, mode_chosen: '', mode_locked: false,
                     chip: '', board: '', duid: '', mac: '', created: 'now', updated: 'now',
                     secrets: { rsa_key: true, customer_key_hash: 'ab'.repeat(32), device_secret: true, rsa_key_fingerprint: 'cd'.repeat(32) },
-                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, device_key: false, device_key_fingerprint: '', device_key_exported: false },
+                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, jtag_locked: false, device_key: false, device_key_fingerprint: '', device_key_exported: false },
                     metadata: {}, facts: {}, events: [] };
                 this.modules.set(serial, m);
                 return [m, true];
@@ -783,6 +785,9 @@
                 if ((body.metadata || {}).EEPROM_UPDATE !== 'success') { ok = false; notes.push('no EEPROM_UPDATE in metadata'); }
                 const program = !!(body.expect && body.expect.secure_boot_provision);
                 if (program && (body.metadata || {}).CUSTOMER_KEY_HASH !== body.expect.customer_key_hash) { ok = false; notes.push('CUSTOMER_KEY_HASH mismatch'); }
+                // otp_server/modules.py _apply_stage1: program_jtag_lock=1 was sent -> the board must report JTAG_LOCKED=1
+                if (body.expect && body.expect.jtag_lock && (body.metadata || {}).JTAG_LOCKED !== '1') { ok = false; notes.push(`JTAG_LOCKED=${(body.metadata || {}).JTAG_LOCKED || 'missing'} (expected 1)`); }
+                if ((body.metadata || {}).JTAG_LOCKED === '1') m.otp.jtag_locked = true;
                 if ((body.metadata || {}).SECURE_BOOT_PROVISION === 'success' && (body.metadata || {}).CUSTOMER_KEY_HASH) {
                     // OTP writes are permanent: the board is locked from now on (secure scenario only)
                     m.otp.customer_key_hash = body.metadata.CUSTOMER_KEY_HASH;

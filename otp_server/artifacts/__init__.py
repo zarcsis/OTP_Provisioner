@@ -186,7 +186,8 @@ class Artifacts:
             # A lock the station only assumes (the board has not reported it yet) changes the second stage only:
             # stages 2 and 3 still wait for the board's own report.
             assumed = not ours and self.modules.lock_suspected(record)
-            plan = self.stage1.plan(record, locked_to_ours=ours or assumed, secure=secure)
+            plan = self.stage1.plan(record, locked_to_ours=ours or assumed, secure=secure,
+                                    jtag_locked=self.modules.jtag_locked(record))
             self.stage1.ensure(plan, serial, secrets_fn)
             files = self.stage1.files(plan)
             manifest = self.stage1.manifest(plan, record, files, base_url,

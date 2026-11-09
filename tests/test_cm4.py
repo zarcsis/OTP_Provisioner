@@ -136,7 +136,7 @@ def test_stage1_secure_cm4_burns_the_key_hash(make_env):
     assert m["mode"] == "signed" and m["config_txt"] == "uart_2ndstage=1\nrecovery_reboot=1\nprogram_pubkey=1\n"
     assert [i["key"] for i in m["irreversible"]] == ["program_pubkey"]
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
-                           "otp_key_hash": None}
+                           "otp_key_hash": None, "jtag_lock": False}
     run = env.docker.runs_of("stage1.sh")[-1]
     assert {k: run["env"][k] for k in ("MODE", "CHIP", "SIGN_RECOVERY", "LOCKED")} == {
         "MODE": "signed", "CHIP": "2711", "SIGN_RECOVERY": "0", "LOCKED": "0"}

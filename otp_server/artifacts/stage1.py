@@ -62,6 +62,8 @@ class Stage1Plan:
     family: boards.Family = boards.PI5
     #: Signed without program_pubkey: the board's OTP holds (or is assumed to hold) our key hash already.
     locked: bool = False
+    #: provisioning.jtag_lock is on, but the board reported JTAG_LOCKED=1 before: program_jtag_lock is not sent again.
+    jtag_locked_already: bool = False
 
     @property
     def mode(self) -> str:
@@ -198,8 +200,9 @@ class Stage1Builder:
             raise NotReady(_mismatch(stored, computed))
         return computed, bool(stored)
 
-    def plan(self, record: dict, *, locked_to_ours: bool, secure: bool) -> Stage1Plan:
-        """Decide mode and inputs for a board (see SPEC §10 signing rules); ``secure`` = the board's scenario.
+    def plan(self, record: dict, *, locked_to_ours: bool, secure: bool, jtag_locked: bool = False) -> Stage1Plan:
+        """Decide mode and inputs for a board (see SPEC §10 signing rules); ``secure`` = the board's scenario,
+        ``jtag_locked`` = the board reported ``JTAG_LOCKED=1`` before (nothing left to burn for JTAG).
         The board's family (:func:`otp_server.boards.family_of`) picks the firmware and the second stage."""
         prov = self.cfg.provisioning
         try:
@@ -216,7 +219,7 @@ class Stage1Builder:
         secure = bool(secure)
         signed = secure or locked_to_ours
         program_pubkey = secure and not locked_to_ours
-        jtag = bool(prov.jtag_lock) and secure
+        jtag = bool(prov.jtag_lock) and secure and not jtag_locked
         # A BCM2711 boot ROM runs the plain recovery.bin whatever its OTP holds.
         sign_recovery = locked_to_ours and family.countersigned_recovery
         khash, key_checked = self._key_hash(record) if signed else ("", False)
@@ -235,7 +238,8 @@ class Stage1Builder:
                           sign_recovery=sign_recovery, channel=channel, pieeprom=pie, recovery=rec,
                           boot_conf=boot_conf, config_txt=cfgtxt, customer_key_hash=khash,
                           key_checked=key_checked, warnings=warnings, family=family,
-                          locked=signed and not program_pubkey)
+                          locked=signed and not program_pubkey,
+                          jtag_locked_already=bool(prov.jtag_lock) and secure and jtag_locked)
         plan.fp = fingerprint("stage1", family.soc, plan.mode, channel, pie.name, self.hashes.sha256(pie),
                               self.hashes.sha256(rec), self._eeprom_tools_hash(),
                               boot_conf, cfgtxt, sign_recovery, khash if signed else None,
@@ -398,6 +402,9 @@ class Stage1Builder:
                             else "the board's report settles it (if its OTP holds no key hash, the next run burns it)"))
         else:
             notes.append(f"board OTP is already locked to our key: signed EEPROM and {recovery}")
+        if plan.jtag_locked_already:
+            notes.append("VideoCore JTAG is locked already (the board reported JTAG_LOCKED=1): program_jtag_lock is "
+                         "not sent again")
         if not fam.reboot_order:
             notes.append("the board comes back in RPIBOOT mode for stage 2 because its nRPIBOOT jumper stays fitted "
                          "until stage 3 is done")
@@ -418,7 +425,9 @@ class Stage1Builder:
             "expect": {"secure_boot_provision": plan.program_pubkey,
                        "customer_key_hash": plan.customer_key_hash if plan.program_pubkey else None,
                        # signed for a board whose OTP holds (or is assumed to hold) our key hash: it must say so
-                       "otp_key_hash": plan.customer_key_hash if plan.locked else None},
+                       "otp_key_hash": plan.customer_key_hash if plan.locked else None,
+                       # program_jtag_lock=1 was sent: the board must report JTAG_LOCKED=1
+                       "jtag_lock": plan.jtag_lock},
             "notes": notes,
             "source": {"channel": plan.channel, "pieeprom": plan.pieeprom.name, "firmware": f"firmware-{fam.soc}"},
         }

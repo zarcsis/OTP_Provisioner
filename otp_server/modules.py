@@ -85,6 +85,17 @@ def _clean_text(v: Any, limit: int = 4096) -> str:
     return s.replace("\x00", "").strip()[:limit]
 
 
+def _otp_flag(v: Any) -> bool | None:
+    """A yes/no OTP field of the recovery's metadata (``JTAG_LOCKED``: ``"0"`` / ``"1"``, read as hex so a padded
+    ``"00000001"`` counts too); None when it is absent or not a number."""
+    s = _clean_text(v, 64).lower()
+    s = s[2:] if s.startswith("0x") else s
+    try:
+        return int(s, 16) != 0
+    except ValueError:
+        return None
+
+
 def _stage_max(a: str, b: str) -> str:
     ia = STAGES.index(a) if a in STAGES else 0
     ib = STAGES.index(b) if b in STAGES else 0
@@ -444,6 +455,11 @@ class ModuleService:
         if md.get("SECURE_BOOT_PROVISION") == "success":
             # OTP writes are permanent: once provisioned, never downgraded by a later report.
             rec["secure_boot_provisioned"] = True
+        jtag_locked = _otp_flag(md.get("JTAG_LOCKED"))
+        if jtag_locked and not rec["facts"].get("jtag_locked"):
+            # Permanent too: kept as a fact, so a later stage 1 does not send program_jtag_lock=1 again.
+            rec["facts"]["jtag_locked"] = True
+            _add_event(rec, "otp", "VideoCore JTAG is locked (the board reported JTAG_LOCKED=1)")
 
         if reported_hash:
             self._resolve_lock(rec)              # the board itself said what its OTP holds
@@ -483,6 +499,13 @@ class ModuleService:
                 ok = False
         elif self.is_locked(rec) and not self.locked_to_our_key(rec):
             notes.append("warning: board OTP is locked to a different key (CUSTOMER_KEY_HASH " f"{rec['otp_key_hash']})")
+        if expect.get("jtag_lock") and not jtag_locked:
+            # program_jtag_lock=1 was sent (it only takes on a board whose OTP holds a key hash): the board must
+            # say the bit is set, or the station would count a JTAG it cannot vouch for as locked.
+            notes.append(f"JTAG_LOCKED={md.get('JTAG_LOCKED') or 'missing'} (expected 1: program_jtag_lock=1 was "
+                         "sent): VideoCore JTAG is not reported locked. Run stage 1 again (it sends "
+                         "program_jtag_lock=1 again); if the board still reports 0, its firmware did not burn it")
+            ok = False
         want_locked = str(expect.get("otp_key_hash") or "").lower()
         if want_locked and reported_hash and reported_hash != want_locked:
             # Signed for a board assumed to hold our key hash (a BCM2711 runs that stage 1 either way): it does not.
@@ -721,6 +744,12 @@ class ModuleService:
         return self.is_locked(record) and bool(ours) and h == ours
 
     @staticmethod
+    def jtag_locked(record: dict) -> bool:
+        """The board reported ``JTAG_LOCKED=1`` in a stage 1 (``facts.jtag_locked``, never cleared: OTP)."""
+        facts = (record or {}).get("facts")
+        return isinstance(facts, dict) and facts.get("jtag_locked") is True
+
+    @staticmethod
     def lock_assumption(record: dict) -> dict:
         """``facts.otp_lock``: ``{"state": "suspected" | "", "why", "at", "rejected": [variant, ...]}`` -- what
         the station assumes about the OTP lock while the board has not reported it (``{}`` when nothing)."""
@@ -775,6 +804,7 @@ class ModuleService:
                 "locked": self.is_locked(r),
                 "locked_to_our_key": self.locked_to_our_key(r),
                 "secure_boot_provisioned": r["secure_boot_provisioned"],
+                "jtag_locked": self.jtag_locked(r),
                 "lock_suspected": self.lock_suspected(r),
                 "lock_note": self.lock_assumption(r).get("why", ""),
                 "device_key": bool(r["device_key_pem"]),

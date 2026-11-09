@@ -1011,6 +1011,40 @@
             eq(api.calls.length, 0, '… before anything is sent to the server');
         }
 
+        // program_jtag_lock=1 (provisioning.jtag_lock): stage 1 counts only when the board reports JTAG_LOCKED=1
+        section = 'flow-jtag';
+        for (const took of [true, false]) {
+            const { files, m1, m2, m3 } = await buildServerFiles();
+            const cfg = enc.encode('uart_2ndstage=1\nset_reboot_order=0x3\nrecovery_reboot=1\nprogram_pubkey=1\nprogram_jtag_lock=1\n');
+            const url = '/api/modules/a7eb274c/stage/1/files/jtag/config.txt';
+            files.set(url, cfg);
+            const m1j = Object.assign({}, m1, {
+                files: [...m1.files.slice(0, 3), { name: 'config.txt', size: cfg.byteLength, sha256: await sha(cfg), url, origin: 'test' }],
+                irreversible: [...m1.irreversible, { key: 'program_jtag_lock', value: '1', why: 'permanently disables VideoCore JTAG' }],
+                expect: Object.assign({}, m1.expect, { jtag_lock: true }),
+            });
+            const api = new T.FakeApi({ files, manifests: { 1: m1j, 2: m2, 3: m3 } });
+            const hub = new T.MockHub();
+            const board = new T.MockBoard(hub, { serial: 'a7eb274c', keyHash: KEYHASH, jtagLock: took });
+            board.powerOnRom();
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'secure' });
+            await flow.connectBoard();
+            const ok = await flow.provision([1]);
+            const tag = took ? 'jtag' : 'jtag not burnt';
+            const b1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
+            eq(ev.confirms[0] && ev.confirms[0].flags.map((f) => f.key).join('|'), 'stage 1: program_pubkey|stage 1: program_jtag_lock', `${tag}: the operator confirms both OTP writes`);
+            eq(b1 && `${b1[3].expect.jtag_lock}:${b1[3].metadata.JTAG_LOCKED}`, `true:${took ? 1 : 0}`, `${tag}: the result carries expect.jtag_lock and the board's JTAG_LOCKED`);
+            if (took) {
+                eq(ok, true, 'jtag: stage 1 accepted');
+                eq(flow.module && flow.module.otp.jtag_locked, true, 'jtag: the record says VideoCore JTAG is locked');
+            } else {
+                eq(`${ok}:${flow.stages[1].state}`, 'false:failed', 'jtag not burnt: stage 1 is not accepted');
+                assert(/JTAG_LOCKED=0/.test(flow.stages[1].detail), 'jtag not burnt: the reason names JTAG_LOCKED', flow.stages[1].detail);
+                eq(flow.module && flow.module.otp.jtag_locked, false, 'jtag not burnt: the record does not say locked');
+            }
+        }
+
         // ================================================================ T10 Flow: failure paths
         section = 'flow-errors';
         {

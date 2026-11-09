@@ -234,6 +234,43 @@ def test_stage1_secure_boot(module_service):
     assert v["ok"] is True and rec["secure_boot_provisioned"] is True
 
 
+JTAG_EVENT = "VideoCore JTAG is locked (the board reported JTAG_LOCKED=1)"
+
+
+def test_stage1_jtag_lock_must_be_reported(module_service):
+    rec, _ = module_service.hello("a7eb274c")
+    ours = rec["customer_key_hash"]
+    expect = {"secure_boot_provision": True, "customer_key_hash": ours, "otp_key_hash": None, "jtag_lock": True}
+    burnt = {"SECURE_BOOT_PROVISION": "success", "CUSTOMER_KEY_HASH": ours}
+    # program_jtag_lock=1 was sent: no report, a 0 or garbage is not a lock
+    for md, shown in ((md_ok(**burnt), "missing"), (md_ok(**burnt, JTAG_LOCKED="0"), "0"),
+                      (md_ok(**burnt, JTAG_LOCKED="yes"), "yes")):
+        rec, v = module_service.record_result("a7eb274c", 1, s1(md, expect=expect))
+        assert v["ok"] is False and any(n.startswith(f"JTAG_LOCKED={shown} (expected 1") for n in v["notes"]), v
+        assert rec["stage"] == "new" and not module_service.jtag_locked(rec)
+        assert module_service.public_view(rec)["otp"]["jtag_locked"] is False
+    assert module_service.locked_to_our_key(rec)          # the key hash took all the same
+    rec, v = module_service.record_result("a7eb274c", 1, s1(md_ok(**burnt, JTAG_LOCKED="1"), expect=expect))
+    assert v == {"ok": True, "notes": []}
+    assert rec["stage"] == "eeprom" and rec["facts"]["jtag_locked"] is True
+    assert module_service.public_view(rec)["otp"]["jtag_locked"] is True
+    assert [e["note"] for e in rec["events"] if e["kind"] == "otp"] == [JTAG_EVENT]
+    # OTP is permanent: a later report of 0 does not unlock it; a padded 1 counts; the event is not repeated
+    for value in ("0", "00000001", "0x1"):
+        rec, v = module_service.record_result("a7eb274c", 1, s1(md_ok(CUSTOMER_KEY_HASH=ours, JTAG_LOCKED=value)))
+        assert v["ok"] is True and module_service.jtag_locked(rec)
+    assert sum(e["kind"] == "otp" for e in rec["events"]) == 1
+
+
+def test_stage1_jtag_reported_without_being_asked_is_recorded(module_service):
+    rec, _ = module_service.hello("a7eb274c")
+    rec, v = module_service.record_result("a7eb274c", 1, s1(md_ok(JTAG_LOCKED="1")))
+    assert v["ok"] is True and module_service.jtag_locked(rec)
+    rec, v = module_service.record_result("a7eb274c", 1, s1(md_ok(JTAG_LOCKED="0")))
+    assert v["ok"] is True and module_service.jtag_locked(rec)
+    assert module_service.public_view({"serial": "cccccccc"})["otp"]["jtag_locked"] is False
+
+
 # ---------------------------------------------------------------------- an OTP lock the board has not reported
 SECURE_SERVED = [{"name": "config.txt", "size": 72}, {"name": "pieeprom.sig", "size": 80},
                  {"name": "pieeprom.bin", "size": 2097152}]
@@ -389,7 +426,8 @@ def test_public_view(module_service):
     assert view["secrets"] == {"rsa_key": True, "customer_key_hash": rec["customer_key_hash"], "device_secret": True,
                                "rsa_key_fingerprint": public_key_fingerprint(rec["rsa_public_pem"])}
     assert view["otp"] == {"customer_key_hash": ZERO_HASH, "locked": False, "locked_to_our_key": False,
-                           "secure_boot_provisioned": False, "lock_suspected": False, "lock_note": "", "device_key": True,
+                           "secure_boot_provisioned": False, "jtag_locked": False, "lock_suspected": False,
+                           "lock_note": "", "device_key": True,
                            "device_key_fingerprint": public_key_fingerprint(EC_PEM),
                            "device_key_exported": False}
     assert view["events"][-1]["kind"] == "device_key"
