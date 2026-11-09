@@ -1,4 +1,4 @@
-# rpi-image-gen config written by OTP_Provisioner: Raspberry Pi OS Lite for the Raspberry Pi 5.
+# rpi-image-gen config written by OTP_Provisioner: Raspberry Pi OS Lite for the Raspberry Pi 5 / CM5 / Pi 500.
 # The same image for every board; stage 3 writes each board's account, SSH, Wi-Fi, host name and
 # time zone to its boot partition as cloud-init files (image.* settings).
 device:
@@ -7,6 +7,7 @@ device:
   user1: "pi"
   user1sudo: "passwd"
   user1groups: "adm,dialout,cdrom,audio,users,video,games,plugdev,input,gpio,spi,i2c,netdev,render"
+  luks2_cipher: "aes-xts-plain64"
 
 image:
   layer: image-rpios
@@ -16,4 +17,5 @@ image:
 
 layer:
   base: otp-rpios-lite
+  kernel: otp-rpios-kernel-2712
   station: otp-rpios-setup

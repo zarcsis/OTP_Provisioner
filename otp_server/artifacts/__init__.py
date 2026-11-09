@@ -7,8 +7,11 @@ available: the gadget and both image variants are built up front.
 
 Signing rules (SPEC §10): a board whose OTP holds another key is refused (NotReady). Stage 1 is signed
 in the secure scenario or when the board is already locked to our key (``program_pubkey=1`` only when
-not locked yet; ``bootcode5.bin`` counter-signed only when locked). Stages 2 and 3 are signed iff the
-board is locked to our key (a locked board only runs signed code).
+not locked yet; on a BCM2712 ``bootcode5.bin`` counter-signed only when locked, a BCM2711's ``bootcode4.bin``
+never). Stages 2 and 3 are signed iff the board is locked to our key (a locked board only runs signed code).
+
+Board families (:mod:`otp_server.boards`): the record's chip picks the stage-1 firmware, the image a board gets
+and its boot.img; a board of no supported family or model is refused at every stage.
 
 File downloads are pinned to the manifest: ``stage_file`` serves the files the last manifest issued for
 that board and stage named (path + sha256), never a re-resolved newer artifact. Superseded artifact
@@ -27,6 +30,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from .. import boards
 from .common import HashCache, NotReady, StageFile, sweep_stale_temp
 from .gadget import GadgetBuilder
 from .image import ImageBuilder
@@ -162,6 +166,9 @@ class Artifacts:
     def _stage(self, serial: str, stage: int, base_url: str) -> tuple[dict, dict[str, Path]]:
         record = self.modules.require(serial)
         serial = str(record.get("serial") or serial)
+        unsupported = boards.unsupported_reason(record)
+        if unsupported:
+            raise NotReady(f"board {serial}: {unsupported}")
         ours = self._board(record)
         secure = self.modules.mode_of(record) == "secure"
         if secure and stage in (2, 3) and not ours:
@@ -171,7 +178,7 @@ class Artifacts:
                            "hash yet: run stage 1 first (signed EEPROM + program_pubkey)")
         secrets_fn = lambda: self.modules.secrets_for(serial)  # noqa: E731
         if stage == 1:
-            if self.modules.recovery_refused_both(record):
+            if self.modules.recovery_refused_both(record) and boards.family_of(record).countersigned_recovery:
                 raise NotReady(f"board {serial}: its boot ROM refused both the plain and the counter-signed second "
                                "stage. Its OTP is locked to another key, or it was not in RPIBOOT mode (power button "
                                "held while plugging in). Check the board, then 'uv run -m otp_server modules "

@@ -1,9 +1,10 @@
 """Stage 1: rpiboot directory that flashes the EEPROM (and, signed, burns the key hash into OTP).
 
-Files served: ``bootcode5.bin`` (rpi-eeprom recovery.bin, counter-signed when the board is already
-locked to our key), ``pieeprom.bin`` + ``pieeprom.sig`` (newest pieeprom of the firmware channel with
-our boot.conf applied, signed with the board key in signed mode) and ``config.txt``. The binaries are
-produced by ``docker/scripts/stage1.sh`` in the tools image.
+Files served: the second stage (rpi-eeprom recovery.bin as ``bootcode5.bin`` for a BCM2712, counter-signed when
+the board is already locked to our key; as ``bootcode4.bin`` for a BCM2711, never counter-signed: its boot ROM only
+checks Raspberry Pi's signature), ``pieeprom.bin`` + ``pieeprom.sig`` (newest pieeprom of the firmware channel of
+the board's SoC with our boot.conf applied, signed with the board key in signed mode) and ``config.txt``. The
+binaries are produced by ``docker/scripts/stage1.sh`` in the tools image.
 """
 from __future__ import annotations
 
@@ -12,14 +13,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import boards
 from ..docker import Mount
 from ..secrets_gen import customer_key_hash
 from .common import (NotReady, StageFile, TempKeys, commit_partial, content_hash, file_url, fingerprint,
                      fresh_partial, is_complete, read_json, require_quick_build, sha256_file, write_text)
 
-PIEEPROM_SIZE = 2 * 1024 * 1024
+#: The BCM2712 EEPROM image size (:attr:`otp_server.boards.Family.pieeprom_size` has every family's).
+PIEEPROM_SIZE = boards.PI5.pieeprom_size
 _PIEEPROM_RE = re.compile(r"^pieeprom-(\d{4}-\d{2}-\d{2})\.bin$")
-OUTPUTS = ("bootcode5.bin", "pieeprom.bin", "pieeprom.sig", "config.txt")
+#: What stage1.sh leaves besides the second stage (named by the family).
+FILES = ("pieeprom.bin", "pieeprom.sig", "config.txt")
+
+
+def outputs(family: boards.Family) -> tuple[str, ...]:
+    """Every file of a complete stage-1 directory of ``family``."""
+    return (family.second_stage, *FILES)
 
 WHY_PUBKEY = ("burns sha256 of this board's public key into OTP: the SoC will only run firmware signed with "
               "this key, forever")
@@ -50,15 +59,24 @@ class Stage1Plan:
     # checks it against the key from secrets_fn before anything is served.
     key_checked: bool = False
     warnings: list[str] = field(default_factory=list)
+    family: boards.Family = boards.PI5
+    #: Signed without program_pubkey: the board's OTP holds (or is assumed to hold) our key hash already.
+    locked: bool = False
 
     @property
     def mode(self) -> str:
         return "signed" if self.signed else "unsigned"
 
+    @property
+    def second_stage(self) -> str:
+        """The file name the boot ROM asks for (``bootcode5.bin`` / ``bootcode4.bin``)."""
+        return self.family.second_stage
 
-def config_txt(program_pubkey: bool, jtag_lock: bool) -> str:
-    """Stage-1 config.txt (SPEC §10.2 order)."""
-    lines = ["uart_2ndstage=1", "set_reboot_order=0x3", "recovery_reboot=1"]
+
+def config_txt(program_pubkey: bool, jtag_lock: bool, family: boards.Family = boards.PI5) -> str:
+    """Stage-1 config.txt (SPEC §10.2 order). ``set_reboot_order=0x3`` brings a BCM2712 back into RPIBOOT after
+    the update; a CM4 comes back by itself (its nRPIBOOT jumper is fitted)."""
+    lines = ["uart_2ndstage=1"] + (["set_reboot_order=0x3"] if family.reboot_order else []) + ["recovery_reboot=1"]
     if program_pubkey:
         lines.append("program_pubkey=1")
     if jtag_lock:
@@ -126,13 +144,13 @@ def unsigned_boot_conf(boot_conf: str) -> tuple[str, list[str]]:
     return "\n".join(kept), removed
 
 
-def newest_pieeprom(channel_dir: Path) -> Path | None:
+def newest_pieeprom(channel_dir: Path, size: int = PIEEPROM_SIZE) -> Path | None:
     best: tuple[str, Path] | None = None
     if not channel_dir.is_dir():
         return None
     for p in channel_dir.iterdir():
         m = _PIEEPROM_RE.match(p.name)
-        if m and p.is_file() and p.stat().st_size == PIEEPROM_SIZE:
+        if m and p.is_file() and p.stat().st_size == size:
             if best is None or m.group(1) > best[0]:
                 best = (m.group(1), p)
     return best[1] if best else None
@@ -148,8 +166,9 @@ class Stage1Builder:
         self.tools = tools
         self.hashes = hashes
 
-    def channel_dir(self, channel: str) -> Path:
-        return Path(self.cfg.repo_root) / "external" / "usbboot" / "rpi-eeprom" / "firmware-2712" / channel
+    def channel_dir(self, channel: str, family: boards.Family = boards.PI5) -> Path:
+        return (Path(self.cfg.repo_root) / "external" / "usbboot" / "rpi-eeprom" / f"firmware-{family.soc}"
+                / channel)
 
     def _eeprom_tools_hash(self) -> str:
         """Content hash of the rpi-eeprom / usbboot tools stage1.sh runs (they shape the EEPROM image)."""
@@ -180,20 +199,26 @@ class Stage1Builder:
         return computed, bool(stored)
 
     def plan(self, record: dict, *, locked_to_ours: bool, secure: bool) -> Stage1Plan:
-        """Decide mode and inputs for a board (see SPEC §10 signing rules); ``secure`` = the board's scenario."""
+        """Decide mode and inputs for a board (see SPEC §10 signing rules); ``secure`` = the board's scenario.
+        The board's family (:func:`otp_server.boards.family_of`) picks the firmware and the second stage."""
         prov = self.cfg.provisioning
+        try:
+            family = boards.family_of(record)
+        except ValueError as exc:
+            raise NotReady(str(exc)) from None
         channel = prov.firmware_channel
-        cdir = self.channel_dir(channel)
-        pie = newest_pieeprom(cdir)
+        cdir = self.channel_dir(channel, family)
+        pie = newest_pieeprom(cdir, family.pieeprom_size)
         rec = cdir / "recovery.bin"
         if pie is None or not rec.is_file():
-            raise NotReady(f"rpi-eeprom firmware-2712/{channel} has no pieeprom-*.bin / recovery.bin "
+            raise NotReady(f"rpi-eeprom firmware-{family.soc}/{channel} has no pieeprom-*.bin / recovery.bin "
                            f"(is the external/usbboot submodule checked out with rpi-eeprom?)")
         secure = bool(secure)
         signed = secure or locked_to_ours
         program_pubkey = secure and not locked_to_ours
         jtag = bool(prov.jtag_lock) and secure
-        sign_recovery = locked_to_ours
+        # A BCM2711 boot ROM runs the plain recovery.bin whatever its OTP holds.
+        sign_recovery = locked_to_ours and family.countersigned_recovery
         khash, key_checked = self._key_hash(record) if signed else ("", False)
         warnings: list[str] = []
         if signed:
@@ -205,12 +230,13 @@ class Stage1Builder:
                                 "(no customer key): the line was removed; SIGNED_BOOT belongs to the secure scenario")
         if prov.jtag_lock and not secure:
             warnings.append("provisioning.jtag_lock only applies to the secure scenario")
-        cfgtxt = config_txt(program_pubkey, jtag)
+        cfgtxt = config_txt(program_pubkey, jtag, family)
         plan = Stage1Plan(signed=signed, program_pubkey=program_pubkey, jtag_lock=jtag,
                           sign_recovery=sign_recovery, channel=channel, pieeprom=pie, recovery=rec,
                           boot_conf=boot_conf, config_txt=cfgtxt, customer_key_hash=khash,
-                          key_checked=key_checked, warnings=warnings)
-        plan.fp = fingerprint("stage1", plan.mode, channel, pie.name, self.hashes.sha256(pie),
+                          key_checked=key_checked, warnings=warnings, family=family,
+                          locked=signed and not program_pubkey)
+        plan.fp = fingerprint("stage1", family.soc, plan.mode, channel, pie.name, self.hashes.sha256(pie),
                               self.hashes.sha256(rec), self._eeprom_tools_hash(),
                               boot_conf, cfgtxt, sign_recovery, khash if signed else None,
                               self.tools.hash(), self.tools.script_hash("stage1.sh"))
@@ -223,7 +249,7 @@ class Stage1Builder:
         return plan
 
     def complete(self, plan: Stage1Plan) -> bool:
-        if not (is_complete(plan.dir) and all((plan.dir / n).is_file() for n in OUTPUTS)):
+        if not (is_complete(plan.dir) and all((plan.dir / n).is_file() for n in outputs(plan.family))):
             return False
         if plan.signed:
             # the key the EEPROM was really signed with (stage1.sh records it) must be the expected one
@@ -261,9 +287,11 @@ class Stage1Builder:
         part = fresh_partial(plan.dir)
         write_text(part / "boot.conf", plan.boot_conf)
         write_text(part / "config.txt", plan.config_txt)
-        env = {"MODE": plan.mode, "CHANNEL": plan.channel, "SIGN_RECOVERY": "1" if plan.sign_recovery else "0"}
+        env = {"MODE": plan.mode, "CHANNEL": plan.channel, "SIGN_RECOVERY": "1" if plan.sign_recovery else "0",
+               "CHIP": plan.family.soc, "LOCKED": "1" if plan.locked else "0"}
         mounts = [Mount.bind(part, "/out")]
-        job.log(f"==> stage 1 ({plan.mode}, channel {plan.channel}, {plan.pieeprom.name}) -> {plan.dir}")
+        job.log(f"==> stage 1 ({plan.family.chip}, {plan.mode}, channel {plan.channel}, {plan.pieeprom.name}) "
+                f"-> {plan.dir}")
         for w in plan.warnings:
             job.log(f"WARNING: {w}")
         if plan.signed:
@@ -281,13 +309,14 @@ class Stage1Builder:
 
     @staticmethod
     def _verify(part: Path, plan: Stage1Plan) -> None:
-        for n in ("bootcode5.bin", "pieeprom.bin", "pieeprom.sig", "build-info.json"):
+        for n in (plan.second_stage, "pieeprom.bin", "pieeprom.sig", "build-info.json"):
             p = part / n
             if not p.is_file() or p.stat().st_size == 0:
                 raise RuntimeError(f"stage1.sh did not produce {n}")
-        if (part / "pieeprom.bin").stat().st_size != PIEEPROM_SIZE:
+        size = plan.family.pieeprom_size
+        if (part / "pieeprom.bin").stat().st_size != size:
             raise RuntimeError(f"pieeprom.bin has {(part / 'pieeprom.bin').stat().st_size} bytes, "
-                               f"expected {PIEEPROM_SIZE}")
+                               f"expected {size}")
         if (part / "config.txt").read_text(encoding="utf-8") != plan.config_txt:
             raise RuntimeError("stage1.sh modified config.txt")
         # pieeprom.sig is sha256 + ts only, in both modes: the signed EEPROM carries its signature
@@ -305,6 +334,8 @@ class Stage1Builder:
         if not isinstance(info, dict) or info.get("mode") != plan.mode:
             raise RuntimeError(f"build-info.json mode is {info.get('mode') if isinstance(info, dict) else None!r}, "
                                f"expected {plan.mode!r}")
+        if str(info.get("chip") or plan.family.soc) != plan.family.soc:
+            raise RuntimeError(f"build-info.json is for a BCM{info.get('chip')}, expected {plan.family.chip}")
         want = plan.customer_key_hash if plan.signed else None
         if info.get("customer_key_hash") != want:
             raise RuntimeError(f"build-info.json customer_key_hash is {info.get('customer_key_hash')!r}, "
@@ -334,11 +365,11 @@ class Stage1Builder:
                             lambda: self.complete(plan), "stage 1 files")
 
     def files(self, plan: Stage1Plan) -> list[StageFile]:
-        rel = f"rpi-eeprom firmware-2712/{plan.channel}"
+        rel = f"rpi-eeprom firmware-{plan.family.soc}/{plan.channel}"
         rec_origin = f"{rel}/recovery.bin" + (" (counter-signed with the board key)" if plan.sign_recovery else "")
         pie_origin = f"{rel}/{plan.pieeprom.name} + boot.conf" + (" (signed)" if plan.signed else "")
         return [
-            self.hashes.stage_file("bootcode5.bin", plan.dir / "bootcode5.bin", rec_origin),
+            self.hashes.stage_file(plan.second_stage, plan.dir / plan.second_stage, rec_origin),
             self.hashes.stage_file("pieeprom.bin", plan.dir / "pieeprom.bin", pie_origin),
             self.hashes.stage_file("pieeprom.sig", plan.dir / "pieeprom.sig",
                                    "rpi-eeprom-digest" + (" -k <board key>" if plan.signed else "")),
@@ -353,16 +384,23 @@ class Stage1Builder:
             irreversible.append({"key": "program_pubkey", "value": "1", "why": WHY_PUBKEY})
         if plan.jtag_lock:
             irreversible.append({"key": "program_jtag_lock", "value": "1", "why": WHY_JTAG})
+        fam = plan.family
         notes = []
+        recovery = "counter-signed recovery" if fam.countersigned_recovery else "plain recovery (a BCM2711 needs no other)"
         if not plan.signed:
             notes.append("unsigned EEPROM update; OTP is not changed in this stage")
         elif plan.program_pubkey:
             notes.append("signed EEPROM; program_pubkey=1 locks this board to its key (IRREVERSIBLE)")
         elif assumed_lock:
             notes.append(f"the board's OTP probably holds our key hash already ({assumed_lock}): signed EEPROM and "
-                         "counter-signed recovery; if the boot ROM refuses it, the next run sends the plain one")
+                         f"{recovery}; "
+                         + ("if the boot ROM refuses it, the next run sends the plain one" if fam.countersigned_recovery
+                            else "the board's report settles it (if its OTP holds no key hash, the next run burns it)"))
         else:
-            notes.append("board OTP is already locked to our key: signed EEPROM and counter-signed recovery")
+            notes.append(f"board OTP is already locked to our key: signed EEPROM and {recovery}")
+        if not fam.reboot_order:
+            notes.append("the board comes back in RPIBOOT mode for stage 2 because its nRPIBOOT jumper stays fitted "
+                         "until stage 3 is done")
         notes.extend(plan.warnings)
         return {
             "stage": 1,
@@ -370,13 +408,17 @@ class Stage1Builder:
             "title": "EEPROM & OTP",
             "ready": True,
             "mode": plan.mode,
-            # which second stage bootcode5.bin is (the page reports it back when the boot ROM refuses it)
-            "recovery": "countersigned" if plan.sign_recovery else "plain",
+            "chip": fam.chip,
+            # Which second stage bootcode5.bin is (the page reports it back when the boot ROM refuses it). None for a
+            # BCM2711: its boot ROM runs the one second stage there is, whatever its OTP holds.
+            "recovery": ("countersigned" if plan.sign_recovery else "plain") if fam.countersigned_recovery else None,
             "files": [f.to_dict(file_url(base_url, serial, 1, f.name)) for f in files],
             "config_txt": plan.config_txt,
             "irreversible": irreversible,
             "expect": {"secure_boot_provision": plan.program_pubkey,
-                       "customer_key_hash": plan.customer_key_hash if plan.program_pubkey else None},
+                       "customer_key_hash": plan.customer_key_hash if plan.program_pubkey else None,
+                       # signed for a board whose OTP holds (or is assumed to hold) our key hash: it must say so
+                       "otp_key_hash": plan.customer_key_hash if plan.locked else None},
             "notes": notes,
-            "source": {"channel": plan.channel, "pieeprom": plan.pieeprom.name},
+            "source": {"channel": plan.channel, "pieeprom": plan.pieeprom.name, "firmware": f"firmware-{fam.soc}"},
         }

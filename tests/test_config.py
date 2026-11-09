@@ -76,8 +76,9 @@ def test_defaults(tmp_path):
     b = cfg.builds
     assert b.auto is True and b.tools.image_tag == "otp-tools:latest"
     assert (b.gadget.targets, b.gadget.image_tag, b.gadget.volume) == (
-        "pi5-family", "otp-gadget-builder:trixie", "otp-pgm-work")
+        "pi5-family,cm4", "otp-gadget-builder:trixie", "otp-pgm-work")
     assert b.image.overrides == []          # IGconf_image_pmap is set per scenario, not here
+    assert b.image.families == ["pi5", "cm4"]
     assert (b.image.builder_tag, b.image.volume, b.image.keep_raw_image) == (
         "otp-image-builder:trixie", "otp-image-work", False)
     i = cfg.image
@@ -484,7 +485,7 @@ def test_text_fallbacks_for_empty_strings(tmp_path):
     cfg = load(tmp_path, server={"host": " "}, docker={"binary": ""}, builds={"gadget": {"targets": ""}})
     assert cfg.server.host == "127.0.0.1"
     assert cfg.docker.binary == "docker"
-    assert cfg.builds.gadget.targets == "pi5-family"
+    assert cfg.builds.gadget.targets == "pi5-family,cm4"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -639,10 +640,11 @@ def test_summary(make_cfg, tmp_path):
     assert "secure_boot" not in prov and "mode" not in prov
     assert s["builds"]["auto"] is False
     assert s["builds"]["tools"] == {"image_tag": "otp-tools:latest"}
-    assert s["builds"]["gadget"] == {"targets": "pi5-family", "image_tag": "otp-gadget-builder:trixie",
+    assert s["builds"]["gadget"] == {"targets": "pi5-family,cm4", "image_tag": "otp-gadget-builder:trixie",
                                      "volume": "otp-pgm-work"}
     assert s["builds"]["image"] == {"overrides": [], "builder_tag": "otp-image-builder:trixie",
-                                    "volume": "otp-image-work", "keep_raw_image": False}
+                                    "volume": "otp-image-work", "keep_raw_image": False,
+                                    "families": [f for f in cfg.builds.image.families]}
     d = s["docker"]
     assert set(d) == {"binary", "start_desktop", "desktop_path", "idle_timeout"}
     assert d["desktop_path"] == (str(cfg.docker.desktop_path) if cfg.docker.desktop_path else None)

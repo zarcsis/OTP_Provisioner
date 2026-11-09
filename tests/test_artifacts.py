@@ -131,6 +131,14 @@ def make_repo(base: Path) -> tuple[Path, Path]:
         (d / "pieeprom-2026-09-25.bin").write_bytes(b"\2" * 2097152)
         (d / "pieeprom-2026-12-31.bin").write_bytes(b"\3" * 100)          # wrong size: ignored
         (d / "recovery.bin").write_bytes(b"\4" * 104314)
+    fw4 = repo / "external" / "usbboot" / "rpi-eeprom" / "firmware-2711"
+    for ch in ("default", "latest"):
+        d = fw4 / ch
+        d.mkdir(parents=True)
+        (d / "pieeprom-2026-09-23.bin").write_bytes(b"\5" * 524288)
+        (d / "pieeprom-2026-10-23.bin").write_bytes(b"\6" * 524288)
+        (d / "pieeprom-2026-11-01.bin").write_bytes(b"\7" * 2097152)      # a BCM2712 size: ignored
+        (d / "recovery.bin").write_bytes(b"\x08" * 87710)
     (repo / "external" / "usbboot" / "firmware").mkdir(parents=True)
     (repo / "external" / "usbboot" / "firmware" / "bootfiles.bin").write_bytes(b"bootfiles-tar" * 100)
     (repo / "external" / "pi-gen-micro").mkdir(parents=True)
@@ -233,13 +241,15 @@ def out_dir(call) -> Path:
 def h_stage1(call):
     out = out_dir(call)
     assert (out / "boot.conf").is_file() and (out / "config.txt").is_file()
-    (out / "bootcode5.bin").write_bytes(b"recovery" + call["env"]["SIGN_RECOVERY"].encode())
-    (out / "pieeprom.bin").write_bytes(b"\2" * 2097152)
+    chip = call["env"].get("CHIP", "2712")
+    second, size = ("bootcode4.bin", 524288) if chip == "2711" else ("bootcode5.bin", 2097152)
+    (out / second).write_bytes(b"recovery" + call["env"]["SIGN_RECOVERY"].encode())
+    (out / "pieeprom.bin").write_bytes(b"\2" * size)
     # pieeprom.sig = sha256 + ts in both modes (a signed EEPROM embeds bootconf.sig instead)
     sig = hashlib.sha256((out / "pieeprom.bin").read_bytes()).hexdigest() + "\nts: 1\n"
     (out / "pieeprom.sig").write_text(sig, encoding="ascii")
     # stage1.sh reports the key hash it built with (EXPECT_CKH, signed mode only)
-    (out / "build-info.json").write_text(json.dumps({"mode": call["env"]["MODE"],
+    (out / "build-info.json").write_text(json.dumps({"chip": chip, "mode": call["env"]["MODE"],
                                                      "customer_key_hash": call["env"].get("EXPECT_CKH")}),
                                          encoding="utf-8")
 
@@ -279,7 +289,10 @@ def h_builder(call, *, forced_pmap: str | None = None):
     call["config"] = (cfg_dir / "otp-image.yaml").read_text(encoding="utf-8")
     call["secret_files"] = {f.relative_to(cfg_dir).as_posix(): f.read_bytes()
                             for f in sorted(cfg_dir.rglob("*")) if f.is_file() and f.name != "otp-image.yaml"}
-    call["docker"].volumes[call["mounts"]["/work"].source] = {"pmap": forced_pmap or pmap}
+    # the device class rpi-image-gen's device layer sets (rpi5 -> pi5, rpi-cm4 -> cm4)
+    layer = next(ln.split(":", 1)[1].strip() for ln in call["config"].splitlines() if ln.startswith("  layer: rpi"))
+    dclass = {"rpi5": "pi5", "rpi-cm4": "cm4"}[layer]
+    call["docker"].volumes[call["mounts"]["/work"].source] = {"pmap": forced_pmap or pmap, "device_class": dclass}
     (out_dir(call) / "deb13-arm64-min.img").write_bytes(b"raw image " + pmap.encode())
 
 
@@ -287,8 +300,9 @@ def h_collect(call, *, corrupt: str = ""):
     out = out_dir(call)
     built = call["docker"].volumes.get(call["mounts"]["/work"].source) or {}
     assert built.get("pmap") in VARIANTS, "image-collect.sh ran without an image build in the work volume"
-    (out / "image.json").write_text(json.dumps(image_json_doc(encrypted=built["pmap"] == "crypt")),
-                                    encoding="utf-8")
+    doc = image_json_doc(encrypted=built["pmap"] == "crypt")
+    doc["IGmeta"]["IGconf_device_class"] = built.get("device_class", "pi5")
+    (out / "image.json").write_text(json.dumps(doc), encoding="utf-8")
     make_sparse(out / "boot.vfat.sparse", [("raw", 2), ("dc", 30)])
     make_sparse(out / "root.ext4.sparse.0", [("raw", 3), ("dc", 37)])
     make_sparse(out / "root.ext4.sparse.1", [("dc", 3), ("raw", 1), ("dc", 36)] if corrupt != "mixed"
@@ -302,7 +316,7 @@ def h_collect(call, *, corrupt: str = ""):
     if corrupt == "sha":
         pieces_root[1]["sha256"] = "0" * 64
     collect = {"image_name": "deb13-arm64-min", "outputdir": "/work/image-deb13-arm64-min",
-               "image_version": "v1.2", "device_class": "pi5", "storage_type": "sd",
+               "image_version": "v1.2", "device_class": doc["IGmeta"]["IGconf_device_class"], "storage_type": "sd",
                "simages": {"boot.vfat.sparse": {"size": (out / "boot.vfat.sparse").stat().st_size,
                                                 "pieces": [piece("boot.vfat.sparse")]},
                            "root.ext4.sparse": {"size": 999, "pieces": pieces_root}}}
@@ -440,7 +454,8 @@ def test_stage1_unsigned_shared_dir(make_env):
     assert m["stage"] == 1 and m["kind"] == "rpiboot" and m["ready"] is True and m["mode"] == "unsigned"
     assert [f["name"] for f in m["files"]] == ["bootcode5.bin", "pieeprom.bin", "pieeprom.sig", "config.txt"]
     assert m["config_txt"] == "uart_2ndstage=1\nset_reboot_order=0x3\nrecovery_reboot=1\n"
-    assert m["irreversible"] == [] and m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    assert m["irreversible"] == [] and m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,
+                                                       "otp_key_hash": None}
     assert m["source"]["pieeprom"] == "pieeprom-2026-09-25.bin"
     f0 = m["files"][0]
     assert f0["url"] == f"http://127.0.0.1:8765/api/modules/{SERIAL}/stage/1/files/bootcode5.bin"
@@ -449,7 +464,7 @@ def test_stage1_unsigned_shared_dir(make_env):
     assert len(runs) == 1
     r = runs[0]
     assert r["image"] == TOOLS_TAG and r["args"] == ["stage1.sh"]
-    assert r["env"] == {"MODE": "unsigned", "CHANNEL": "latest", "SIGN_RECOVERY": "0"}
+    assert r["env"] == {"MODE": "unsigned", "CHANNEL": "latest", "SIGN_RECOVERY": "0", "CHIP": "2712", "LOCKED": "0"}
     assert r["mounts"]["/scripts"].readonly and r["mounts"]["/ext"].readonly
     assert Path(r["mounts"]["/ext"].source) == env.cfg.repo_root / "external"
     assert not r["mounts"]["/out"].readonly and "/keys" not in r["mounts"]
@@ -481,7 +496,8 @@ def test_stage1_signed_secure_scenario(make_env):
                                "program_pubkey=1\nprogram_jtag_lock=1\n")
     assert [i["key"] for i in m["irreversible"]] == ["program_pubkey", "program_jtag_lock"]
     assert "OTP" in m["irreversible"][0]["why"]
-    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]}
+    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
+                           "otp_key_hash": None}
     r = env.docker.runs_of("stage1.sh")[0]
     assert base_env(r) == {"MODE": "signed", "CHANNEL": "latest", "SIGN_RECOVERY": "0"}
     assert r["env"]["EXPECT_CKH"] == rec["customer_key_hash"]
@@ -502,7 +518,8 @@ def test_stage1_default_mode_and_per_board_choice(make_env):
     assert env.modules.mode_of(rec) == "secure"
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "signed" and "program_pubkey=1" in m["config_txt"]
-    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]}
+    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
+                           "otp_key_hash": None}
     env.board(SERIAL2, mode="open")                       # the operator's choice wins over the default
     m2 = env.arts.stage_manifest(SERIAL2, 1)
     assert m2["mode"] == "unsigned" and m2["irreversible"] == [] and "program_pubkey=1" not in m2["config_txt"]
@@ -532,7 +549,8 @@ def test_stage1_locked_to_our_key(make_env, chosen):
     assert env.modules.mode_of(rec) == "secure"           # a locked board is secure whatever was chosen
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "signed" and m["config_txt"] == config_txt(False, False) and m["irreversible"] == []
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,
+                           "otp_key_hash": rec["customer_key_hash"]}      # the board must report our hash
     assert base_env(env.docker.runs_of("stage1.sh")[0]) == {"MODE": "signed", "CHANNEL": "latest",
                                                              "SIGN_RECOVERY": "1"}
     assert "counter-signed" in m["files"][0]["origin"]
@@ -550,7 +568,8 @@ def test_stage1_after_an_interrupted_secure_run_assumes_the_lock(make_env):
                          {"name": "pieeprom.bin", "size": 2097152}]})
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["recovery"] == "countersigned" and m["mode"] == "signed" and m["irreversible"] == []
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}   # no second program_pubkey
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None,   # no second program_pubkey
+                           "otp_key_hash": env.store.get(SERIAL)["customer_key_hash"]}
     assert any("probably holds our key hash" in n for n in m["notes"])
     assert base_env(env.docker.runs_of("stage1.sh")[-1])["SIGN_RECOVERY"] == "1"
     # stages 2 and 3 still wait for the board's own report
@@ -721,12 +740,12 @@ def test_gadget_build_job(make_env):
     assert b["context"] == env.cfg.repo_root / "docker"         # the context carries gadget-helpers/
     r = env.docker.runs_of(GADGET_TAG)[0]
     assert r["platform"] == "linux/arm64" and r["args"] == []
-    assert r["env"] == {"PGM_TARGETS": "pi5-family", "PGM_COMMIT": env.arts.gadget.commit()}
+    assert r["env"] == {"PGM_TARGETS": "pi5-family,cm4", "PGM_COMMIT": env.arts.gadget.commit()}
     assert Path(r["mounts"]["/src"].source) == env.cfg.repo_root / "external" / "pi-gen-micro"
     assert r["mounts"]["/src"].readonly
     assert r["mounts"]["/work"].type == "volume" and r["mounts"]["/work"].source == "otp-pgm-work"
     key = env.arts.gadget.key()
-    assert key.endswith("-pi5-family")
+    assert key.endswith("-pi5-family,cm4")
     assert Path(r["mounts"]["/out"].source) == env.cfg.work_dir / "artifacts" / "gadget" / f"{key}.partial"
     path, source, version = env.arts.gadget.current()
     assert source == "built" and version == key and path.parent.name == key
@@ -868,7 +887,8 @@ def test_secure_board_needs_stage1_before_stages_2_and_3(make_env, how):
     # stage 1 is served: the signed EEPROM that burns the board's key hash into OTP
     m1 = env.arts.stage_manifest(SERIAL, 1)
     assert m1["mode"] == "signed" and [i["key"] for i in m1["irreversible"]] == ["program_pubkey"]
-    assert m1["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"]}
+    assert m1["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
+                            "otp_key_hash": None}
     # the page reports stage 1 done (OTP locked to our key): stages 2 and 3 are served, signed
     env.report_stage1_locked(SERIAL)
     m2 = env.arts.stage_manifest(SERIAL, 2)
@@ -928,7 +948,7 @@ def test_image_build_argv_and_collect(make_env):
         cfg_dir = Path(r["mounts"]["/cfg"].source)
         assert r["mounts"]["/cfg"].readonly and cfg_dir.parent == env.image_root / "cfg"
         assert not cfg_dir.exists()                          # the config dir (secrets) is gone after the build
-        assert "  base: otp-rpios-lite\n  station: otp-rpios-setup\n" in r["config"]
+        assert "  base: otp-rpios-lite\n  kernel: otp-rpios-kernel-2712\n  station: otp-rpios-setup\n" in r["config"]
         assert '  hostname: "raspberrypi"\n  user1: "pi"\n' in r["config"]   # board settings are not in it
         assert r["secret_files"] == {}
     b = [x for x in env.docker.builds if x["tag"] == BUILDER_TAG]
@@ -955,7 +975,7 @@ def test_image_build_argv_and_collect(make_env):
         assert man["overrides"] == [f"IGconf_image_pmap={v}"]
         assert man["config_hash"] == env.arts.image.config_hash(v)
         assert man["sources_hash"] == env.arts.image.sources_hash() and "rpi_image_gen_commit" in man
-        assert man["image_settings"] == {"name": "rpios-trixie-arm64-lite", "base": "Raspberry Pi OS Lite"}
+        assert man["image_settings"] == {"name": "rpios-trixie-arm64-lite", "base": "Raspberry Pi OS Lite", "family": "pi5"}
         assert "droneos_commit" not in man and "config" not in man
         assert [p["name"] for p in man["simages"]["root.ext4.sparse"]] == ["root.ext4.sparse.0", "root.ext4.sparse.1"]
         assert man["simages"]["root.ext4.sparse"][1]["sha256"] == sha(set_dir / "root.ext4.sparse.1")
@@ -1117,7 +1137,8 @@ def test_stage3_open_manifest(make_env):
     runs = env.docker.runs[n_runs:]
     assert [r["args"][:1] for r in runs] == [["boot-slot.sh"]]
     r = runs[0]
-    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "0", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": ""}
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "0", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": "",
+                        "BOARD": "pi5"}
     assert Path(r["mounts"]["/in"].source) == clear_dir and "/keys" not in r["mounts"]
     assert r["mounts"]["/seed"].readonly and not Path(r["mounts"]["/seed"].source).exists()   # removed after the run
     assert sorted(r["seed"]) == ["meta-data", "user-data"]                 # no Wi-Fi network: no network-config
@@ -1256,7 +1277,8 @@ def test_stage3_signed_resigns_boot_slot(make_env, chosen):
     assert m["mode"] == "signed" and m["scenario"] == "secure" and m["image"]["variant"] == "crypt"
     assert m["fwcrypto_init"] is True and m["key_export"] == KEY_EXPORT
     r = env.docker.runs_of("boot-slot.sh")[0]
-    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "1", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": ""}
+    assert r["env"] == {"SIMAGE": "boot.vfat.sparse", "SIGN": "1", "MAX_PIECE": "268435456", "INPLACE": "0", "PRUNE": "",
+                        "BOARD": "pi5"}
     assert sorted(r["seed"]) == ["meta-data", "user-data"]               # first-boot files on signed boards too
     crypt_set = env.current("crypt")["set"]
     assert Path(r["mounts"]["/in"].source) == env.image_root / crypt_set
@@ -1467,7 +1489,7 @@ def test_status_shape_and_start_build_validation(make_env):
     assert st["tools"]["ready"] is True and st["tools"]["path"] == TOOLS_TAG
     assert set(st["image"]["variants"]) == set(VARIANTS)
     for vs in st["image"]["variants"].values():
-        assert set(vs) == {"ready", "set", "version", "path", "size", "built", "detail"}
+        assert set(vs) == {"ready", "set", "version", "path", "size", "built", "detail", "family"}
     with pytest.raises(ValueError):
         env.arts.start_build("everything")
 
@@ -1695,7 +1717,7 @@ def test_gadget_key_covers_the_builder_files(make_env):
     k1 = g.key()
     assert g.built_image() is not None
     (env.cfg.repo_root / "docker" / "gadget-entrypoint.sh").write_text("# changed\n", encoding="utf-8")
-    assert g.key() != k1 and g.key().endswith("-pi5-family")
+    assert g.key() != k1 and g.key().endswith("-pi5-family,cm4")
     assert g.built_image() is None
     with pytest.raises(NotReady, match="not built"):
         g.current()
@@ -1714,7 +1736,7 @@ def test_gadget_key_covers_the_helper_packages(make_env):
     script = pkg / "otp-keyexport"
     original = script.read_bytes()
     script.write_bytes(original + b"echo changed\n")             # a helper changed: the gadget is stale
-    assert g.builder_hash() != h1 and g.key() != k1 and g.key().endswith("-pi5-family")
+    assert g.builder_hash() != h1 and g.key() != k1 and g.key().endswith("-pi5-family,cm4")
     assert g.built_image() is None
     with pytest.raises(NotReady, match="not built"):
         g.current()
@@ -1892,7 +1914,7 @@ def test_stage3_writes_the_settings_as_first_boot_files(make_env):
         assert "drone" not in r["config"] and "Field" not in r["config"] and r["secret_files"] == {}
     for v in VARIANTS:
         assert env.arts.image.current_set(v)[1]["image_settings"] == {"name": "rpios-trixie-arm64-lite",
-                                                                      "base": "Raspberry Pi OS Lite"}
+                                                                      "base": "Raspberry Pi OS Lite", "family": "pi5"}
     env.board()
     m = env.arts.stage_manifest(SERIAL, 3)
     r = env.docker.runs_of("boot-slot.sh")[-1]

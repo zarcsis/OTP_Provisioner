@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end test of the whole station without hardware: real server + real page + mock Raspberry Pi 5.
+"""End-to-end test of the whole station without hardware: real server + real page + a mock Raspberry Pi 5 or
+Compute Module 4.
 
-    uv run python -B tests/web/run_e2e.py [--scenario A|B|both] [--recovery-passphrase] [--scratch DIR] [--keep] [--chrome PATH]
+    uv run python -B tests/web/run_e2e.py [--scenario A|B|C|D|both|cm4|all] [--recovery-passphrase] [--scratch DIR]
+                                         [--keep] [--chrome PATH]
 
 For every scenario the runner
   1. starts ITS OWN server: python -B tests/web/e2e_server.py --port <free> --registry <temp dir> -- the real app
@@ -26,6 +28,10 @@ crypt image; before anything is erased the page has the gadget's otp-keyexport h
 station built and checks its key against it (oem cryptcheck). The mock gadget answers only what the station's
 rpi-fastbootd does (docker/fastbootd/otp-station.patch). provisioning.recovery_passphrase is off by default;
 --recovery-passphrase turns it on for B (the station adds keyslot 1) and checks the passphrase.
+Scenarios C and D are A and B on a mock Compute Module 4 (BCM2711, USB 0a5c:2711, USER_BOARDREV of a CM4):
+bootcode4.bin from firmware-2711, no recovery variant, 2711/... in bootfiles.bin, the cm4-clear / cm4-crypt image
+sets and an image.json whose device class is cm4. They run when the station builds the cm4 family
+(builds.image.families); --scenario all (the default) skips them otherwise, with a note.
 Exit code 0 when every assertion passed.
 """
 from __future__ import annotations
@@ -56,7 +62,8 @@ TESTS = pathlib.Path(__file__).resolve().parent
 REPO = TESTS.parents[1]
 sys.path.insert(0, str(REPO))
 
-from otp_server import imagejson  # noqa: E402
+from otp_server import boards, imagejson
+from otp_server.artifacts.image import label  # noqa: E402
 from otp_server.secrets_gen import public_key_fingerprint, same_public_key  # noqa: E402
 
 CHROME_CANDIDATES = [
@@ -66,9 +73,13 @@ CHROME_CANDIDATES = [
 ]
 LIVE_SERVER = "http://127.0.0.1:8765"
 SCENARIOS = {
-    "A": {"serial": "e2e5a7c1", "mode": "open"},
-    "B": {"serial": "e2e5b7c2", "mode": "secure"},
+    "A": {"serial": "e2e5a7c1", "mode": "open", "family": "pi5"},
+    "B": {"serial": "e2e5b7c2", "mode": "secure", "family": "pi5"},
+    "C": {"serial": "e2e5c7c3", "mode": "open", "family": "cm4"},
+    "D": {"serial": "e2e5d7c4", "mode": "secure", "family": "cm4"},
 }
+#: USER_BOARDREV the mock board reports (e2e.js): a Pi 5 and a CM4.
+BOARDREV = {"pi5": "d04170", "cm4": "c03141"}
 #: otp_server/artifacts/image.py KEY_EXPORT (where the gadget's otp-keyexport helper works)
 KEY_EXPORT = {"dir": "/run/otp-keyexport", "key": "/run/otp-keyexport/key.der",
               "status": "/run/otp-keyexport/status", "request": "/run/otp-keyexport/request"}
@@ -145,7 +156,7 @@ def image_blocks(variant: str) -> list[str]:
     <disk>p1, p2, ... whose root simage is root.luks.sparse; a clear set's partitions are the same shape."""
     set_dir, man = current_set(variant)
     ij = imagejson.load(set_dir / "image.json")
-    if variant == "crypt":
+    if variant.endswith("crypt"):
         ij, containers = imagejson.station_luks(ij, 16 << 20)
         man = dict(man, simages={**(man.get("simages") or {}), **{c["simage"]: [] for c in containers}})
     disk = imagejson.storage_device(ij)
@@ -456,10 +467,12 @@ def run_scenario(name: str, args: argparse.Namespace, scratch: pathlib.Path, chr
     sc = SCENARIOS[name]
     serial = sc["serial"]
     secure = sc["mode"] == "secure"
+    fam = boards.FAMILIES[sc["family"]]
     C = Checks(name)
     settings = ["provisioning.recovery_passphrase=true"] if (secure and args.recovery_passphrase) else []
     if args.image_name:
         settings.append(f"image.name={args.image_name}")
+    settings.extend(args.set)
     srv = OwnServer(scratch, f"scenario-{name}", settings)
     google_dir = work_dir() / "google"
     google_before = files_snapshot(google_dir)
@@ -481,10 +494,13 @@ def run_scenario(name: str, args: argparse.Namespace, scratch: pathlib.Path, chr
         C.check("server: provisioning.secure_boot is gone", "secure_boot" not in prov, json.dumps(sorted(prov)))
         C.eq("server: provisioning.recovery_passphrase", prov.get("recovery_passphrase"), srv.recovery_passphrase)
         variants = (status["artifacts"]["image"].get("variants") or {})
-        C.check("server: both image variants (clear, crypt) ready", sorted(variants) == ["clear", "crypt"] and all(v.get("ready") for v in variants.values()),
+        # clear + crypt of the Raspberry Pi 5 (the mock board is one), plus cm4-clear + cm4-crypt with builds.image.families
+        C.check("server: both Raspberry Pi 5 image variants (clear, crypt) and every other family's ready",
+                {"clear", "crypt"} <= set(variants) and all(v.get("ready") for v in variants.values()),
                 json.dumps({k: v.get("detail") for k, v in variants.items()}))
-        blocks = image_blocks("crypt" if secure else "clear")
-        cfg = {"scenario": name, "serial": serial, "mode": sc["mode"], "blocks": blocks, "timeoutMs": int(args.timeout * 1000)}
+        blocks = image_blocks(label(fam, "crypt" if secure else "clear"))
+        cfg = {"scenario": name, "serial": serial, "mode": sc["mode"], "blocks": blocks, "chip": fam.chip,
+               "timeoutMs": int(args.timeout * 1000)}
         inject = (f"<script>window.__E2E = {json.dumps(cfg)};</script>\n"
                   '<script src="/__e2e__/mocks.js"></script>\n<script src="/__e2e__/e2e.js"></script>')
         st = ProxyState(srv.port, inject, srv.registry)
@@ -556,6 +572,9 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
     mode = sc["mode"]
     secure = mode == "secure"
     variant = "crypt" if secure else "clear"
+    fam = boards.FAMILIES[sc["family"]]
+    lbl = label(fam, variant)          # the image set of the board's family (clear, crypt, cm4-clear, cm4-crypt)
+    bc = fam.second_stage              # bootcode5.bin / bootcode4.bin
     with_pass = secure and srv.recovery_passphrase
     C.check("page ran without errors", not rep.get("errors") and not st.errors,
             "; ".join((rep.get("errors") or []) + st.errors)[:2000])
@@ -612,16 +631,24 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
 
     # ---------------- stage 1
     s1 = {f["name"]: f for f in m1["files"]}
-    C.eq("stage 1: manifest files", sorted(s1), ["bootcode5.bin", "config.txt", "pieeprom.bin", "pieeprom.sig"])
+    C.eq("stage 1: manifest files", sorted(s1), sorted([bc, "config.txt", "pieeprom.bin", "pieeprom.sig"]))
+    C.eq(f"stage 1: the {fam.chip}'s firmware and second stage", (m1.get("chip"), (m1.get("source") or {}).get("firmware")),
+         (fam.chip, f"firmware-{fam.soc}"))
+    # a fresh board: the plain second stage on a BCM2712; a BCM2711 has one second stage, the manifest names no variant
+    C.eq("stage 1: recovery variant", m1.get("recovery"), "plain" if fam.countersigned_recovery else None)
+    C.check("stage 1: set_reboot_order only on a BCM2712", ("set_reboot_order=0x3" in m1["config_txt"]) == fam.reboot_order,
+            repr(m1["config_txt"]))
     cap1 = {n: served(st, 1, n) for n in s1}
     server1 = {n: ((c["size"], c["sha256"]) if c else None) for n, c in cap1.items()}
     for n, f in s1.items():
         C.check(f"stage 1: server streamed {n} = manifest (size+sha256)", server1[n] == (f["size"], f["sha256"]),
                 f"server {server1[n]}, manifest {(f['size'], f['sha256'])}")
     rom1 = roms[0] if roms else {}
-    C.check("stage 1: ROM received bootcode5.bin == server file",
-            rom1.get("sent") and server1["bootcode5.bin"] and (rom1.get("size"), rom1.get("sha256")) == server1["bootcode5.bin"],
-            f"sent {rom1.get('size')} {str(rom1.get('sha256'))[:16]}, server {server1['bootcode5.bin']}")
+    C.check(f"stage 1: ROM received {bc} == server file",
+            rom1.get("sent") and server1.get(bc) and (rom1.get("size"), rom1.get("sha256")) == server1.get(bc),
+            f"sent {rom1.get('size')} {str(rom1.get('sha256'))[:16]}, server {server1.get(bc)}")
+    C.eq(f"stage 1: pieeprom.bin is a {fam.chip} EEPROM image ({fam.pieeprom_size} bytes)",
+         (server1.get("pieeprom.bin") or (0,))[0], fam.pieeprom_size)
     C.check("stage 1: boot message length field = file size", rom1.get("header_len") == 24 and rom1.get("header_size_field") == rom1.get("size"),
             f"{rom1.get('header_len')} / {rom1.get('header_size_field')}")
     fs1 = fss[0]["files"] if fss else {}
@@ -641,7 +668,7 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 m1["expect"].get("secure_boot_provision") is True and m1["expect"].get("customer_key_hash") == rep.get("registryKeyHash"),
                 json.dumps(m1["expect"]))
         C.check("confirmation dialog lists program_pubkey=1", any(f.startswith("stage 1: program_pubkey=1") for f in flags), json.dumps(flags))
-        unsigned_pie = shared.get("A_pieeprom_sha")
+        unsigned_pie = shared.get(f"{fam.key}_pieeprom_sha")
         if unsigned_pie:
             C.check("stage 1: signed pieeprom.bin differs from the unsigned one", server1["pieeprom.bin"][1] != unsigned_pie)
     else:
@@ -650,7 +677,7 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
         C.eq("stage 1: nothing irreversible", m1["irreversible"], [])
         C.eq("stage 1: expect no OTP programming", m1["expect"].get("secure_boot_provision"), False)
         C.check("confirmation dialog lists nothing for stage 1", not any(f.startswith("stage 1:") for f in flags), json.dumps(flags))
-        shared["A_pieeprom_sha"] = server1["pieeprom.bin"][1]
+        shared[f"{fam.key}_pieeprom_sha"] = server1["pieeprom.bin"][1]
 
     # ---------------- stage 2
     s2 = {f["name"]: f for f in m2["files"]}
@@ -663,10 +690,10 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 f"server {server2[n]}, manifest {(f['size'], f['sha256'])}")
     bf = (cap2.get("bootfiles.bin") or {}).get("body") or get_bytes(base + s2["bootfiles.bin"]["url"])
     with tarfile.open(fileobj=io.BytesIO(bf)) as tf:
-        member = next((m for m in tf.getmembers() if m.name.lower().lstrip("./") == "2712/bootcode5.bin"), None)
+        member = next((m for m in tf.getmembers() if m.name.lower().lstrip("./") == f"{fam.soc}/{bc}"), None)
         bc5 = tf.extractfile(member).read() if member else b""
     rom2 = roms[1] if len(roms) > 1 else {}
-    C.check("stage 2: ROM received 2712/bootcode5.bin from bootfiles.bin",
+    C.check(f"stage 2: ROM received {fam.soc}/{bc} from bootfiles.bin",
             member is not None and rom2.get("sent") and (rom2.get("size"), rom2.get("sha256")) == (len(bc5), hashlib.sha256(bc5).hexdigest()),
             f"sent {rom2.get('size')} {str(rom2.get('sha256'))[:16]}, tar member {len(bc5)} {hashlib.sha256(bc5).hexdigest()[:16]}")
     fs2 = fss[1]["files"] if len(fss) > 1 else {}
@@ -686,9 +713,14 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 server2["bootfiles.bin"][1] != shared.get("A_bootfiles_sha", repo_bf))
         # the bootloader reads the key that verifies boot.img over rpiboot (usbboot 2026-10-23)
         with tarfile.open(fileobj=io.BytesIO(bf)) as tf:
-            pk_member = next((m for m in tf.getmembers() if m.name.lower().lstrip("./") == "2712/pubkey.bin"), None)
+            pk_member = next((m for m in tf.getmembers() if m.name.lower().lstrip("./") == f"{fam.soc}/pubkey.bin"), None)
             pk = tf.extractfile(pk_member).read() if pk_member else b""
-        C.check("stage 2: bootfiles.bin carries 2712/pubkey.bin, whose sha256 is the key hash in OTP",
+            if not fam.countersigned_recovery:     # the BCM2711 second stage goes to the board as it is
+                orig = tarfile.open(REPO / "external" / "usbboot" / "firmware" / "bootfiles.bin")
+                om = next((m for m in orig.getmembers() if m.name.lower().lstrip("./") == f"{fam.soc}/{bc}"), None)
+                C.eq(f"stage 2: {fam.soc}/{bc} is not counter-signed (the repo's bytes)",
+                     hashlib.sha256(bc5).hexdigest(), hashlib.sha256(orig.extractfile(om).read()).hexdigest() if om else None)
+        C.check(f"stage 2: bootfiles.bin carries {fam.soc}/pubkey.bin, whose sha256 is the key hash in OTP",
                 len(pk) == 264 and hashlib.sha256(pk).hexdigest() == rep.get("registryKeyHash"),
                 f"{len(pk)} bytes, sha256 {hashlib.sha256(pk).hexdigest()[:16]}, registry {str(rep.get('registryKeyHash'))[:16]}")
     else:
@@ -701,12 +733,15 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
     fb = board.get("fastboot") or {}
     parts = m3["parts"]
     blocks = rep.get("blocks") or []
-    set_dir, setman = current_set(variant)
+    set_dir, setman = current_set(lbl)
     C.check("stage 3: manifest kind/device/erase", m3["kind"] == "fastboot-idp" and m3["storage_device"] == "mmcblk0" and m3["erase"] is True,
             f"{m3['kind']} {m3['storage_device']} erase {m3['erase']}")
     C.eq("stage 3: scenario", m3.get("scenario"), mode)
     C.eq(f"stage 3: the {variant} image (variant, encrypted)", (m3["image"].get("variant"), m3["image"].get("encrypted")), (variant, secure))
-    C.eq(f"stage 3: the current {variant} image set", m3["image"].get("set"), setman.get("set", set_dir.name))
+    C.eq(f"stage 3: the current {lbl} image set", m3["image"].get("set"), setman.get("set", set_dir.name))
+    C.eq("stage 3: the image of the board's family (family, device class)",
+         (m3["image"].get("family"), m3["image"].get("device_class"), setman.get("family", "pi5")),
+         (fam.key, fam.device_class, fam.key))
     C.check("stage 3: the final manifest has nothing pending", not m3.get("pending"), str(m3.get("pending")))
     C.eq("stage 3: fwcrypto_init", m3["fwcrypto_init"], secure)
     first3 = next((m["body"] for m in st.manifests if m["stage"] == 3 and not m["harness"] and m["status"] == 200), {})
@@ -791,6 +826,9 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 (c.get("size"), c.get("sha256")) == (n, h) == (p["size"], p["sha256"]))
     n, h = sha256_url(base + ij["url"])
     C.check("stage 3: server image.json = manifest", (n, h) == (ij["size"], ij["sha256"]))
+    served_ij = json.loads(get_bytes(base + ij["url"]))
+    C.eq("stage 3: image.json names the board's device class (rpi-fastbootd's idpinit checks it)",
+         (served_ij.get("IGmeta") or {}).get("IGconf_device_class"), fam.device_class)
     if secure:
         bij = imagejson.load(work_dir() / "modules" / serial / "luks" / next(
             d.name for d in (work_dir() / "modules" / serial / "luks").iterdir() if (d / "image.json").is_file()) / "image.json")
@@ -865,6 +903,8 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
     C.eq("final module: scenario (mode, mode_chosen, mode_locked)", (mod.get("mode"), mod.get("mode_chosen"), mod.get("mode_locked")), (mode, mode, secure))
     C.eq("registry: mode", rec.get("mode"), mode)
     C.eq("final module: mac", mod.get("mac"), MAC)
+    C.eq("final module: chip, family, board type, supported", (mod.get("chip"), mod.get("family"), mod.get("boardrev"),
+                                                              mod.get("unsupported")), (fam.chip, fam.key, BOARDREV[fam.key], ""))
     C.eq("final module: duid (16-hex fastboot serial)", mod.get("duid"), "10000000" + serial)
     otp = mod.get("otp") or {}
     kinds = [(e["kind"], e["note"]) for e in mod.get("events") or []]
@@ -897,6 +937,9 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
     for n in (1, 2, 3):
         s = stages.get(str(n)) or {}
         print(f"      step {n}: {s.get('uiIcon')} {s.get('uiState')} · {s.get('uiDetail')}")
+    C.check("the last step tells the operator what to do with the board (a CM4: remove the nRPIBOOT jumper)",
+            ("remove the nRPIBOOT jumper" in ((stages.get("3") or {}).get("uiDetail") or "")) == (fam.key == "cm4"),
+            (stages.get("3") or {}).get("uiDetail"))
     C.check("confirmation dialog: Proceed disabled until the serial is typed",
             bool(rep.get("dialogs")) and all(d["okDisabledBeforeTyping"] and not d["okDisabledAfterTyping"] and d["token"] == serial for d in rep["dialogs"]),
             json.dumps(rep.get("dialogs")))
@@ -917,9 +960,18 @@ def verify(C: Checks, name: str, sc: dict, serial: str, srv: OwnServer, st: Prox
                 "OTP key slot is empty: the gadget generates the device key" in log_text and "OTP device key stored on the server" in log_text)
 
 
+def _family_built(family: str) -> bool:
+    """The work dir has a current image set of this family (both variants named)."""
+    root = work_dir() / "artifacts" / "image"
+    fam = boards.FAMILIES[family]
+    return all((root / f"current-{label(fam, v)}.json").is_file() for v in ("clear", "crypt"))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", choices=["A", "B", "both"], default="both")
+    ap.add_argument("--scenario", choices=["A", "B", "C", "D", "both", "cm4", "all"], default="all",
+                    help="A/B: Raspberry Pi 5 open/secure, C/D: Compute Module 4 open/secure; both = A+B, cm4 = C+D, "
+                         "all = every scenario of a family the station builds")
     ap.add_argument("--recovery-passphrase", action="store_true",
                     help="scenario B with provisioning.recovery_passphrase on (keyslot 1 + passphrase checks)")
     ap.add_argument("--scratch", help="directory for temp registries and logs (default: a new temp dir)")
@@ -929,6 +981,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--wait-builds", type=float, default=40.0, help="minutes to wait for tools/gadget/image")
     ap.add_argument("--image-name", help="image.name of the test server (default: the name of the station's current "
                                          "image sets, so the e2e uses them instead of asking for a rebuild)")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="a setting of the test server (tests/web/e2e_server.py --set, JSON values), e.g. the station's "
+                         "image.packages / image.apps: the image sets are served only to a server with the settings they "
+                         "were built with")
     args = ap.parse_args(argv)
     if args.image_name is None:
         try:
@@ -942,7 +998,15 @@ def main(argv: list[str] | None = None) -> int:
     work = work_dir()
     shared: dict = {}
     results = []
-    names = ["A", "B"] if args.scenario == "both" else [args.scenario]
+    groups = {"both": ["A", "B"], "cm4": ["C", "D"], "all": ["A", "B", "C", "D"]}
+    names = groups.get(args.scenario, [args.scenario])
+    if args.scenario == "all":
+        built = [f for f in ("pi5", "cm4") if _family_built(f)]
+        skipped = [n for n in names if SCENARIOS[n]["family"] not in built]
+        if skipped:
+            log(f"skipping scenario(s) {', '.join(skipped)}: the station builds no image for their family "
+                f"(builds.image.families; current-*.json of the work dir)")
+        names = [n for n in names if n not in skipped]
     try:
         for n in names:
             log(f"=== scenario {n} ({SCENARIOS[n]['serial']}, {SCENARIOS[n]['mode']}) ===")

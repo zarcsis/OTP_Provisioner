@@ -5,6 +5,9 @@ The gadget is always built here (no prebuilt image): it carries our ``otp-keyexp
 (docker/gadget-helpers), which hands the OTP device key to the station in the secure scenario, and an
 rpi-fastbootd rebuilt with docker/fastbootd/otp-station.patch, which answers only the commands the page
 sends and cannot read anything back from the board (no cryptopen / mount / arbitrary upload-file).
+One gadget boots every board family its pi-gen-micro targets name (``builds.gadget.targets``, comma-separated:
+``pi5-family,cm4``): the kernel is the same (linux-image-rpi-v8), the boot.img carries each target's firmware
+and device trees. Stage 2 refuses a board whose family no target covers.
 Built gadget: ``<work>/artifacts/gadget/<key>[-r<N>]/fastboot-gadget-<targets>.img`` (+ build-info.json,
 .complete), key = ``<pi-gen-micro commit>-<builder hash>-<targets>`` where the builder hash covers
 docker/gadget.Dockerfile, gadget-entrypoint.sh, the helper packages and docker/fastbootd. A forced rebuild of the same key
@@ -21,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import boards
 from ..docker import Mount
 from .common import (NotReady, TempKeys, commit_partial, content_hash, file_url, fingerprint, fresh_partial,
                      git_output, heavy_lock, is_complete, now_iso, read_json, require_quick_build, rmtree,
@@ -263,8 +267,17 @@ class GadgetBuilder:
 
     def stage2(self, record: dict, *, signed: bool, secure: bool, secrets_fn,
                base_url: str) -> tuple[dict, dict[str, Path]]:
-        """Stage-2 manifest and {name: path}. The gadget is the same in both scenarios."""
+        """Stage-2 manifest and {name: path}. The gadget is the same in both scenarios and for every board family
+        its targets cover (``builds.gadget.targets``)."""
         serial = str(record.get("serial") or "")
+        try:
+            family = boards.family_of(record)
+        except ValueError as exc:
+            raise NotReady(str(exc)) from None
+        if not boards.gadget_covers(self.gcfg.targets, family):
+            raise NotReady(f"the fastboot gadget is built for {self.gcfg.targets}, which does not boot a {family.title} "
+                           f"({family.chip}): add {sorted(family.gadget_targets)[0]} to the setting "
+                           "builds.gadget.targets (comma-separated) and build the gadget again")
         boot_img, source, version = self.current()
         if not self.bootfiles_path.is_file():
             raise NotReady(f"{self.bootfiles_path} is missing (external/usbboot submodule not checked out?)")
@@ -293,7 +306,12 @@ class GadgetBuilder:
                 self.hashes.stage_file("boot.sig", out_dir / "boot.sig", "rpi-eeprom-digest -k <board key>"),
                 self.hashes.stage_file("config.txt", cfg_path, "generated"),
             ]
-            notes.append("board OTP is locked to our key: boot.img signed, bootcode5.bin counter-signed, pubkey.bin added")
+            if family.countersigned_recovery:
+                notes.append("board OTP is locked to our key: boot.img signed, bootcode5.bin counter-signed, "
+                             "pubkey.bin added")
+            else:
+                notes.append(f"board OTP is locked to our key: boot.img signed, {family.soc}/pubkey.bin added "
+                             f"({family.second_stage} needs no counter-signature on a {family.chip})")
             if cmdline:
                 notes.append(f"the station holds this board's OTP device key: the gadget never exports it again "
                              f"({cmdline} in the signed boot.img)")

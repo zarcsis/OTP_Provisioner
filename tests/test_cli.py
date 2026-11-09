@@ -585,7 +585,7 @@ def test_winusb_rpiboot_setup_package(tmp_path):
     _write(tmp_path, "oem45.inf", RPI_INF)
     _write(tmp_path, "oem1.inf", OTHER_INF)
     r = winusb.scan(tmp_path)
-    assert set(r) == {"platform", "rpiboot", "fastboot", "detail"}
+    assert set(r) == {"platform", "rpiboot", "fastboot", "rpiboot_cm4", "detail"}
     assert r["platform"] == "windows" and r["rpiboot"] is True and r["fastboot"] is True
     assert "oem45.inf" in r["detail"] and "oem1.inf" not in r["detail"]
 

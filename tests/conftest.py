@@ -72,7 +72,9 @@ def make_cfg(monkeypatch):
         tree: dict = {
             "paths": {"work": str(tmp_path / "work")},
             "server": {"open_browser": False},
-            "builds": {"auto": False},
+            # The image of the Raspberry Pi 5 only unless a test asks for more families (the default builds a
+            # Compute Module 4 image too): most tests are about one family's pair of images.
+            "builds": {"auto": False, "image": {"families": ["pi5"]}},
         }
         _merge(tree, overrides)
         cfg = load_config(overrides=tree, repo_root=repo_root)

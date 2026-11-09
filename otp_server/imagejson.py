@@ -254,6 +254,19 @@ def custom_image_json(facts: dict, *, name: str, version: str, luks: dict | None
     }
 
 
+def with_device_class(image_json: dict, device_class: str) -> dict:
+    """A copy with ``IGmeta.IGconf_device_class`` = ``device_class`` (rpi-fastbootd's ``oem idpinit`` refuses an
+    image.json whose device class does not name the board's model)."""
+    import copy
+
+    ij = copy.deepcopy(image_json)
+    meta_ = ij.get("IGmeta")
+    if not isinstance(meta_, dict):
+        meta_ = ij["IGmeta"] = {}
+    meta_["IGconf_device_class"] = str(device_class)
+    return ij
+
+
 def partition_order(image_json: dict) -> list[str]:
     """Partition names (``partitionimages`` keys) in disk order, as the provisionmap lists them (top level
     and inside encrypted containers); only flat maps."""

@@ -1,6 +1,7 @@
 """Board ("module") lifecycle on top of a :class:`~otp_server.storage.base.ModuleStore` (SPEC section 7).
 
-A module is keyed by the 8-hex USB serial the BCM2712 boot ROM reports. Stages only move forward:
+A module is keyed by the 8-hex USB serial the boot ROM reports (BCM2712 or BCM2711: :mod:`otp_server.boards`;
+``chip`` in the record says which). Stages only move forward:
 ``new`` -> ``eeprom`` -> ``gadget`` -> ``flashed``. Every read-modify-write goes through one lock so
 concurrent API requests cannot lose updates. Records hold secrets; :meth:`ModuleService.public_view`
 is the only representation that may leave the server.
@@ -15,6 +16,7 @@ import re
 import threading
 from typing import Any
 
+from . import boards
 from .secrets_gen import (customer_key_hash, new_module_secrets, otp_zero_words, parse_device_private_key,
                           public_key_fingerprint, public_pem_from_private, same_public_key)
 from .storage.base import MAX_EVENTS, StoreError, normalize_record, utc_now_iso
@@ -53,6 +55,7 @@ USB_KEYS = ("vendor_id", "product_id", "product_name", "manufacturer", "serial_n
 #: The two second stages (``bootcode5.bin``) stage 1 can send. The BCM2712 boot ROM runs the plain
 #: recovery.bin only on a board whose OTP holds no key hash, and the one counter-signed with our key only
 #: on a board locked to it (usbboot secure-boot-recovery5/README.md); it refuses the other one silently.
+#: A BCM2711 has one second stage (``bootcode4.bin``): its boot ROM checks only Raspberry Pi's signature.
 RECOVERY_VARIANTS = ("plain", "countersigned")
 
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
@@ -176,6 +179,9 @@ class ModuleService:
         """
         key = normalize_serial(serial)
         info = info if isinstance(info, dict) else {}
+        chip = _clean_text(info.get("chip"), 64)
+        if chip and boards.family_of_chip(chip) is None:
+            raise ValueError(f"the station provisions {boards.supported_text()} only, this board is a {chip}")
         with self._lock:
             rec, created = self._load_or_new(key)
             self._ensure_secrets(rec)
@@ -444,6 +450,15 @@ class ModuleService:
         if result.get("second_stage_rejected"):
             ok = self._second_stage_rejected(rec, result, notes)
             return ok
+        try:
+            family = boards.family_of(rec)
+        except ValueError:
+            family = boards.PI5
+        unsupported = boards.unsupported_reason(rec)
+        if unsupported:
+            # A Pi 4 Model B reports BCM2711 like a CM4; only its own report tells them apart.
+            notes.append(f"{unsupported}: the station stops here (stages 2 and 3 are refused for this board)")
+            ok = False
 
         eeprom = md.get("EEPROM_UPDATE")
         if eeprom is None:
@@ -468,16 +483,29 @@ class ModuleService:
                 ok = False
         elif self.is_locked(rec) and not self.locked_to_our_key(rec):
             notes.append("warning: board OTP is locked to a different key (CUSTOMER_KEY_HASH " f"{rec['otp_key_hash']})")
+        want_locked = str(expect.get("otp_key_hash") or "").lower()
+        if want_locked and reported_hash and reported_hash != want_locked:
+            # Signed for a board assumed to hold our key hash (a BCM2711 runs that stage 1 either way): it does not.
+            if reported_hash == ZERO_HASH:
+                notes.append("the board's OTP holds no key hash after all (it was assumed locked): it got a signed "
+                             "EEPROM but is not locked; run stage 1 again, it now burns the key hash (program_pubkey=1)")
+            else:
+                notes.append(f"the board's OTP holds the key hash {reported_hash}, not this board's key "
+                             f"{want_locked}")
+            ok = False
         if (not ok and expect.get("secure_boot_provision") and not reported_hash and not self.is_locked(rec)
                 and "pieeprom.bin" in self._served_names(result)):
             # The board took program_pubkey=1 and the whole EEPROM image, then the run broke off before its
-            # report: it has most likely flashed the EEPROM and burnt our key hash into OTP. From now on its boot
-            # ROM only runs a counter-signed second stage, so the next stage 1 has to assume the lock.
+            # report: it has most likely flashed the EEPROM and burnt our key hash into OTP. From now on a BCM2712
+            # boot ROM only runs a counter-signed second stage, so the next stage 1 has to assume the lock (a
+            # BCM2711 runs the same second stage either way; the next run sends no program_pubkey=1 again).
             self._suspect_lock(rec, "a secure stage 1 broke off after the board got program_pubkey=1 and the whole "
                                     "pieeprom.bin, before its report")
             notes.append("the board's OTP probably holds our key hash now (it got program_pubkey=1 and the whole "
-                         "EEPROM image before the run broke off): the next stage 1 assumes the lock and sends the "
-                         "counter-signed second stage; the board's own report settles it")
+                         "EEPROM image before the run broke off): the next stage 1 assumes the lock"
+                         + (" and sends the counter-signed second stage" if family.countersigned_recovery else
+                            " (signed EEPROM without program_pubkey=1)")
+                         + "; the board's own report settles it")
 
         usn = md.get("USER_SERIAL_NUM")
         if usn:
@@ -506,7 +534,17 @@ class ModuleService:
 
     def _second_stage_rejected(self, rec: dict, result: dict, notes: list[str]) -> bool:
         """The page saw the boot ROM keep the second stage it was sent (no re-enumeration): the board's OTP
-        lock is not what the station assumed. Flip the assumption so the next run sends the other one."""
+        lock is not what the station assumed. Flip the assumption so the next run sends the other one.
+        A BCM2711 runs its one second stage whatever its OTP holds: nothing is assumed from its refusal."""
+        try:
+            family = boards.family_of(rec)
+        except ValueError:
+            family = boards.PI5
+        if not family.countersigned_recovery:
+            notes.append(f"the {family.chip} boot ROM did not run the second stage ({family.second_stage}); its OTP "
+                         f"does not matter for that. Check the USB cable and RPIBOOT mode ({family.rpiboot_how}), then "
+                         "run stage 1 again")
+            return False
         variant = str(result.get("recovery") or "").strip().lower()
         if variant not in RECOVERY_VARIANTS:
             notes.append("the boot ROM refused the second stage (the page did not say which one was sent)")
@@ -705,6 +743,10 @@ class ModuleService:
         """The Module JSON of SPEC section 8. Never contains ``rsa_private_pem`` or ``device_secret``."""
         r = normalize_record(record)
         stage = r["stage"]
+        try:
+            family = boards.family_of(r).key
+        except ValueError:
+            family = ""
         return {
             "serial": r["serial"],
             "stage": stage,
@@ -716,6 +758,8 @@ class ModuleService:
             "updated": r["updated"],
             "chip": r["chip"],
             "board": r["board"],
+            "family": family,
+            "unsupported": boards.unsupported_reason(r),
             "duid": r["duid"],
             "mac": r["mac"],
             "factory_uuid": r["factory_uuid"],

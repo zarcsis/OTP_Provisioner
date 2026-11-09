@@ -152,7 +152,7 @@ def test_signed_passes_expect_ckh_from_the_key(make_env, how):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed"
-    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh}
+    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh, "otp_key_hash": None}
     (run,) = env.docker.runs
     assert run["env"]["EXPECT_CKH"] == ckh and customer_key_hash(run["public_pem"]) == ckh
     assert run["env"]["MODE"] == "signed" and run["env"]["SIGN_RECOVERY"] == "0"
@@ -359,7 +359,7 @@ def test_open_plan_is_unsigned_and_ignores_the_board_key(make_env):
     assert plan.signed is False and plan.customer_key_hash == ""
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "unsigned"
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": None}
     (run,) = env.docker.runs
     assert "/keys" not in run["mounts"] and "EXPECT_CKH" not in run["env"]
 
@@ -374,7 +374,7 @@ def test_board_locked_to_our_key_gets_a_signed_stage1(make_env):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed" and m["irreversible"] == []
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": ckh}
     assert m["notes"][0] == "board OTP is already locked to our key: signed EEPROM and counter-signed recovery"
     assert "program_pubkey" not in m["config_txt"]
     (run,) = env.docker.runs
@@ -472,6 +472,30 @@ def test_script_signed_needs_valid_expect_ckh(tmp_path, ckh, msg):
         extra["EXPECT_CKH"] = ckh
     cp = _run_script(tmp_path, extra, "[all]\nSIGNED_BOOT=1\n", CFG_PLAIN + "program_pubkey=1\n")
     assert cp.returncode != 0 and msg in cp.stderr
+
+
+@pytest.mark.parametrize("extra, cfg, msg", [
+    ({"CHIP": "2711", "MODE": "signed", "SIGN_RECOVERY": "1", "LOCKED": "1"}, "", "SIGN_RECOVERY must be 0"),
+    ({"CHIP": "2712", "MODE": "signed", "SIGN_RECOVERY": "0", "LOCKED": "1"}, "", "SIGN_RECOVERY must equal LOCKED"),
+    ({"CHIP": "2711", "MODE": "signed", "SIGN_RECOVERY": "0", "LOCKED": "0"}, "", "or LOCKED=1"),
+    ({"CHIP": "2711", "MODE": "signed", "SIGN_RECOVERY": "0", "LOCKED": "1"}, "program_pubkey=1\n",
+     "program_pubkey=1 but LOCKED=1"),
+    ({"CHIP": "2711", "MODE": "unsigned", "SIGN_RECOVERY": "0", "LOCKED": "1"}, "", "LOCKED=1 requires MODE=signed"),
+    ({"CHIP": "2710", "MODE": "unsigned", "SIGN_RECOVERY": "0"}, "", "CHIP must be 2712 or 2711"),
+])
+def test_script_chip_and_lock_guards(tmp_path, extra, cfg, msg):
+    cp = _run_script(tmp_path, {"EXPECT_CKH": "ab" * 32, **extra}, "[all]\nSIGNED_BOOT=1\n" if extra["MODE"] == "signed"
+                     else "[all]\n", "uart_2ndstage=1\nrecovery_reboot=1\n" + cfg)
+    assert cp.returncode != 0 and msg in cp.stderr, cp.stderr
+
+
+@pytest.mark.parametrize("extra", [{"CHIP": "2711", "MODE": "unsigned", "SIGN_RECOVERY": "0"},
+                                   {"CHIP": "2711", "MODE": "signed", "SIGN_RECOVERY": "0", "LOCKED": "1"}])
+def test_script_cm4_passes_the_guards_to_its_firmware(tmp_path, extra):
+    signed = extra["MODE"] == "signed"
+    cp = _run_script(tmp_path, {"EXPECT_CKH": "ab" * 32, **extra}, "[all]\nSIGNED_BOOT=1\n" if signed else "[all]\n",
+                     "uart_2ndstage=1\nrecovery_reboot=1\n")
+    assert "firmware directory not found" in cp.stderr and "firmware-2711/latest" in cp.stderr, cp.stderr
 
 
 def test_script_compares_key_hash_with_expect_ckh():

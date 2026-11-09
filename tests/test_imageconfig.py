@@ -29,8 +29,23 @@ def test_render_is_raspberry_pi_os_lite():
     r = ic.render(image())
     assert r.files == {}
     assert "  layer: rpi5\n" in r.text and "  layer: image-rpios\n" in r.text
-    assert "  base: otp-rpios-lite\n  station: otp-rpios-setup\n" in r.text
-    assert r.summary == {"name": "rpios-trixie-arm64-lite", "base": "Raspberry Pi OS Lite"}
+    assert "  base: otp-rpios-lite\n  kernel: otp-rpios-kernel-2712\n  station: otp-rpios-setup\n" in r.text
+    assert r.summary == {"name": "rpios-trixie-arm64-lite", "base": "Raspberry Pi OS Lite", "family": "pi5"}
+
+
+def test_render_for_the_compute_module_4():
+    """The CM4 image: rpi-image-gen's rpi-cm4 device layer (rpi-generic64: kernel8, 4 KiB pages, so ext4 with 4 KiB
+    blocks) and the v8 kernel packages; the LUKS2 cipher stays aes-xts-plain64 (rpi-image-gen would pick Adiantum
+    for a SoC without AES instructions, but the station builds every container in aes-xts-plain64)."""
+    from otp_server import boards
+    yaml = pytest.importorskip("yaml")
+    pi5, cm4 = ic.render(image()), ic.render(image(), family=boards.CM4)
+    doc = yaml.safe_load(cm4.text)
+    assert doc["device"]["layer"] == "rpi-cm4" and doc["device"]["luks2_cipher"] == "aes-xts-plain64"
+    assert doc["layer"] == {"base": "otp-rpios-lite", "kernel": "otp-rpios-kernel-v8", "station": "otp-rpios-setup"}
+    assert "Compute Module 4" in cm4.text.splitlines()[0]
+    assert cm4.summary["family"] == "cm4" and cm4.digest() != pi5.digest()
+    assert (REPO_ROOT / "image" / "example-cm4.yaml").read_bytes().decode("utf-8") == cm4.text
 
 
 def test_render_ignores_the_board_settings():
@@ -47,9 +62,9 @@ def test_render_is_valid_yaml_with_the_expected_variables():
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load(ic.render(image()).text)
     assert doc["device"] == {"layer": "rpi5", "hostname": "raspberrypi", "user1": "pi", "user1sudo": "passwd",
-                             "user1groups": ic.IMAGE_USER_GROUPS}
+                             "user1groups": ic.IMAGE_USER_GROUPS, "luks2_cipher": "aes-xts-plain64"}
     assert "sudo" not in ic.IMAGE_USER_GROUPS.split(",")      # rpi-image-gen: user1sudo adds it, a listed one conflicts
-    assert doc["layer"] == {"base": "otp-rpios-lite", "station": "otp-rpios-setup"}
+    assert doc["layer"] == {"base": "otp-rpios-lite", "kernel": "otp-rpios-kernel-2712", "station": "otp-rpios-setup"}
     assert doc["image"] == {"layer": "image-rpios", "boot_part_size": "200%", "root_part_size": "300%",
                             "name": "rpios-trixie-arm64-lite"}
     assert set(doc) == {"device", "image", "layer"}           # locale: rpi-image-gen's defaults are pi-gen's
@@ -145,7 +160,11 @@ def test_station_layers_require_layers_that_exist():
     names = _layer_names()
     for f in LAYERS.glob("*.yaml"):
         assert _requires(f) <= names, f.name
-    assert {"otp-rpios-lite", "otp-rpios-setup", "otp-rpios-packages"} <= names
+    assert {"otp-rpios-lite", "otp-rpios-setup", "otp-rpios-packages", "otp-rpios-kernel-2712",
+            "otp-rpios-kernel-v8"} <= names
+    from otp_server import boards
+    for fam in boards.FAMILIES.values():                  # every layer a family's config names exists
+        assert {fam.device_layer, fam.kernel_layer} <= names, fam.key
 
 
 def test_otp_rpios_lite_layer():

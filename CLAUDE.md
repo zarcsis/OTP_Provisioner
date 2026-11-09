@@ -7,7 +7,8 @@ moving pieces of it elsewhere.
 
 ## What this is
 
-**OTP_Provisioner** is a demo provisioning station for Raspberry Pi 5 boards (BCM2712). One Python server
+**OTP_Provisioner** is a demo provisioning station for Raspberry Pi 5 boards (BCM2712) and, since 2026-11-09,
+Compute Module 4 modules (BCM2711; "Board families" under "Architecture in one pass"). One Python server
 (FastAPI, `otp_server/`) keeps the per-board secrets, builds every file a board needs inside Docker, and
 serves one web page (`index.html`, `js/`) that drives the board over **WebUSB** from Chrome or Edge: it
 speaks the `rpiboot` protocol to the boot ROM (stages 1 and 2) and the `fastboot` protocol to a
@@ -50,6 +51,14 @@ FAIL. README "Checking a board" (under "System packages and sandboxed apps") lis
 output. The secure scenario has not been on hardware since these updates (only the suites and the e2e runner
 cover it there).
 
+**Status (2026-11-09):** Compute Module 4 support is written and checked without a module: the suites, the page
+self-test (a mock CM4 through all three stages), the real `stage1.sh` in Docker for both families (unsigned, secure,
+locked), the gadget rebuilt for `pi5-family,cm4`, all four images rebuilt (the CM4 pair: 4 KiB-block ext4, the v8
+kernel only, `aes-xts-plain64`, an initramfs with `dm-crypt`, `aes-neon-bs`, the `hwkey` keyscript and `rpi-fw-crypto`),
+the real `boot-slot.sh` on them (a CM4's signed `boot.img`: `kernel8.img`, `initramfs8`, `start4.elf` that knows
+`lock_device_private_key`), and the e2e runner on the real artifacts, 514 checks in scenarios A-D (C, D: a mock CM4).
+No CM4 has been provisioned. README "Compute Module 4" ends with what a first run on a module must confirm.
+
 ## How it was written
 
 A series of working increments on `master`, all of it written in Claude Code sessions with the owner and
@@ -75,6 +84,10 @@ checked against a real board between steps:
    a minor version); usbboot 2026-10-23 (stage 2 carries the public key), pi-gen-micro main with rpi-fastbootd
    `adf29cb`, rpi-image-gen v2.9.0 with Raspberry Pi OS 2026-10-06, the bootloader from rpi-eeprom's latest
    channel, kernel command line additions as linux-base fragments. The apps demo ran on `2a03e58f` (Status).
+9. (2026-11-09) Compute Module 4: `otp_server/boards.py` (the families and what differs), stage 1 from
+   `firmware-2711` with `bootcode4.bin`, one gadget for `pi5-family,cm4`, an image pair per family
+   (`builds.image.families`), the kernel package layers split per flavour, the family's device class in every
+   image.json a board gets, the page accepting the BCM2711. Not on hardware yet (Status).
 
 Design decisions that were the owner's and should not be re-litigated:
 
@@ -111,6 +124,7 @@ otp_server/
   google_account.py           OAuth (scope drive.file), the "OTP_Provisioner" spreadsheet per account
   storage/base.py, gsheets.py record schema (FIELDS, append-only) and the Sheets store (cached, quota-aware)
   modules.py                  board lifecycle: hello, scenarios, stage verdicts, OTP lock state, key export
+  boards.py                   board families (pi5 = BCM2712, cm4 = BCM2711 CM4 only): every chip-dependent value
   diskimage.py                upload checks of a custom .img (MBR, two partitions); DiskPlan = the Imager file
   secrets_gen.py              RSA key, customer_key_hash, device_secret, LUKS key/passphrase derivation
   artifacts/                  tools image, stage 1 (EEPROM), gadget + stage 2, image + stage 3, LUKS per board,
@@ -131,9 +145,9 @@ js/
   server.js, app.js           API client; the UI
 docker/
   tools.Dockerfile, tools-entrypoint.sh      otp-tools: openssl, rpi-eeprom tools, mtools, sparse tools, cryptsetup
-  scripts/stage1.sh           recovery.bin + signed/unsigned pieeprom.bin (+ counter-signed recovery when locked)
+  scripts/stage1.sh           recovery.bin + signed/unsigned pieeprom.bin (+ counter-signed recovery when locked; CHIP=2711)
   scripts/stage2-sign.sh      boot.sig + counter-signed bootfiles.bin with pubkey.bin (+ per-board cmdline in boot.img)
-  scripts/boot-slot.sh        the board's boot partition: first-boot files, cmdline, re-sign on secure boards
+  scripts/boot-slot.sh        the board's boot partition: first-boot files, cmdline, re-sign on secure boards (BOARD=pi5|cm4)
   scripts/root-luks.sh, luks_encrypt.py      the board's LUKS2 container, encrypted exactly like dm-crypt
   scripts/image-collect.sh    rpi-image-gen output -> IDP set of sparse pieces + manifest
   scripts/custom-image.sh     an uploaded .img -> clear / crypt IDP set (ext4_sparse.py; custom-crypt/ = what the
@@ -144,7 +158,9 @@ docker/
   fastbootd/otp-station.patch, station-test.sh, station_test.cpp   our rpi-fastbootd and its build-time test
 image/
   build.sh, docker/           rpi-image-gen front end (Linux native or --docker; the station runs --in-container)
-  layer/otp-rpios-*.yaml      the three station layers = Raspberry Pi OS Lite; rpios_packages.py regenerates one
+  layer/otp-rpios-*.yaml      the station layers = Raspberry Pi OS Lite; rpios_packages.py regenerates the package
+                              layer and the kernel layers otp-rpios-kernel-2712 / -v8 (one per family)
+  example.yaml, example-cm4.yaml   the default config of each family (kept equal to imageconfig.render by a test)
   layer/otp-apps.yaml         the sandboxed apps (in the config only when image.apps is set)
 examples/apps/                the demo: vn-demo-provider (system), vn-demo-detector (app), build.py (stdlib .deb builder)
   rpi-image-gen/              submodule (v2.9.0)
@@ -164,16 +180,19 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1210 tests, ~1.5 min; needs no Docker, no Google, no hardware
-uv run python -B tests/web/run_selftest.py    # ~630 checks: the page in headless Chrome against a fake API + mock board
-uv run python -B tests/web/run_e2e.py         # ~240 checks: real server + real artifacts + mock board, both scenarios
+uv run --group dev python -B -m pytest -q     # ~1255 tests, ~1.5 min; needs no Docker, no Google, no hardware
+uv run python -B tests/web/run_selftest.py    # ~640 checks: the page in headless Chrome against a fake API + mock board
+uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
 
 * The e2e runner starts its own server (no Google, in-memory registry) but **reuses the default work
   dir**, so it needs the tools image, the gadget and both image variants built (it waits up to 40 min for a
   live server on :8765 to finish them, never builds itself). It shares that work dir with a running
   station: one e2e check ("Google login files untouched") fails when the live server rewrites
-  `google/spreadsheet.json` meanwhile; that is the live server, not the change under test.
+  `google/spreadsheet.json` meanwhile; that is the live server, not the change under test. Its server has only the
+  default settings plus `image.name`: when the station's image carries packages or apps, pass them with `--set`
+  (`--set 'image.packages=["<id>"]' --set 'image.apps=["<line>"]'`, the values of the sheet), or every image set is
+  "rebuild needed" for it and the run waits in vain. Scenarios C and D (a mock CM4) run when the cm4 images exist.
 * The page runners need Chrome (`--chrome`, `$OTP_CHROME`, the default Windows path or `PATH`).
 * `OTP_DOCKER_TESTS=1` adds a smoke test against the real engine. Two `test_keyexport_script.py` cases
   skip on Windows (POSIX permissions); the first-boot block test runs under Git Bash's `sh`.
@@ -181,12 +200,14 @@ uv run python -B tests/web/run_e2e.py         # ~240 checks: real server + real 
   it the `sh` tests skip and `bash` is WSL's `System32\bash.exe` (it gets neither the env nor the `C:/` paths), so
   `test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on` fails; Git's `bin\sh.exe` puts Git's tools
   before the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With
-  `usr\bin` first: 1204 passed, 3 skipped (2026-10-28). A tool shell (Claude Code's PowerShell) often lacks it.
+  `usr\bin` first: 1252 passed, 3 skipped (2026-11-09). A tool shell (Claude Code's PowerShell) often lacks it.
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
 * Everything else in the suites is mocks: a fake docker runner that writes plausible outputs, an in-memory
-  store, a fake Google account, a mock Pi 5 (`tests/web/mocks.js`: boot ROM, second-stage file server,
-  the station's fastbootd with its allowlist). When a new behaviour is added, the mock gets it too.
+  store, a fake Google account, a mock Pi 5 or CM4 (`tests/web/mocks.js`: boot ROM, second-stage file server,
+  the station's fastbootd with its allowlist; `MockBoard({chip: 'BCM2711'})`). When a new behaviour is added, the
+  mock gets it too. `tests/conftest.py` builds the Pi 5 image pair only (`builds.image.families: [pi5]`) unless a
+  test asks for more; `tests/test_cm4.py` holds the CM4 cases.
 * Real-hardware checks have been the final arbiter every time: several bugs below were invisible to every
   mock. Keep a sacrificial board; `program_pubkey`, the device key and `program_jtag_lock` are forever.
 
@@ -219,8 +240,21 @@ rpifwcrypto` from the image's own sources, the `custom-crypt/` files, crypttab/f
 the set's `image.json` (`imagejson.custom_image_json`: the image's disk id, its sizes, its first-partition
 offset as `image-palign-bytes`; crypt = an `encrypted` block with a fresh UUID so `station_luks` works as for
 the station image) and a manifest. `ImageBuilder.source_set` picks the station or the custom set for stage 3
-(`image.custom`); `_board_boot(custom=True)` signs in place (`INPLACE=1`, `PRUNE=pi5`) and serves an unsigned
-boot partition untouched when the image has no cloud-init (empty seed).
+(`image.custom`); `_board_boot(custom=True)` signs in place (`INPLACE=1`, `PRUNE=<family>`) and serves a Pi 5 an
+unsigned boot partition untouched when the image has no cloud-init (empty seed). A custom set serves every family:
+for a CM4 its image.json is a copy with `IGconf_device_class: cm4` (`_family_image_json`) and its boot slot always
+goes through `boot-slot.sh` (kernel/firmware check).
+
+**Board families.** `otp_server/boards.py` is the one place that knows what differs between a BCM2712 (`pi5`) and a
+BCM2711 Compute Module 4 (`cm4`): second stage name, EEPROM size, counter-signed recovery or not,
+`set_reboot_order`, device and kernel layer, device class, `rpi-make-boot-image -b`, gadget targets, accepted board
+types, operator texts. `family_of(record)` reads the record's `chip` (empty = `pi5`, the records before families);
+`unsupported_reason` refuses another SoC, and a BCM2711 that reported a non-CM4 `USER_BOARDREV`, at every stage.
+Stage 1 passes `CHIP`/`LOCKED` to `stage1.sh`; stage 2 checks `gadget_covers(builds.gadget.targets)`; the image
+builder keeps a clear/crypt pair per family in `builds.image.families` under labels `clear`/`crypt` (Pi 5, the names
+it always had) and `cm4-clear`/`cm4-crypt`; stage 3 passes `BOARD` (and `PRUNE`) to `boot-slot.sh`. The page knows
+the families too (`SUPPORTED_CHIPS` in `flow.js`): it accepts both ROMs, and only a manifest that names a recovery
+variant (BCM2712) arms the refused-second-stage watch.
 
 **The Imager file.** `ImageBuilder.imager_image` = the secure stage 3 of a locked board (signed boot slot,
 station-built LUKS container) laid out by `diskimage.DiskPlan` (MBR from the set's partition table, partitions
@@ -304,6 +338,17 @@ through the page once (secure, first run) and that is the accepted weak point of
   `tests/test_artifacts.py` checks the patch against what `js/fastboot.js` sends. A signature cannot be
   withdrawn: gadgets signed for a board with the stock daemon stay valid for it, so rebuild before boards go
   out.
+* **On a Compute Module 4 (BCM2711)** the same chain is weaker in three places (README "Compute Module 4"): its
+  boot ROM checks only Raspberry Pi's signature of the second stage, so `bootcode4.bin` is never counter-signed and
+  any Raspberry Pi-signed bootloader runs over rpiboot (what stays enforced is the signed EEPROM config and
+  `boot.img` against the OTP key hash; `program_arb` is not used); `lock_device_private_key=1` and rpi-fw-crypto live
+  in `start4*.elf` inside `boot.img`, not in the EEPROM, so `boot-slot.sh` refuses a CM4 slot whose firmware does not
+  know the option (`check_firmware_lock`: the string in every `start4*.elf`); the SoC has no AES instructions, and
+  rpi-image-gen would pick Adiantum for its crypt image unless the config sets `luks2_cipher: aes-xts-plain64` (every
+  rendered config does: the station's containers are aes-xts). The gadget runs pi-gen-micro's cut-down
+  `start4cd.elf` on a CM4 (`gpu_mem=16`); it carries the crypto section, but that it serves the key export and
+  `cryptcheck` is unconfirmed on hardware. rpiidp's `idpinit` checks `IGconf_device_class` against the model
+  (`/proc/device-tree/model`): `pi4`/`cm4` accept a CM4, `pi5`/`cm5` only BCM2712 boards.
 
 ## What went wrong, and how it was fixed
 
@@ -507,6 +552,15 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   share one proxy between apps.
 * Logs must never contain key material, passphrases or tokens (`docker.py` masks env names matching
   KEY/PASS/SECRET/TOKEN/PRIVATE; the page redacts passphrases in command echoes).
+* Everything that depends on the board's SoC is read from its `boards.Family` (`family_of(record)`), never from a
+  chip name or a `2712` written into the code. A board is served only its family's files: the stage-1 firmware and
+  second stage, an image set whose manifest names its family (`rebuild_reason`), an `image.json` whose
+  `IGconf_device_class` is its family's (rpiidp refuses another), a `boot.img` made for its `BOARD`.
+* The Pi 5 keeps the names it had before families (`clear`/`crypt` labels, `current-<variant>.json`, the gadget
+  of `pi5-family`): never rename them, existing work dirs and sheets rely on them. `builds.gadget.targets` reaches
+  pi-gen-micro comma-separated (`config._gadget_targets`); a space would make it skip the target with a warning.
+* A signed CM4 boot slot always passes `check_firmware_lock` (its `start4*.elf` know `lock_device_private_key`),
+  and every rendered image config sets `luks2_cipher: aes-xts-plain64` (what `root-luks.sh` builds).
 
 ## Conventions
 
@@ -548,6 +602,8 @@ For the planned split (server on another machine, Sheets replaced, the open scen
   whatever replaces it) must back up `rsa_private_pem` before stage 1 runs.
 * Two `bootcode5.bin` variants; the ROM never says which it wanted. Any port must keep the assumption
   logic or an operator override; `mark-locked` exists because the report can be lost after OTP is burnt.
+  A BCM2711 (CM4) has one `bootcode4.bin` for both states: its refusal says nothing about OTP, and the assumption
+  only decides whether stage 1 sends `program_pubkey=1` again (it does not; the board's report settles it).
 * The ROM refuses a counter-signed recovery on a clean board, so "always send the signed one" does not
   work either.
 * `fastbootd` READ-locks the key at start; a helper that must read it has to run `Before=fastbootd` and
@@ -615,6 +671,17 @@ For the planned split (server on another machine, Sheets replaced, the open scen
   fragments in a late hook and rpi-linux-base installs it). A fragment is one line: `-glob` drops words, a
   word is added once. `tests/test_imageconfig.py` runs our fragments through upstream's assembler.
 * The package set is pinned to one Raspberry Pi OS Lite release `.info`; regenerate
-  `otp-rpios-packages.yaml` with `image/rpios_packages.py` when the base release moves, and re-verify
-  the first boot on hardware (cloud-init, NetworkManager and raspi-config behaviour all changed between
+  `otp-rpios-packages.yaml` and the kernel layers with `image/rpios_packages.py` when the base release moves, and
+  re-verify the first boot on hardware (cloud-init, NetworkManager and raspi-config behaviour all changed between
   releases during this project).
+
+**The Compute Module 4**
+* Its family is the boot ROM's (`BCM2711`), but so is a Pi 4 Model B's, a Pi 400's and a CM4S's: only
+  `USER_BOARDREV` from stage 1 (type `0x14`) says it is a CM4. A port that skips stage 1 cannot tell them apart.
+* It enters RPIBOOT through the nRPIBOOT jumper and stays in it for stages 2 and 3 because of the jumper (no
+  `set_reboot_order` on a BCM2711); the operator removes it after stage 3. `shutdown` only halts a CM4.
+* Its gadget and OS firmware (`start4*.elf`) come from Raspberry Pi's apt repository at build time and decide
+  whether rpi-fw-crypto and `lock_device_private_key` work (on a Pi 5 the EEPROM decides). The gadget's
+  raspi-firmware version is not part of the gadget key: a firmware regression would not rebuild anything.
+* Unconfirmed on hardware (2026-11-09): the 8-hex USB serial of the BCM2711 ROM, the WebUSB timings, the cut-down
+  firmware's crypto service in the gadget, the CM4 crypt image's initramfs, the eMMC erase time.

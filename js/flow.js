@@ -23,8 +23,14 @@
  *   onBuildWait(n, {reason, job})     the server is still building what this stage needs
  *   onDevice(usb | null, kind)        the current USB device changed
  *
- * Serial identity: the BCM2712 boot ROM reports the 8-hex serial; the fastboot gadget reports the 16-hex
+ * Serial identity: the boot ROM reports the 8-hex serial; the fastboot gadget reports the 16-hex
  * 64-bit serial whose last 8 hex are the same value. The server keys boards by the 8-hex value.
+ *
+ * Board families (SUPPORTED_CHIPS, otp_server/boards.py on the server): BCM2712 (Raspberry Pi 5 / CM5 / Pi 500)
+ * and BCM2711 (Compute Module 4 only; the server refuses a Pi 4 Model B or Pi 400 once stage 1 reported the board
+ * type). A CM4 enters RPIBOOT through its nRPIBOOT jumper and keeps it fitted until stage 3 is done; its boot ROM
+ * runs one second stage whatever its OTP holds, so its stage 1 manifest names no "recovery" variant and the page
+ * does not watch for a refused second stage.
  */
 (function () {
     'use strict';
@@ -37,6 +43,15 @@
     const FASTBOOT_VARS = ['product', 'version-bootloader', 'version-fastbootd', 'secure', 'secure-otp', 'secure-devkey',
         'mmc-cid', 'mac-ethernet', 'rpi-duid', 'otp-lock-status', 'block-devices', 'max-download-size'];
     const USB_FILTERS = [...OTP.rpiboot.USB_FILTERS, ...OTP.fastboot.FILTERS];
+    /** The boot ROMs of the boards the station provisions, with how the operator gets each into RPIBOOT mode. */
+    const SUPPORTED_CHIPS = {
+        BCM2712: { family: 'pi5', title: 'Raspberry Pi 5 / CM5 / Pi 500', rpiboot: 'hold the power button while plugging in USB-C',
+            stopped: 'powered off', afterFlash: 'unplug it and power it from its own supply' },
+        // a CM4 has no power-off circuit of its own: `shutdown` halts it
+        BCM2711: { family: 'cm4', title: 'Compute Module 4', rpiboot: 'fit the nRPIBOOT jumper and power the board on',
+            stopped: 'halted', afterFlash: 'remove the nRPIBOOT jumper (it would boot into RPIBOOT again), then power-cycle it on its own supply' },
+    };
+    const SUPPORTED_TEXT = 'Raspberry Pi 5 / CM5 / Pi 500 (BCM2712) and Compute Module 4 (BCM2711)';
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     /** Uint8Array -> base64 (small payloads: the exported device key). */
     const toBase64 = (bytes) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
@@ -298,7 +313,7 @@
                 } finally {
                     await dev.close();
                 }
-                if (!dev.chip || dev.chip.name !== 'BCM2712') throw new Error(`${dev.chip ? dev.chip.name : 'unknown chip'}: the station provisions Raspberry Pi 5 / CM5 (BCM2712) only`);
+                if (!dev.chip || !SUPPORTED_CHIPS[dev.chip.name]) throw new Error(`${dev.chip ? dev.chip.name : 'unknown chip'}: the station provisions ${SUPPORTED_TEXT} only`);
                 const serial = normalizeSerial(dev.serial || u.serialNumber);
                 if (!serial) throw new Error(`the board reported no usable USB serial ("${dev.serial || u.serialNumber || ''}")`);
                 const body = {
@@ -488,11 +503,17 @@
             return true;
         }
 
+        /** What the board's chip means for the operator (SUPPORTED_CHIPS; a Raspberry Pi 5 when unknown). */
+        boardKind() {
+            const chip = (this.module && this.module.chip) || (this.probeInfo && this.probeInfo.chip && this.probeInfo.chip.name) || '';
+            return SUPPORTED_CHIPS[chip] || SUPPORTED_CHIPS.BCM2712;
+        }
+
         _stageFailed(n, e) {
             let msg;
             if (e instanceof FlowAbort || this.aborted) msg = 'aborted by the operator';
             else if (e instanceof FlowCancelled) msg = e.message;
-            else if (isGone(e) || e instanceof DeviceGone) msg = `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (hold the power button while plugging in), click "Connect board", then "Provision" to resume from stage ${n}.`;
+            else if (isGone(e) || e instanceof DeviceGone) msg = `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (${this.boardKind().rpiboot}), click "Connect board", then "Provision" to resume from stage ${n}.`;
             else msg = errText(e);
             if (e instanceof SecondStageRejected && e.verdict && e.verdict.notes && e.verdict.notes.length) {
                 msg += `. ${e.verdict.notes.filter((t) => !/^page reported failure/.test(t)).join('. ')}`;
@@ -557,7 +578,9 @@
                 need: 'rpiboot',
                 needAfterMs: this.opt.needDeviceAfterMs,
                 what: `board ${this.serial} to re-enumerate as the second stage`,
-                giveUp: previous && this.opt.secondStageRejectMs ? {
+                // Only a boot ROM that picks between two second stages (BCM2712: the manifest names the variant)
+                // refuses one silently; a BCM2711 runs the one it is given.
+                giveUp: previous && recovery && this.opt.secondStageRejectMs ? {
                     afterMs: this.opt.secondStageRejectMs,
                     check: () => this._isConnected(previous),
                     error: () => new SecondStageRejected(recovery),
@@ -785,7 +808,7 @@
                 const verified = res.verified || [];
                 const summary = `${res.flashed.map((f) => `${f.simage} → ${f.dev}`).join(', ')}`
                     + `${verified.length ? `; the board's key opens ${verified.map((v) => v.dev).join(', ')}` : ''}`
-                    + '; the board is powered off: unplug it and power it from its own supply, it sets itself up on that first boot';
+                    + `; the board is ${this.boardKind().stopped}: ${this.boardKind().afterFlash}, it sets itself up on that first boot`;
                 this._setStage(3, 'done', summary, { verdict });
                 this.log('ok', `Stage 3 (Image) done: ${summary}`);
                 this.deviceStale = true;
@@ -823,6 +846,7 @@
         return pem;
     };
 
+    Flow.SUPPORTED_CHIPS = SUPPORTED_CHIPS;
     Flow.STAGE_TITLES = STAGE_TITLES;
     Flow.STAGE_INDEX = STAGE_INDEX;
     Flow.FASTBOOT_VARS = FASTBOOT_VARS;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write ``layer/otp-rpios-packages.yaml``: the package set of an official Raspberry Pi OS Lite release.
+"""Write the package layers of the station image from an official Raspberry Pi OS Lite release.
 
 Raspberry Pi publishes a ``.info`` file next to every image (``dpkg -l`` of the finished image)::
 
@@ -8,11 +8,17 @@ raspios_lite_arm64-2026-10-06/2026-10-06-raspios-trixie-arm64-lite.info
 
 (a local path works too). Every installed package is listed, dependencies included: pi-gen installs with
 recommends and rpi-image-gen without, so naming only pi-gen's top-level lists would give a smaller system.
-Left out, because the station image is for the Raspberry Pi 5 only:
 
-* the versioned kernel packages (``linux-image-6.12.47+rpt-rpi-2712`` ...): the ``linux-*-rpi-2712``
-  metapackages pull the current ones;
-* the Raspberry Pi 3/4 kernel (``linux-image-rpi-v8``, ``linux-headers-rpi-v8`` and their versioned packages).
+Three layers (``layer/``):
+
+* ``otp-rpios-packages.yaml``: everything but the kernels, the same for every board family;
+* ``otp-rpios-kernel-2712.yaml``: the Raspberry Pi 5 kernel metapackages (``linux-image-rpi-2712``,
+  ``linux-headers-rpi-2712``), for the ``pi5`` family;
+* ``otp-rpios-kernel-v8.yaml``: the Raspberry Pi 3/4 kernel metapackages (``linux-image-rpi-v8``,
+  ``linux-headers-rpi-v8``), for the ``cm4`` family.
+
+The official image carries both kernels (it boots every model); a station image carries its family's. Left out
+everywhere: the versioned kernel packages (``linux-image-6.12.47+rpt-rpi-2712`` ...), which the metapackages pull.
 """
 from __future__ import annotations
 
@@ -21,9 +27,17 @@ import sys
 import urllib.request
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent / "layer" / "otp-rpios-packages.yaml"
+LAYER_DIR = Path(__file__).resolve().parent / "layer"
+OUT = LAYER_DIR / "otp-rpios-packages.yaml"
 VERSIONED_KERNEL = re.compile(r"^linux-(?:image|headers|kbuild)-\d")
-OTHER_BOARDS = frozenset({"linux-image-rpi-v8", "linux-headers-rpi-v8"})
+#: The kernel metapackages of each flavour; each flavour has its own layer.
+KERNEL_META = re.compile(r"^linux-(?:image|headers)-rpi-(2712|v8)$")
+FLAVOURS = ("2712", "v8")
+FLAVOUR_BOARDS = {"2712": "Raspberry Pi 5 / CM5 / Pi 500, BCM2712", "v8": "Compute Module 4, BCM2711"}
+
+
+def kernel_layer(flavour: str) -> Path:
+    return LAYER_DIR / f"otp-rpios-kernel-{flavour}.yaml"
 
 
 def read_info(src: str) -> str:
@@ -33,8 +47,9 @@ def read_info(src: str) -> str:
     return Path(src).read_text(encoding="utf-8")
 
 
-def parse(info: str) -> tuple[str, str, list[str], list[str]]:
-    """(release line, generator line, kept packages, dropped packages) of a ``.info`` file."""
+def parse(info: str) -> tuple[str, str, list[str], list[str], dict[str, list[str]]]:
+    """(release line, generator line, kept packages, dropped packages, {flavour: kernel metapackages}) of a
+    ``.info`` file."""
     lines = info.splitlines()
     release = lines[0].strip() if lines else ""
     generator = lines[1].strip() if len(lines) > 1 else ""
@@ -42,6 +57,7 @@ def parse(info: str) -> tuple[str, str, list[str], list[str]]:
         raise SystemExit(f"not a Raspberry Pi OS .info file (first line {release!r})")
     keep: list[str] = []
     drop: list[str] = []
+    kernels: dict[str, list[str]] = {f: [] for f in FLAVOURS}
     for line in lines:
         f = line.split()
         if len(f) < 4 or f[0] != "ii":
@@ -52,16 +68,23 @@ def parse(info: str) -> tuple[str, str, list[str], list[str]]:
         elif ":" not in name and arch not in ("arm64", "all"):
             name = f"{name}:{arch}"
         bare = name.split(":")[0]
-        if VERSIONED_KERNEL.match(bare) or bare in OTHER_BOARDS:
+        m = KERNEL_META.match(bare)
+        if m:
+            kernels[m.group(1)].append(bare)
+        elif VERSIONED_KERNEL.match(bare):
             drop.append(name)
         else:
             keep.append(name)
     if len(keep) < 100:
         raise SystemExit(f"only {len(keep)} packages found: is this the .info of a Lite image?")
-    return release, generator, sorted(set(keep)), sorted(set(drop))
+    for flavour, names in kernels.items():
+        if f"linux-image-rpi-{flavour}" not in names:
+            raise SystemExit(f"the release has no linux-image-rpi-{flavour}: is this an arm64 Lite image?")
+    return release, generator, sorted(set(keep)), sorted(set(drop)), {k: sorted(set(v)) for k, v in kernels.items()}
 
 
 def render(release: str, generator: str, keep: list[str], drop: list[str]) -> str:
+    """``otp-rpios-packages.yaml``: every package but the kernels."""
     head = [
         "# METABEGIN",
         "# X-Env-Layer-Name: otp-rpios-packages",
@@ -74,10 +97,30 @@ def render(release: str, generator: str, keep: list[str], drop: list[str]) -> st
         "---",
         f"# {release}",
         f"# {generator}",
-        f"# {len(keep)} packages; left out (Raspberry Pi 5 image, the kernel metapackages pull the rest):",
+        f"# {len(keep)} packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (the",
+        "# metapackages pull them):",
     ]
     head += [f"#   {name}" for name in drop]
     body = ["mmdebstrap:", "  packages:"] + [f"    - {name}" for name in keep]
+    return "\n".join(head + body) + "\n"
+
+
+def render_kernel(flavour: str, release: str, generator: str, names: list[str]) -> str:
+    """``otp-rpios-kernel-<flavour>.yaml``: the kernel metapackages of one flavour."""
+    head = [
+        "# METABEGIN",
+        f"# X-Env-Layer-Name: otp-rpios-kernel-{flavour}",
+        "# X-Env-Layer-Category: distribution",
+        f"# X-Env-Layer-Desc: The {flavour} kernel packages of an official Raspberry Pi OS",
+        f"#  Lite release ({FLAVOUR_BOARDS[flavour]}; generated by",
+        "#  image/rpios_packages.py from the release's .info file; do not edit by hand).",
+        "# X-Env-Layer-Version: 1.0.0",
+        "# METAEND",
+        "---",
+        f"# {release}",
+        f"# {generator}",
+    ]
+    body = ["mmdebstrap:", "  packages:"] + [f"    - {name}" for name in names]
     return "\n".join(head + body) + "\n"
 
 
@@ -85,9 +128,13 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
-    release, generator, keep, drop = parse(read_info(argv[1]))
+    release, generator, keep, drop, kernels = parse(read_info(argv[1]))
     OUT.write_bytes(render(release, generator, keep, drop).encode("utf-8"))
     print(f"{OUT}: {len(keep)} packages from {release!r}, {len(drop)} left out")
+    for flavour in FLAVOURS:
+        path = kernel_layer(flavour)
+        path.write_bytes(render_kernel(flavour, release, generator, kernels[flavour]).encode("utf-8"))
+        print(f"{path}: {', '.join(kernels[flavour])}")
     return 0
 
 

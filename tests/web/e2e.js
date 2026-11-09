@@ -3,7 +3,8 @@
  *
  * Loaded by the runner's proxy BEFORE the page's own scripts (after tests/web/mocks.js), so navigator.usb is a
  * TestMocks.MockHub by the time js/app.js builds its OTP.Flow. window.__E2E = {scenario, serial, mode, blocks,
- * timeoutMs} comes from the runner: mode = the scenario radio to pick ("open" | "secure"), blocks = the
+ * timeoutMs, chip} comes from the runner: mode = the scenario radio to pick ("open" | "secure"), chip = "BCM2712" (a Pi 5)
+ * or "BCM2711" (a Compute Module 4: USB 0a5c:2711, USER_BOARDREV c03141), blocks = the
  * "<dev>:<simage>" list the mock gadget answers to "oem idpgetblk" (the runner reads it from the image set the
  * server serves for that scenario). The script plugs a mock Raspberry Pi 5 into the hub and clicks through the
  * real UI like an operator (scenario radio → Connect board → Provision → typed-serial confirmation → Select
@@ -44,10 +45,13 @@
 
     // ------------------------------------------------------------------ the board (records what it received)
 
-    /** One Pi 5: ROM → recovery (stage 1) → ROM → bootloader (stage 2) → fastboot gadget (stage 3). */
+    /** One Pi 5 or CM4: ROM → recovery (stage 1) → ROM → bootloader (stage 2) → fastboot gadget (stage 3). */
     class E2EBoard {
         constructor(opts) {
-            this.o = Object.assign({ serial: 'e2e5a7c1', keyHash: '0'.repeat(64), program: false, blocks: [], fastboot: {} }, opts);
+            this.o = Object.assign({ serial: 'e2e5a7c1', keyHash: '0'.repeat(64), program: false, blocks: [], fastboot: {}, chip: 'BCM2712' }, opts);
+            this.cm4 = this.o.chip === 'BCM2711';
+            this.pid = this.cm4 ? 0x2711 : 0x2712;
+            if (this.cm4) this.o.fastboot = Object.assign({ product: 'Raspberry Pi Compute Module 4 Rev 1.1' }, this.o.fastboot);
             this.boots = 0;
             this.history = [];
             this.roms = [];          // [{boot, bytes: Uint8Array}] second stage sent to each ROM enumeration
@@ -61,7 +65,7 @@
             }, delay || 5);
         }
         _rom() {
-            const rom = T.romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom) });
+            const rom = T.romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), productId: this.pid });
             this.roms.push({ boot: this.boots + 1, dev: rom });
             return rom;
         }
@@ -77,7 +81,7 @@
             const md = [
                 ['USER_SERIAL_NUM', this.o.serial],
                 ['MAC_ADDR', '2c:cf:67:e2:e5:01'],
-                ['USER_BOARDREV', 'd04170'],
+                ['USER_BOARDREV', this.cm4 ? 'c03141' : 'd04170'],
                 ['CUSTOMER_KEY_HASH', this.o.program ? this.o.keyHash : '0'.repeat(64)],
             ];
             if (this.o.program) md.push(['SECURE_BOOT_PROVISION', 'success']);
@@ -85,7 +89,7 @@
             return md.map(([k, v]) => ({ cmd: 0, name: `*${k}*${v}` }));
         }
         _fs(script, rec, onEnd) {
-            const fs = T.fsDevice({ serial: '', script, onEnd });
+            const fs = T.fsDevice({ serial: '', script, onEnd, productId: this.pid });
             const origIn = fs.controlTransferIn;
             fs.controlTransferIn = async function (setup, len) {
                 const idx = this.readIndex;
@@ -264,7 +268,7 @@
         report.scenarioRemembered = (() => { try { return localStorage.getItem('otp.scenario'); } catch (e) { return null; } })();
         mark(`scenario radio: ${report.scenarioDefault} → ${report.scenarioRadio}`);
 
-        const board = new E2EBoard({ serial: CFG.serial, program: CFG.mode === 'secure', blocks: CFG.blocks || [] });
+        const board = new E2EBoard({ serial: CFG.serial, program: CFG.mode === 'secure', blocks: CFG.blocks || [], chip: CFG.chip || 'BCM2712' });
         window.__E2E_BOARD = board;
         report.blocks = board.o.blocks;
         board.powerOnRom();

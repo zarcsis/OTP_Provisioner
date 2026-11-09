@@ -965,6 +965,52 @@
             eq(r3 && `${r3[3].ok}:${r3[3].details.device_key_pem}`, 'true:null', 'open: stage-3 result without a device key');
         }
 
+        // a Compute Module 4 (BCM2711): bootcode4.bin, a stage 1 without a recovery variant, its own way into RPIBOOT
+        section = 'flow-cm4';
+        {
+            const { files, m1open, m2, m3open } = await buildServerFiles();
+            const bc4 = T.bytesOf(900, 51);
+            const cfg4 = enc.encode('uart_2ndstage=1\nrecovery_reboot=1\n');
+            const entry = async (name, bytes) => {
+                const url = `/api/modules/a7eb274c/stage/1/files/cm4/${name}`;
+                files.set(url, bytes);
+                return { name, size: bytes.byteLength, sha256: await sha(bytes), url, origin: 'test' };
+            };
+            const m1cm4 = Object.assign({}, m1open, { chip: 'BCM2711', recovery: null,
+                files: [await entry('bootcode4.bin', bc4), ...m1open.files.slice(1, 3), await entry('config.txt', cfg4)] });
+            const api = new T.FakeApi({ files, manifests: { 1: m1cm4, 2: m2, 3: m3open } });
+            const hub = new T.MockHub();
+            // its ROM runs the second stage later than the BCM2712 refusal watch would wait: that is no refusal here
+            const board = new T.MockBoard(hub, { chip: 'BCM2711', program: false, bootDelayMs: 400,
+                fastboot: { blocks: ['mmcblk0p1:boot.sparse', 'mmcblk0p2:root.sparse'] } });
+            board.powerOnRom();
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev, { scenario: 'open', secondStageRejectMs: 150 });
+            await flow.connectBoard();
+            const hb = api.calls[0] && api.calls[0][1];
+            eq(hb && `${hb.chip}:${hb.board}:${hb.usb.product_id}:${hb.usb.product_name}`, `BCM2711:Pi 4 / CM4:${0x2711}:BCM2711 Boot`, 'cm4: hello reports the BCM2711');
+            const ok = await flow.provision();
+            eq(ok, true, 'cm4: provision() succeeded');
+            if (!ok) results.push('  cm4 flow log:\n    ' + ev.logs.slice(-20).join('\n    '));
+            deq(board.history, ['rom', 'fs', 'rom', 'fs', 'fastboot'], 'cm4: ROM → recovery → ROM → bootloader → fastboot gadget');
+            eq(api.calls.some((c) => c[0] === 'result' && c[3].second_stage_rejected), false, 'cm4: a slow second stage is not taken for a refusal (the manifest names no recovery variant)');
+            assert(ev.logs.some((l) => /Sending bootcode4\.bin .* from server stage 1/.test(l)), 'cm4: stage 1 hands the ROM bootcode4.bin from the manifest', ev.logs.filter((l) => /Sending/.test(l)).join(' | '));
+            assert(ev.logs.some((l) => /Sending bootcode4\.bin .* from bootfiles\.bin:2711\/bootcode4\.bin/.test(l)), 'cm4: stage 2 takes 2711/bootcode4.bin from bootfiles.bin', ev.logs.filter((l) => /Sending/.test(l)).join(' | '));
+            const b1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
+            eq(b1 && b1[3].metadata.USER_BOARDREV, 'c03141', 'cm4: the stage-1 report carries the board type (USER_BOARDREV, the server refuses a Pi 4 Model B)');
+            assert(/the board is halted: remove the nRPIBOOT jumper/.test(flow.stages[3].detail), 'cm4: stage 3 says the module halted and tells the operator to remove the nRPIBOOT jumper', flow.stages[3].detail);
+            eq(flow.boardKind().family, 'cm4', 'cm4: the flow knows the board family');
+        }
+        {
+            // a board the station does not provision (here a BCM2837 boot ROM): refused at connect, the server never hears of it
+            const hub = new T.MockHub();
+            hub.plug(T.romDevice({ serial: 'a7eb274c', productId: 0x2764 }));
+            const api = new T.FakeApi({ files: new Map(), manifests: {} });
+            const flow = makeFlow(api, hub, newEv());
+            await throwsLike(() => flow.connectBoard(), /BCM2836\/BCM2837: the station provisions .*Compute Module 4 \(BCM2711\) only/, 'other SoCs are refused at connect');
+            eq(api.calls.length, 0, '… before anything is sent to the server');
+        }
+
         // ================================================================ T10 Flow: failure paths
         section = 'flow-errors';
         {

@@ -25,12 +25,14 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
+from . import boards
 from . import imageconfig
 
 log = logging.getLogger(__name__)
@@ -85,11 +87,12 @@ DEFAULTS: dict[str, Any] = {
         "auto": True,
         "tools": {"image_tag": "otp-tools:latest"},
         "gadget": {
-            "targets": "pi5-family",
+            "targets": "pi5-family,cm4",
             "image_tag": "otp-gadget-builder:trixie",
             "volume": "otp-pgm-work",
         },
         "image": {
+            "families": ["pi5", "cm4"],
             "overrides": [],
             "builder_tag": "otp-image-builder:trixie",
             "volume": "otp-image-work",
@@ -168,12 +171,14 @@ class ImageCfg:
 @dataclass
 class ImageBuildCfg:
     """How the image is built: rpi-image-gen from ``<repo>/image`` in the builder image (``overrides`` are
-    extra ``IGconf_*=value`` words for rpi-image-gen)."""
+    extra ``IGconf_*=value`` words for rpi-image-gen). ``families``: the board families
+    (:mod:`otp_server.boards`) the station builds its image for, a clear and a crypt variant each."""
 
     overrides: list[str]
     builder_tag: str
     volume: str
     keep_raw_image: bool
+    families: list[str] = field(default_factory=lambda: ["pi5"])
 
 
 @dataclass
@@ -572,6 +577,21 @@ def _unique(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+_TARGET_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def _gadget_targets(value: str) -> str:
+    """``builds.gadget.targets`` as pi-gen-micro takes it: one comma-separated word (``pi5-family,cm4``); spaces
+    between targets are read as commas (pi-gen-micro splits at commas only, and the gadget builder refuses spaces)."""
+    words = boards.gadget_target_words(value)
+    if not words:
+        raise ValueError("name at least one pi-gen-micro target (pi5-family, cm4, ...)")
+    for w in words:
+        if not _TARGET_RE.match(w):
+            raise ValueError(f"{w!r} is not a pi-gen-micro target name")
+    return ",".join(_unique(words))
+
+
 def _default_desktop_path() -> Path | None:
     if sys.platform != "win32":
         return None
@@ -617,11 +637,17 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
         if o.startswith("IGconf_image_pmap="):
             raise ValueError("config builds.image.overrides: IGconf_image_pmap is set per scenario "
                              "(open = clear, secure = crypt; both images are built); remove it")
+    words = [w for item in _str_list(image.get("families"), "builds.image.families", "board families")
+             for w in item.replace(",", " ").split()]
+    families = _unique([_checked("builds.image.families", boards.check_family, w) for w in words])
+    if not families:
+        raise ValueError(f"config builds.image.families: name at least one board family ({', '.join(boards.FAMILIES)})")
     builds = BuildsCfg(
         auto=_bool(bld.get("auto"), "builds.auto"),
         tools=ToolsBuildCfg(image_tag=_str(tools.get("image_tag"), "builds.tools.image_tag") or ""),
         gadget=GadgetBuildCfg(
-            targets=_str(gadget.get("targets"), "builds.gadget.targets") or "pi5-family",
+            targets=_checked("builds.gadget.targets", _gadget_targets,
+                             _str(gadget.get("targets"), "builds.gadget.targets") or DEFAULTS["builds"]["gadget"]["targets"]),
             image_tag=_str(gadget.get("image_tag"), "builds.gadget.image_tag") or "",
             volume=_str(gadget.get("volume"), "builds.gadget.volume") or "",
         ),
@@ -630,6 +656,7 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
             builder_tag=_str(image.get("builder_tag"), "builds.image.builder_tag") or "",
             volume=_str(image.get("volume"), "builds.image.volume") or "",
             keep_raw_image=_bool(image.get("keep_raw_image"), "builds.image.keep_raw_image"),
+            families=families,
         ),
     )
 

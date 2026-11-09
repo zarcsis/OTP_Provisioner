@@ -9,12 +9,17 @@
 #     which the OS reads from the boot partition (/boot/firmware) like on an unsigned board.
 #     INPLACE=1 (an operator's own image): boot.img, boot.sig and config.txt go into the image's own boot
 #     partition instead of a new FAT32, so every file the image keeps there (and its label and volume id)
-#     stays where the OS expects it; PRUNE=pi5 leaves what a Raspberry Pi 5 never loads out of boot.img.
+#     stays where the OS expects it; PRUNE=pi5|cm4 leaves what that board never loads out of boot.img.
 #     The config.txt inside a signed boot.img always ends with "[all] lock_device_private_key=1": the
 #     firmware then refuses to hand the OTP device private key to the running OS (rpi-fw-crypto privkey,
 #     the GET_CUSTOMER_PRIVATE_KEY / user-OTP mailbox calls), while hmac, sign and pubkey keep working (the
 #     initramfs keyscript only needs hmac). boot.sig covers that config.txt, so it cannot be taken out
-#     without the board's key; the firmware applies it from EEPROM 2025-08-20 on.
+#     without the board's key; the firmware applies it from EEPROM 2025-08-20 on. On a BCM2711 (BOARD=cm4)
+#     that firmware is start4.elf in boot.img, not the EEPROM: the slot is refused when its start4*.elf
+#     does not know lock_device_private_key (older than 2025-08), since the OS could then read the key.
+#   * BOARD=pi5|cm4 (the board's family): the boot partition must hold that board's kernel (kernel_2712.img
+#     or kernel8.img / kernel8.img) and, for a CM4, its firmware (start4.elf + fixup4.dat); boot.img is made
+#     with rpi-make-boot-image -b <BOARD>.
 #
 # Mounts:  /in   ro  the image set; the boot slot sparse image is named by SIMAGE
 #          /seed ro  files/<name> (copied to the root of the boot partition) and cmdline.append (one line
@@ -23,14 +28,16 @@
 #          /out  rw
 #          /ext  ro  <repo>/external (usbboot + rpi-eeprom submodules), SIGN=1 only
 # Env:     SIMAGE=<file name in /in>  SIGN=0|1  MAX_PIECE=<bytes> (default 268435456)  [SOURCE_DATE_EPOCH]
-#          INPLACE=0|1 (SIGN=1: keep the image's FAT)  PRUNE=|pi5 (SIGN=1: files left out of boot.img)
+#          BOARD=pi5|cm4 (default pi5)
+#          INPLACE=0|1 (SIGN=1: keep the image's FAT)  PRUNE=|pi5|cm4 (SIGN=1: files left out of boot.img; the
+#          same as BOARD when set)
 #          The seed may be empty (an image without cloud-init gets no first-boot files).
-# Steps:   simg2img -> raw vfat.
+# Steps:   simg2img -> raw vfat; the BOARD's kernel (and firmware) checked.
 #          SIGN=0: cmdline.txt edited and the seed files written into that FAT as it is (same geometry,
 #          label and volume id).
 #          SIGN=1: mcopy -s the files out; cmdline.txt edited; lock_device_private_key=1 in config.txt; if
 #          the slot already holds boot.img it is signed as it is (its cmdline.txt is left alone, the lock goes
-#          into its config.txt with mtools), else rpi-make-boot-image -b pi5 -a 64;
+#          into its config.txt with mtools), else rpi-make-boot-image -b <BOARD> -a 64;
 #          boot.sig via rpi-eeprom-digest -k; new FAT32 of the same byte size (mkfs.fat -s 1 -F 32 -n BOOT)
 #          holding boot.img, boot.sig, config.txt (boot_ramdisk=1, uart_2ndstage=1) and the seed files
 #          (INPLACE=1: written into the image's FAT, its config.txt replaced). boot.img must stay within
@@ -53,6 +60,7 @@ SIMAGE="${SIMAGE:-}"
 SIGN="${SIGN:-0}"
 INPLACE="${INPLACE:-0}"
 PRUNE="${PRUNE:-}"
+BOARD="${BOARD:-pi5}"
 BOOT_IMG_MAX="${BOOT_IMG_MAX:-134217728}"
 MAX_PIECE="${MAX_PIECE:-268435456}"
 export MTOOLS_SKIP_CHECK=1
@@ -143,6 +151,37 @@ sys.exit(0 if locked else 1)
 EOF
 }
 
+# <list of the boot partition's root (mdir -b, one "::/name" per line)>: dies unless it holds what a board of
+# BOARD boots (a Raspberry Pi 5 falls back to kernel8.img when there is no kernel_2712.img; a CM4 runs
+# kernel8.img and needs its firmware, start4.elf + fixup4.dat, in the boot partition).
+check_board_files() {
+    local list="$1" has
+    has() { grep -qix "::/$1" "${list}"; }
+    case "${BOARD}" in
+        pi5)
+            has kernel_2712.img || has kernel8.img \
+                || die "the boot partition has no Raspberry Pi 5 kernel (kernel_2712.img or kernel8.img)" ;;
+        cm4)
+            has kernel8.img || die "the boot partition has no Compute Module 4 kernel (kernel8.img)"
+            has start4.elf && has fixup4.dat \
+                || die "the boot partition has no Compute Module 4 firmware (start4.elf, fixup4.dat): a BCM2711 loads it from there" ;;
+    esac
+}
+
+# <dir>: dies unless every start4*.elf in it knows lock_device_private_key (a BCM2711 applies the lock in
+# that firmware; one from before 2025-08 ignores the line and hands the OTP device key to the OS).
+check_firmware_lock() {
+    local f found=0
+    for f in "$1"/start4*.elf; do
+        [ -f "${f}" ] || continue
+        found=1
+        grep -aq lock_device_private_key "${f}" \
+            || die "$(basename "${f}") predates lock_device_private_key (Raspberry Pi firmware 2025-08): on a BCM2711 the running OS could read the OTP device key; update the image's raspi-firmware"
+        echo "    $(basename "${f}"): knows lock_device_private_key"
+    done
+    [ "${found}" = 1 ] || die "no start4*.elf next to boot.img's config.txt"
+}
+
 # Split <file> into self-contained sparse pieces <file>.0, .1, ... when it exceeds MAX_PIECE.
 # Prints the resulting file names (basenames), in flashing order.
 split_sparse() {
@@ -171,12 +210,14 @@ split_sparse() {
 }
 
 # ---------------------------------------------------------------------------
-step "boot-slot: SIMAGE=${SIMAGE} SIGN=${SIGN} MAX_PIECE=${MAX_PIECE}"
+step "boot-slot: SIMAGE=${SIMAGE} SIGN=${SIGN} BOARD=${BOARD} MAX_PIECE=${MAX_PIECE}"
 [ -n "${SIMAGE}" ] || die "SIMAGE is not set"
 case "${SIMAGE}" in */*|.*) die "SIMAGE must be a bare file name, got '${SIMAGE}'" ;; esac
 case "${SIGN}" in 0|1) ;; *) die "SIGN must be 0 or 1, got '${SIGN}'" ;; esac
 case "${INPLACE}" in 0|1) ;; *) die "INPLACE must be 0 or 1, got '${INPLACE}'" ;; esac
-case "${PRUNE}" in ""|pi5) ;; *) die "PRUNE must be empty or pi5, got '${PRUNE}'" ;; esac
+case "${BOARD}" in pi5|cm4) ;; *) die "BOARD must be pi5 or cm4, got '${BOARD}'" ;; esac
+case "${PRUNE}" in ""|pi5|cm4) ;; *) die "PRUNE must be empty, pi5 or cm4, got '${PRUNE}'" ;; esac
+[ -z "${PRUNE}" ] || [ "${PRUNE}" = "${BOARD}" ] || die "PRUNE=${PRUNE} does not match BOARD=${BOARD}"
 [[ "${MAX_PIECE}" =~ ^[0-9]+$ ]] && [ "${MAX_PIECE}" -ge 1048576 ] || die "MAX_PIECE must be an integer >= 1048576"
 [ -f "${IN}/${SIMAGE}" ] || die "${IN}/${SIMAGE} missing"
 [ -d "${SEED}" ] || die "${SEED} is not mounted"
@@ -202,6 +243,13 @@ simg2img "${IN}/${SIMAGE}" "${WORK}/source.vfat"
 SIZE="$(stat -c %s "${WORK}/source.vfat")"
 echo "    raw size ${SIZE} bytes"
 [[ "$(file -b "${WORK}/source.vfat")" == *FAT* ]] || die "${SIMAGE} does not hold a FAT filesystem"
+mdir -b -i "${WORK}/source.vfat" ::/ > "${WORK}/rootlist.txt" 2>/dev/null || : > "${WORK}/rootlist.txt"
+if grep -qix '::/boot.img' "${WORK}/rootlist.txt"; then
+    echo "    the slot holds a prebuilt boot.img: its contents are the image's business"
+else
+    check_board_files "${WORK}/rootlist.txt"
+    echo "    ${BOARD}: kernel$([ "${BOARD}" = cm4 ] && echo ' and firmware') present"
+fi
 
 CMDLINE_OUT=""
 if [ "${SIGN}" = 0 ]; then
@@ -234,6 +282,12 @@ else
         mcopy -o -i "${WORK}/boot.img" "${WORK}/inner-config.txt" ::/config.txt \
             || die "cannot write config.txt into the prebuilt boot.img"
         echo "    lock_device_private_key=1 written into the prebuilt boot.img's config.txt"
+        if [ "${BOARD}" = cm4 ]; then
+            mkdir -p "${WORK}/inner-fw"
+            mcopy -n -i "${WORK}/boot.img" "::/start4*.elf" "${WORK}/inner-fw/" 2>/dev/null || true
+            check_firmware_lock "${WORK}/inner-fw"
+            rm -rf "${WORK}/inner-fw"
+        fi
         boot_img_source="existing"
     else
         if [ -n "${CMDLINE_EXTRA}" ]; then
@@ -254,11 +308,24 @@ else
               if ! grep -Eiq '^[[:space:]]*kernel[[:space:]]*=' config.txt 2>/dev/null; then
                   rm -fv -- kernel.img kernel7.img kernel7l.img kernel8.img initramfs initramfs7 initramfs7l initramfs8
               fi ) | sed 's/^/    /'
+        elif [ "${PRUNE}" = cm4 ]; then
+            step "leaving out what a Compute Module 4 does not load"
+            # rpi-make-boot-image -b cm4 drops the older boards' firmware and kernels and kernel_2712.img; the
+            # BCM2712 device trees and initramfs_2712 (unless config.txt picks a kernel by name) go here
+            ( cd "${WORK}/slot"
+              rm -fv -- bcm2712*.dtb
+              if ! grep -Eiq '^[[:space:]]*kernel[[:space:]]*=' config.txt 2>/dev/null; then
+                  rm -fv -- kernel_2712.img initramfs_2712
+              fi ) | sed 's/^/    /'
+        fi
+        if [ "${BOARD}" = cm4 ]; then
+            step "BCM2711 firmware: lock_device_private_key"
+            check_firmware_lock "${WORK}/slot"
         fi
         step "config.txt: lock_device_private_key=1"
         lock_device_key "${WORK}/slot/config.txt"
-        step "rpi-make-boot-image -b pi5 -a 64"
-        rpi-make-boot-image -b pi5 -a 64 -d "${WORK}/slot" -o "${WORK}/boot.img"
+        step "rpi-make-boot-image -b ${BOARD} -a 64"
+        rpi-make-boot-image -b "${BOARD}" -a 64 -d "${WORK}/slot" -o "${WORK}/boot.img"
         boot_img_source="rpi-make-boot-image"
     fi
     [ -s "${WORK}/boot.img" ] || die "no boot.img"

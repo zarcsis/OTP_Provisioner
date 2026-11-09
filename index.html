@@ -10,7 +10,7 @@
 <header>
     <div class="brand">
         <h1>OTP Provisioner</h1>
-        <span class="sub">Raspberry Pi 5 provisioning station</span>
+        <span class="sub">Raspberry Pi 5 / Compute Module 4 provisioning station</span>
     </div>
     <div id="server-badges" class="badges"></div>
     <div id="caps" class="badges"></div>
@@ -128,9 +128,11 @@
                 <span id="provision-mode" class="muted head-note"></span>
             </div>
             <ol class="instructions">
-                <li>Insert the target <b>SD card</b> into the board.</li>
-                <li><b>Hold the power button</b>, connect <b>USB-C</b> to this station, release the button.</li>
-                <li>Click <b>Connect board</b> and pick <i>BCM2712 Boot</i> in Chrome's list.</li>
+                <li>Insert the target <b>SD card</b> into the board (a Compute Module 4 with eMMC needs none).</li>
+                <li><b>Raspberry Pi 5:</b> <b>hold the power button</b>, connect <b>USB-C</b> to this station, release the button.
+                    <b>Compute Module 4:</b> fit the <b>nRPIBOOT jumper</b> (CM4 IO Board: J2), connect the carrier's USB device port
+                    to this station, power the board on; remove the jumper only after stage 3.</li>
+                <li>Click <b>Connect board</b> and pick <i>BCM2712 Boot</i> (Pi 5) or <i>BCM2711 Boot</i> (CM4) in Chrome's list.</li>
                 <li>Click <b>Provision</b>. When asked, click <b>Connect fastboot gadget</b> and pick <i>Raspberry Pi …</i>.</li>
             </ol>
             <div id="offline-box" class="callout offline hidden">

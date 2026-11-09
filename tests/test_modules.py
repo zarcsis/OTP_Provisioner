@@ -381,8 +381,9 @@ def test_public_view(module_service):
     assert "rsa_private_pem" not in text and "PRIVATE KEY" not in text
     assert "device_secret" not in view and view["secrets"]["device_secret"] is True  # only a flag
     assert set(view) == {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_locked", "created", "updated",
-                         "chip", "board", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata",
-                         "facts", "events"}
+                         "chip", "board", "family", "unsupported", "duid", "mac", "factory_uuid", "boardrev",
+                         "secrets", "otp", "metadata", "facts", "events"}
+    assert (view["family"], view["unsupported"]) == ("pi5", "")
     assert view["stage"] == "eeprom" and view["stage_label"] == "EEPROM flashed"
     assert (view["mode"], view["mode_chosen"], view["mode_locked"]) == ("open", "", False)  # cfg default_mode
     assert view["secrets"] == {"rsa_key": True, "customer_key_hash": rec["customer_key_hash"], "device_secret": True,

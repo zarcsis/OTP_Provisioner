@@ -90,8 +90,8 @@
             badge('WebUSB' + (navigator.usb ? ' ✓' : ' ✗'), navigator.usb ? 'ok' : 'err', 'navigator.usb: Chrome / Edge / Opera'),
             badge('Secure context' + (window.isSecureContext ? ' ✓' : ' ✗'), window.isSecureContext ? 'ok' : 'err', 'WebUSB needs http://localhost, https:// or file://'),
             badge(win ? 'Windows · WinUSB' : 'Linux/macOS', '', win
-                ? 'Chrome opens only devices bound to WinUSB: 0a5c:2712 (rpiboot installer) and 18d1:4e40 (fastboot gadget).'
-                : 'The browser must be allowed to open 0a5c:2712 and 18d1:4e40 — see the udev rules in README.md.'),
+                ? 'Chrome opens only devices bound to WinUSB: 0a5c:2712 and 0a5c:2711 (rpiboot installer) and 18d1:4e40 (fastboot gadget).'
+                : 'The browser must be allowed to open 0a5c:2712, 0a5c:2711 and 18d1:4e40 — see the udev rules in README.md.'),
         );
         if (!navigator.usb) log('error', 'WebUSB is not available in this browser. Use Chrome, Edge or another Chromium browser.');
     }
@@ -230,7 +230,7 @@
                 ? el('div', {}, el('b', {}, 'The board is booting the fastboot gadget. '), 'Click ', el('b', {}, 'Connect fastboot gadget'),
                     ' and pick ', el('i', {}, 'Raspberry Pi …'), ' (USB 18d1:4e40) in Chrome\'s list. It appears about 20 s after stage 2; the list updates live.')
                 : el('div', {}, el('b', {}, 'Chrome needs permission for the re-enumerated board. '), 'Click ', el('b', {}, 'Select device…'),
-                    ' and pick ', el('i', {}, 'BCM2712 Boot'), '.'),
+                    ' and pick ', el('i', {}, (flow.module && flow.module.chip === 'BCM2711') ? 'BCM2711 Boot' : 'BCM2712 Boot'), '.'),
             kind === 'fastboot' && drv && drv.platform === 'windows' && drv.fastboot === false
                 ? el('div', { class: 'warn-text' }, 'Windows has no WinUSB driver bound to 18d1:4e40 yet, so Chrome cannot open the gadget. ', drv.detail || '')
                 : null);
@@ -307,7 +307,7 @@
         const m = serial ? (flow.module && flow.module.serial === serial ? flow.module : srv.modules.find((x) => x.serial === serial)) : null;
         if (!m) {
             box.replaceChildren(el('p', { class: 'muted' }, checking() ? 'Checking the server…' : api.available
-                ? 'No board connected. Put the board into RPIBOOT mode (hold the power button while connecting USB-C) and click Connect board.'
+                ? 'No board connected. Put the board into RPIBOOT mode (Raspberry Pi 5: hold the power button while connecting USB-C; Compute Module 4: fit the nRPIBOOT jumper, connect the carrier\'s USB device port, power on) and click Connect board.'
                 : 'The server is not reachable, so boards cannot be provisioned from here. Start it with "uv run server.py" and reload.'));
             return;
         }
@@ -325,6 +325,7 @@
                 el('span', { class: 'stage-pill stage-' + m.stage }, m.stage_label || m.stage),
                 el('span', { class: 'muted' }, [m.chip, m.board].filter(Boolean).join(' · ')),
                 live ? null : el('span', { class: 'badge' }, 'viewing record')),
+            m.unsupported ? el('div', { class: 'warn-text' }, `Not provisioned by this station: ${m.unsupported}`) : null,
             el('dl', { class: 'kv' },
                 kv('Scenario', modeText),
                 kv('Key hash', sec.customer_key_hash ? el('span', { title: sec.customer_key_hash }, shortHex(sec.customer_key_hash, 24)) : '—', 'mono'),

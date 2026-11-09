@@ -99,9 +99,11 @@
 
     // ------------------------------------------------------------------ rpiboot devices
 
-    function rpiBase({ iSerial, serial, productName }) {
+    /** productId 0x2712 (BCM2712, default) or 0x2711 (BCM2711: a Compute Module 4). */
+    function rpiBase({ iSerial, serial, productName, productId }) {
+        const pid = productId || 0x2712;
         return {
-            vendorId: 0x0a5c, productId: 0x2712, serialNumber: serial, productName: productName || 'BCM2712 Boot', manufacturerName: 'Broadcom',
+            vendorId: 0x0a5c, productId: pid, serialNumber: serial, productName: productName || `BCM${pid.toString(16)} Boot`, manufacturerName: 'Broadcom',
             opened: false, configuration: null, attached: true,
             configurations: [{ configurationValue: 1, interfaces: [{ interfaceNumber: 0, alternate: { alternateSetting: 0, interfaceClass: 0xff, interfaceSubclass: 0, interfaceProtocol: 0, endpoints: [{ direction: 'out', type: 'bulk', endpointNumber: 1 }, { direction: 'in', type: 'bulk', endpointNumber: 2 }] }, alternates: [{ alternateSetting: 0, interfaceClass: 0xff, interfaceSubclass: 0, interfaceProtocol: 0, endpoints: [] }] }] }],
             events: [], bulk: [], iSerial,
@@ -111,7 +113,7 @@
             async claimInterface() { if (!this.attached) throw gone(); },
             async releaseInterface() {},
             _descriptor() {
-                const d = new Uint8Array(18); d[0] = 18; d[1] = 1; d[8] = 0x5c; d[9] = 0x0a; d[10] = 0x12; d[11] = 0x27; d[12] = 0x01; d[13] = 0x01; d[16] = iSerial; d[17] = 1;
+                const d = new Uint8Array(18); d[0] = 18; d[1] = 1; d[8] = 0x5c; d[9] = 0x0a; d[10] = pid & 0xff; d[11] = pid >> 8; d[12] = 0x01; d[13] = 0x01; d[16] = iSerial; d[17] = 1;
                 return { status: 'ok', data: new DataView(d.buffer) };
             },
             async controlTransferOut(setup) {
@@ -129,12 +131,12 @@
     }
 
     /**
-     * Boot ROM: after the 4-byte status read it calls onBooted() (the board re-enumerates). accepts(bytes): the
-     * signature check of the second stage it was sent; false = a refusal as a real BCM2712 does it: status 0, then
+     * Boot ROM: after the 4-byte status read it calls onBooted() (the board re-enumerates, after bootDelayMs). accepts(bytes):
+     * the signature check of the second stage it was sent; false = a refusal as a real BCM2712 does it: status 0, then
      * nothing (the ROM stays on USB and never runs it; `refused` is set).
      */
-    function romDevice({ serial, retcode, onBooted, accepts }) {
-        const d = rpiBase({ iSerial: 3, serial });
+    function romDevice({ serial, retcode, onBooted, accepts, productId, bootDelayMs }) {
+        const d = rpiBase({ iSerial: 3, serial, productId });
         d.kind = 'rom';
         d.controlTransferIn = async function (setup, length) {
             if (!this.attached) throw gone();
@@ -148,7 +150,7 @@
                     let at = 0;
                     for (const c of this.bulk) { sent.set(c, at); at += c.byteLength; }
                     if (accepts && !accepts(sent)) this.refused = true;
-                    else if (onBooted) setTimeout(onBooted, 5);
+                    else if (onBooted) setTimeout(onBooted, bootDelayMs || 5);
                     return { status: 'ok', data: new DataView(b.buffer) };
                 }
             }
@@ -165,8 +167,8 @@
      * timeouts = {scriptIndex: n}: the read of that message first fails n times with a WinUSB-style NetworkError
      * while the device stays attached (recovery.bin busy writing the EEPROM); onTimeout(device, count) after each.
      */
-    function fsDevice({ serial, script, onEnd, timeouts, onTimeout }) {
-        const d = rpiBase({ iSerial: 1, serial });
+    function fsDevice({ serial, script, onEnd, timeouts, onTimeout, productId }) {
+        const d = rpiBase({ iSerial: 1, serial, productId });
         d.kind = 'fs';
         d.readIndex = 0;
         d.timeoutsLeft = Object.assign({}, timeouts || {});
@@ -296,7 +298,7 @@
             }, opts || {});
             this.vendorId = 0x18d1; this.productId = 0x4e40;
             this.serialNumber = this.o.serial64;
-            this.productName = 'Raspberry Pi 5 Model B Rev 1.0';
+            this.productName = this.o.product || 'Raspberry Pi 5 Model B Rev 1.0';
             this.manufacturerName = 'Raspberry Pi';
             this.opened = false; this.configuration = null; this.attached = true;
             this.configurations = [{ configurationValue: 1, interfaces: [{ interfaceNumber: 0, alternates: [{ alternateSetting: 0, interfaceClass: 0xff, interfaceSubclass: 0x42, interfaceProtocol: 0x03, endpoints: [{ direction: 'out', type: 'bulk', endpointNumber: 1 }, { direction: 'in', type: 'bulk', endpointNumber: 1 }] }] }] }];
@@ -420,7 +422,7 @@
                 const vars = {
                     serialno: this.o.serial64 + '\0',
                     'max-download-size': '0x' + this.o.maxDownload.toString(16).toUpperCase(),
-                    product: 'Raspberry Pi 5 Model B Rev 1.0\0',
+                    product: this.productName + '\0',
                     'version-bootloader': '2026/06/03',
                     'version-fastbootd': '14.0.0~git20261026.adf29cb',
                     secure: 'no', 'secure-otp': 'not present', 'secure-devkey': 'present',
@@ -544,19 +546,29 @@
     // ------------------------------------------------------------------ the whole board
 
     /**
-     * One Raspberry Pi 5 going through the three stages.
+     * One Raspberry Pi 5 (or, with chip: 'BCM2711', a Compute Module 4) going through the three stages.
      * stage-1 recovery script: config.txt, pieeprom.sig, pieeprom.bin, metadata, Done → reboot into the ROM.
      * stage-2 bootloader script: config.txt, boot.sig (absent), boot.img, then it leaves USB → fastboot gadget.
      * The second stage enumerates with an empty serial string, so Chrome needs a new permission the first time.
+     * A CM4 enumerates as 0a5c:2711, asks for bootcode4.bin and reports USER_BOARDREV c03141 (type 0x14, CM4);
+     * bootDelayMs: how long the ROM takes to run the second stage it accepted (re-enumeration).
      */
     class MockBoard {
         constructor(hub, opts) {
             this.hub = hub;
             // romAccepts(bytes): the boot ROM's check of the second stage (see romDevice); null = accept anything
-            this.o = Object.assign({ serial: 'a7eb274c', keyHash: 'ab'.repeat(32), program: true, fsSerial: '', fastboot: {}, stage1Timeouts: null, romAccepts: null }, opts || {});
+            this.o = Object.assign({ serial: 'a7eb274c', keyHash: 'ab'.repeat(32), program: true, fsSerial: '', fastboot: {}, stage1Timeouts: null, romAccepts: null,
+                chip: 'BCM2712', bootDelayMs: 0 }, opts || {});
+            this.cm4 = this.o.chip === 'BCM2711';
+            this.pid = this.cm4 ? 0x2711 : 0x2712;
+            if (this.cm4) this.o.fastboot = Object.assign({ product: 'Raspberry Pi Compute Module 4 Rev 1.1' }, this.o.fastboot);
             this.boots = 0;
             this.history = [];
             this.fb = null;
+        }
+        _rom() {
+            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), accepts: this.o.romAccepts, productId: this.pid, bootDelayMs: this.o.bootDelayMs });
+            return rom;
         }
         _replace(oldDev, newDev, delay) {
             setTimeout(() => {
@@ -565,7 +577,7 @@
             }, delay || 5);
         }
         powerOnRom() {
-            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), accepts: this.o.romAccepts });
+            const rom = this._rom();
             this.history.push('rom');
             this.hub.plug(rom);
             return rom;
@@ -577,12 +589,14 @@
             if (this.boots === 1) {
                 fs = fsDevice({
                     serial,
+                    productId: this.pid,
                     script: [
                         { cmd: 0, name: 'config.txt' }, { cmd: 1, name: 'config.txt' },
                         { cmd: 0, name: 'pieeprom.sig' }, { cmd: 1, name: 'pieeprom.sig' },
                         { cmd: 0, name: 'pieeprom.bin' }, { cmd: 1, name: 'pieeprom.bin' },
                         { cmd: 0, name: '*USER_SERIAL_NUM*' + this.o.serial },
                         { cmd: 0, name: '*MAC_ADDR*2c:cf:67:70:76:f3' },
+                        ...(this.cm4 ? [{ cmd: 0, name: '*USER_BOARDREV*c03141' }] : []),
                         // program: the recovery burnt the key hash (program_pubkey=1); else the OTP stays blank
                         { cmd: 0, name: '*CUSTOMER_KEY_HASH*' + (this.o.program ? this.o.keyHash : '0'.repeat(64)) },
                         ...(this.o.program ? [{ cmd: 0, name: '*SECURE_BOOT_PROVISION*success' }] : []),
@@ -594,6 +608,7 @@
             } else {
                 fs = fsDevice({
                     serial,
+                    productId: this.pid,
                     script: [
                         { cmd: 0, name: 'config.txt' }, { cmd: 1, name: 'config.txt' },
                         { cmd: 0, name: 'boot.sig' }, { cmd: 1, name: 'boot.sig' },
@@ -605,8 +620,7 @@
             this._replace(rom, fs, 5);
         }
         _reboot(fs) {
-            const rom = romDevice({ serial: this.o.serial, onBooted: () => this._secondStage(rom), accepts: this.o.romAccepts });
-            this._replace(fs, rom, 10);
+            this._replace(fs, this._rom(), 10);
         }
         _gadget(fs) {
             this.fb = new FastbootSim(Object.assign({ serial64: '10000000' + this.o.serial }, this.o.fastboot));

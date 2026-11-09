@@ -1,9 +1,10 @@
 # OTP_Provisioner
 
-A demo provisioning station for Raspberry Pi 5 boards. A small Python server (FastAPI) keeps the secrets
-of every board, builds all the files a board needs (in Docker), and serves a web page. The page runs in
-Chrome or Edge and drives the board over **WebUSB**: it speaks the `rpiboot` protocol to the BCM2712 boot
-ROM and `fastboot` to the provisioning gadget.
+A demo provisioning station for Raspberry Pi 5 boards (BCM2712: Pi 5, CM5, Pi 500) and Compute Module 4
+modules (BCM2711; see "Compute Module 4"). A small Python server (FastAPI) keeps the secrets of every board,
+builds all the files a board needs (in Docker), and serves a web page. The page runs in Chrome or Edge and
+drives the board over **WebUSB**: it speaks the `rpiboot` protocol to the boot ROM and `fastboot` to the
+provisioning gadget.
 
 Everything the station knows lives in **a Google spreadsheet of the signed-in operator**: the `settings`
 worksheet holds the server settings and the `modules` worksheet the board registry. There is no
@@ -25,7 +26,7 @@ In every scenario a board goes through the same three stages:
 
 | Stage | What the board does | Files come from | Registry stage after success |
 | --- | --- | --- | --- |
-| 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, …) and reboots straight back into RPIBOOT (`set_reboot_order=0x3`, `recovery_reboot=1`). | `external/usbboot/rpi-eeprom` firmware, packed by `docker/scripts/stage1.sh` | `eeprom` |
+| 1 · EEPROM & OTP | Boots `bootcode5.bin` (recovery; `bootcode4.bin` on a CM4) over rpiboot and flashes `pieeprom.bin` + `.sig`. It reports metadata (MAC, DUID, `CUSTOMER_KEY_HASH`, board type, …) and reboots straight back into RPIBOOT (`recovery_reboot=1`; a Pi 5 through `set_reboot_order=0x3`, a CM4 through its nRPIBOOT jumper). | `external/usbboot/rpi-eeprom` firmware (`firmware-2712` / `firmware-2711`), packed by `docker/scripts/stage1.sh` | `eeprom` |
 | 2 · Fastboot gadget | Boots `bootfiles.bin` + `boot.img` (pi-gen-micro "fastboot" ramdisk with our build of rpi-fastbootd and our `otp-keyexport` helper). The board re-enumerates as USB `18d1:4e40` with its 16-hex serial. | gadget built from `external/pi-gen-micro` + `docker/gadget-helpers` + `docker/fastbootd` | `gadget` |
 | 3 · Image | Page drives rpi-fastbootd: (secure) device key export → stage-3 manifest again (the server encrypts the root for the board) → `oem fwcrypto init` → `getvar:public-key` → `erase` → IDP (`oem idpinit` / `idpwrite` / `idpgetblk` + `flash` of sparse pieces ≤ 256 MiB / (secure) `oem cryptcheck` / `idpdone`) → `shutdown` (the board powers off). | the OS image: rpi-image-gen (`image/`) with the station's **OS image** settings, built in Docker in both variants; or an operator's own image uploaded on the page (see "Custom OS images") | `flashed` |
 
@@ -39,7 +40,10 @@ chain, the locked OTP, the exported device key, the station-built encrypted root
 keyslot 0) and the power-off at the end. The notes on what the first secure run needed are in CLAUDE.md
 ("What went wrong"). The sandboxed apps ran from the station image on a second Pi 5 (board `2a03e58f`, open
 scenario, 2026-10-28): the demo detector in its container, the provider counting its detections, the sandbox
-probe 23 PASS / 0 FAIL (see "Checking a board" under "System packages and sandboxed apps").
+probe 23 PASS / 0 FAIL (see "Checking a board" under "System packages and sandboxed apps"). Compute Module 4
+support (2026-11-09) is checked without a module (the suites, real builds of every artifact, the end-to-end run on a
+mock CM4); it has not been on a real module yet (see "Compute
+Module 4" for what a first run must confirm).
 
 ## Requirements
 
@@ -65,12 +69,14 @@ probe 23 PASS / 0 FAIL (see "Checking a board" under "System packages and sandbo
   when it is missing (see Troubleshooting). The builds need internet access.
 * **USB driver on Windows:** Chrome can only open devices bound to WinUSB. Install the official
   `rpiboot_setup.exe` (from the [usbboot releases](https://github.com/raspberrypi/usbboot/releases)).
-  Its `rpiboot-winusb.inf` binds WinUSB to both `0a5c:2712` (BCM2712 boot ROM) and `18d1:4e40` (the
-  fastboot gadget). `rpiboot.exe` itself is not needed. The page header shows whether the driver package is present.
-* **Linux:** give your user access to both devices, for example `/etc/udev/rules.d/99-otp-provisioner.rules`:
+  It binds WinUSB to `0a5c:2712` (BCM2712 boot ROM), `0a5c:2711` (BCM2711 boot ROM, a Compute Module 4) and
+  `18d1:4e40` (the fastboot gadget). `rpiboot.exe` itself is not needed. The page header shows whether the driver
+  packages are present (the status detail says whether the CM4 one is).
+* **Linux:** give your user access to the devices, for example `/etc/udev/rules.d/99-otp-provisioner.rules`:
 
   ```
   SUBSYSTEM=="usb", ATTR{idVendor}=="0a5c", ATTR{idProduct}=="2712", MODE="0660", TAG+="uaccess"
+  SUBSYSTEM=="usb", ATTR{idVendor}=="0a5c", ATTR{idProduct}=="2711", MODE="0660", TAG+="uaccess"
   SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="4e40", MODE="0660", TAG+="uaccess"
   ```
 
@@ -114,11 +120,14 @@ meanwhile and its **Server builds** card shows each job with a live log:
    arm64 container (about 3 minutes; the first build of the builder image also compiles rpi-fastbootd, about
    7 more). Stage 2 answers "not ready" until it exists — there is no prebuilt fallback, because only this
    gadget carries the device key export and the restricted rpi-fastbootd (see "The station's rpi-fastbootd").
-3. **image**: the OS image in both variants, `clear` (open scenario) and `crypt` (secure scenario),
-   about twelve minutes each (the first build in a new work volume takes longer). rpi-image-gen runs in the
+   One gadget boots every family its targets name (`builds.gadget.targets`, default `pi5-family,cm4`).
+3. **image**: the OS image in both variants, `clear` (open scenario) and `crypt` (secure scenario), for each
+   board family in `builds.image.families` (default `pi5` and `cm4`: four images), about twelve minutes each (the
+   first build in a new work volume takes longer). rpi-image-gen runs in the
    builder image from `image/docker` and builds Raspberry Pi OS Lite (see below); each
    result is collected into an IDP set of sparse pieces ≤ `max_piece_size` with SHA-256 for each piece.
-   Stage 3 answers "not ready" until the variant the board needs is there.
+   Stage 3 answers "not ready" until the variant the board needs is there. A station that never sees a CM4 can
+   drop `cm4` from `builds.image.families` and save two builds.
 
 On Windows, if the Docker engine is not running, the server starts Docker Desktop and waits for it (up to 180 s).
 
@@ -160,7 +169,9 @@ Build artifacts live **outside the repo**, in the work directory. The default is
 <work>/artifacts/stage2/config.txt
 <work>/artifacts/gadget/<key>[-r<N>]/  built gadget + build-info.json (newest complete version served)
 <work>/artifacts/image/<set>/          IDP set: image.json, sparse pieces, manifest.json
-<work>/artifacts/image/current-clear.json, current-crypt.json   which set stage 3 serves per variant
+<work>/artifacts/image/current-clear.json, current-crypt.json   which set stage 3 serves per variant (Pi 5)
+<work>/artifacts/image/current-cm4-clear.json, current-cm4-crypt.json   … and for the Compute Module 4
+<work>/artifacts/image-json/           a custom set's image.json with another family's device class (a CM4's)
 <work>/artifacts/custom/<id>/          an uploaded image: source.img, upload.json, its clear and crypt sets
                                        (<variant>-<fingerprint>/), current-<variant>.json, error-<variant>.json
 <work>/modules/<serial>/stage{1,2}/<fp>/    per-board signed files (secure scenario only)
@@ -176,8 +187,9 @@ Docker volumes `otp-pgm-work` and `otp-image-work` keep the build trees and apt 
 
 ## The OS image
 
-The image is **Raspberry Pi OS Lite** (trixie, arm64) for the Raspberry Pi 5, built with rpi-image-gen, and
-it is the same for every board. Like the official image it comes up with the first user `pi` locked, SSH
+The image is **Raspberry Pi OS Lite** (trixie, arm64) built with rpi-image-gen, one for the Raspberry Pi 5 and
+one for the Compute Module 4 (the same layers on another device layer and kernel; see "Compute Module 4"), and
+it is the same for every board of a family. Like the official image it comes up with the first user `pi` locked, SSH
 off and Wi-Fi off; what makes a board yours is written at stage 3 into **its own boot partition** as
 cloud-init files, the way Raspberry Pi Imager customises Raspberry Pi OS. So the settings below apply to
 every board flashed after they are saved, with no rebuild; boards provisioned earlier keep what they got.
@@ -228,17 +240,18 @@ worksheet. Open and secure boards get the same settings.
   when you save it). The Wi-Fi password is stored as typed (8-63 characters, or a 64-digit hex key; empty =
   an open network) and written to the board as the PMK. Both passwords are write-only on the page: it
   shows whether one is set, **remove** clears it.
-* **What the image is.** `image/layer` holds three station layers. `otp-rpios-packages` is the package set
+* **What the image is.** `image/layer` holds the station layers. `otp-rpios-packages` is the package set
   of an official Raspberry Pi OS Lite release, generated from the release's `.info` file by
-  `python image/rpios_packages.py <url or path of the .info>` (the Raspberry Pi 3/4 kernel is left out: a
-  Pi 5 image). `otp-rpios-lite` puts it on rpi-image-gen's Debian and Raspberry Pi base and keeps the
+  `python image/rpios_packages.py <url or path of the .info>`, without the kernels: the generator puts the
+  kernel metapackages of each flavour into `otp-rpios-kernel-2712` (Pi 5) and `otp-rpios-kernel-v8` (CM4), and an
+  image gets its family's. `otp-rpios-lite` puts it on rpi-image-gen's Debian and Raspberry Pi base and keeps the
   manual pages and documentation the official image has. `otp-rpios-setup` does what pi-gen configures
   beyond packages: `pi` locked with no login shell (cloud-init or the wizard set it up), SSH off and host
   keys made at first boot, Wi-Fi off until a country is set (`WirelessEnabled=false`), Bluetooth not
   blocked, classic interface names (`eth0`, `wlan0`), en_GB / gb / Europe/London, `raspberrypi`, pi-gen's
   shell and `PATH` tweaks, avahi, `/etc/machine-id` = `uninitialized`, the NoCloud templates in
   `/boot/firmware`, and no `apt`/`dpkg` leftovers of the build (recommends are installed again, as on
-  Raspberry Pi OS). The differences from the official image: no Pi 3/4 kernel, `cryptsetup` added (the
+  Raspberry Pi OS). The differences from the official image: one kernel (the family's), `cryptsetup` added (the
   secure image), the boot partition layout and `config.txt` of rpi-image-gen's IDP image, **AppArmor on**
   (`apparmor=1 security=apparmor` in `cmdline.txt` from the fragment
   `layer/otp-rpios-setup.d/for/linux-base/cmdline.d/60-apparmor`, `apparmor.service` enabled: the Raspberry
@@ -247,9 +260,10 @@ worksheet. Open and secure boards get the same settings.
   **secure** (crypt) image `rpi-eeprom-update.service` is off (that bootloader is signed for the board,
   and only the station updates it) and `otp-growroot.service` grows the encrypted root to the whole card at
   the first boot (the partition when it ends before the card does, the LUKS2 mapping, the ext4 inside).
-* **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: the Pi 5 device, the
-  `image-rpios` layout, the image name and the station layers) and mounts it read-only at `/cfg` for the
-  build. `image/example.yaml` is that config for the default name (a test keeps it in sync).
+* **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: the family's device layer,
+  `rpi5` or `rpi-cm4`, the `image-rpios` layout, the image name, the station layers with the family's kernel layer
+  and `luks2_cipher: aes-xts-plain64`) and mounts it read-only at `/cfg` for the build. `image/example.yaml` and
+  `image/example-cm4.yaml` are that config for the default name (a test keeps them in sync).
 * **Building by hand** (Linux with Docker): `image/build.sh --docker -c image/example.yaml` or your own
   config; `image/build.sh --help` lists the options. `IGconf_*=value` words after the options are passed to
   rpi-image-gen; `builds.image.overrides` does the same for the station.
@@ -264,7 +278,8 @@ image's id; empty = the station image). Save applies it to the boards flashed fr
 **What the station takes:** an uncompressed `.img` (unpack `.img.xz` / `.zip` first) with an MBR and exactly
 two primary partitions, a FAT boot partition (0x0c, 0x0b, 0x0e or 0x06) and an ext4 root (0x83), with a
 Raspberry Pi 5 kernel (`kernel_2712.img` or `kernel8.img`), `config.txt` and `cmdline.txt` in the boot
-partition: what Raspberry Pi OS and pi-gen produce (bookworm or later). The upload is checked as it arrives
+partition: what Raspberry Pi OS and pi-gen produce (bookworm or later). The same prepared image also serves a
+Compute Module 4 when its boot partition has `kernel8.img` and the BCM2711 firmware (see "Compute Module 4"). The upload is checked as it arrives
 (`otp_server/diskimage.py`: compressed files, GPT, partition count and types, file systems, a truncated upload)
 and stored under the first 16 hex digits of its SHA-256; the same file uploaded twice is kept once. Uploads stay
 on this station's disk (`<work>/artifacts/custom/`), only the choice is a setting.
@@ -298,7 +313,7 @@ per scenario:
 cannot write the account, SSH, Wi-Fi and host name settings into such an image: it boots with the configuration
 it was made with, and the page says so); an image with cloud-init gets the first-boot files like the station
 image. On a board locked to our key the image's own boot partition gets `boot.img` (its files, without what a
-Raspberry Pi 5 never loads, and its `config.txt` with `lock_device_private_key=1` added), `boot.sig` and the
+Raspberry Pi 5 (or a CM4) never loads, and its `config.txt` with `lock_device_private_key=1` added), `boot.sig` and the
 `config.txt` that makes the bootloader load it; everything else the image keeps there stays (`boot-slot.sh` with
 `INPLACE=1`). Software in the image that reads the raw OTP key (`rpi-fw-crypto privkey`, `rpi-otp-private-key`)
 gets an error on a secure board; `hmac` and `sign` work. `boot.img` must stay under the bootloader's
@@ -449,15 +464,85 @@ it streams (`otp_server/diskimage.py`: nothing is written to disk; gaps read as 
 partitions, mostly ciphertext. Only ciphertext, signed boot files and the first-boot files leave the station,
 as in stage 3. The station images need this version's crypt layer for the growth (built after the change).
 
+## Compute Module 4
+
+The station provisions the **Compute Module 4** (BCM2711) next to the Raspberry Pi 5, in both scenarios and the
+same three stages. The board's family comes from the boot ROM it reports (`chip` in the registry,
+`otp_server/boards.py`); everything below follows from it.
+
+**RPIBOOT mode.** On the CM4 IO Board fit jumper **J2** ("Fit jumper to disable eMMC Boot": nRPIBOOT), connect the
+board's USB device port (micro-USB "USB slave") to the station and power the board from its own supply; on another
+carrier, whatever pulls nRPIBOOT low and brings the CM4's USB 2.0 OTG port out. The EEPROM must not be
+write-protected (EEPROM_nWP). Keep the jumper fitted for all three stages: after stage 1 the module comes back in
+RPIBOOT because of it (the Pi 5 does it with `set_reboot_order=0x3`, a BCM2712 feature the CM4 does not get).
+Remove it after stage 3 and power-cycle: the module boots its new OS from eMMC (from the SD card on a CM4 Lite).
+The gadget halts the module at the end of stage 3 (a CM4 has no power-off circuit of its own).
+
+**Only the CM4.** The Pi 4 Model B, Pi 400 and CM4S have the same boot ROM. The board reports its type in stage 1
+(`USER_BOARDREV`); anything but a CM4 (type `0x14`) fails that stage, and every stage is refused for it from then on
+(the board card says why). A Pi 4 Model B has no RPIBOOT jumper and powers itself through the USB-C port the gadget
+would need.
+
+**Stage 1** uses `firmware-2711` (512 KiB EEPROM images) and serves `recovery.bin` as `bootcode4.bin`, unsigned,
+whatever the board's OTP holds: the BCM2711 boot ROM checks only Raspberry Pi's signature (usbboot
+`docs/secure-boot.md`, "Pi 4 vs Pi 5"). So nothing is counter-signed, the stage-1 manifest names no recovery
+variant, and the page does not watch for a refused second stage. A secure stage 1 that broke off after
+`program_pubkey=1` and the whole EEPROM image still makes the station assume the lock: the next run sends a signed
+EEPROM without `program_pubkey=1`, and if the board then reports an empty OTP, that run fails and the one after it
+burns the key hash.
+
+**The secure scenario on a CM4 is weaker than on a Pi 5:**
+
+* any bootloader signed by Raspberry Pi runs over rpiboot (no customer counter-signature); what stays enforced is the
+  signed EEPROM config and `boot.img` verified with the key whose hash is in OTP. The bootloader's anti-rollback
+  (`program_arb=1`, recovery.bin 2026-10-23 and later; on a BCM2711 kept in software) is not used by the station;
+* `lock_device_private_key=1` is applied by `start4.elf` inside the signed `boot.img`, not by the EEPROM: `boot-slot.sh`
+  refuses a CM4 boot partition (and a prebuilt `boot.img`) whose `start4*.elf` does not know the option (Raspberry Pi
+  firmware older than 2025-08), since the OS could then read the OTP key;
+* the BCM2711 has no AES instructions: rpi-image-gen would pick Adiantum for its LUKS2 container, but the station builds
+  every container in `aes-xts-plain64` and sets that cipher in every image config, so the CM4 runs dm-crypt on NEON
+  (slower than a Pi 5).
+
+**Stage 2** serves the same gadget: built for `pi5-family,cm4`, it carries the CM4's firmware (`start4cd.elf`,
+`fixup4cd.dat`: pi-gen-micro's cut-down firmware for `gpu_mem=16`) and device trees; the kernel (`rpi-v8`) is the same.
+`bootfiles.bin` has `2711/bootcode4.bin` as it is and gets `2711/pubkey.bin` next to `2712/pubkey.bin`.
+
+**Stage 3** writes the CM4 image (`cm4-clear` / `cm4-crypt`): rpi-image-gen's `rpi-cm4` device layer with the v8
+kernel (4 KiB pages, so ext4 with 4 KiB blocks) and `otp-rpios-kernel-v8`. Its storage is `mmcblk0` (the eMMC, or a
+CM4 Lite's SD card); the root key is derived from that device's CID either way. rpi-fastbootd's `oem idpinit` checks
+the image's device class against the board's model, so a CM4 gets an `image.json` that says `cm4`: the CM4 image's
+own, or for a **custom image** a copy of the set's (`<work>/artifacts/image-json/`). A custom image serves a CM4 when
+its boot partition has `kernel8.img`, `start4.elf` and `fixup4.dat` (Raspberry Pi OS images do; `boot-slot.sh` checks
+it for every CM4 slot, also an unsigned one), signed in place with `PRUNE=cm4`.
+
+**The image file for Raspberry Pi Imager** of a CM4 Lite goes to the SD card it had at stage 3, in a reader. A CM4
+with eMMC cannot take it: the eMMC is only reachable over rpiboot's mass-storage gadget, whose `boot.img` is not
+signed with the board's key, and a locked module boots only signed ones (usbboot's `secure-boot-msd` shows how one
+could be signed per board; the station does not do it). Run stage 3 again instead.
+
+**Checked without a module** (2026-11-09): the suites and the page self-test; the real `stage1.sh` for both families;
+the gadget and all four images built; in the CM4 images a 4 KiB-block ext4, only the v8 kernel, `aes-xts-plain64`, an
+initramfs with `dm-crypt`, `aes-neon-bs`, the `hwkey` keyscript and `rpi-fw-crypto`; the real `boot-slot.sh` on them (a
+signed CM4 `boot.img` with `kernel8.img`, `initramfs8`, `start4.elf` and the key lock); the end-to-end runner on the real
+artifacts with a mock CM4 (scenarios C and D).
+
+**Not confirmed on a real CM4 yet**: that the BCM2711
+boot ROM reports the 8-hex serial the page keys boards by; the WebUSB timings (set against a Pi 5); that the gadget's
+cut-down `start4cd.elf` serves rpi-fw-crypto (`getvar:public-key`, the key export, `oem fwcrypto init`,
+`oem cryptcheck`; if it does not, the gadget needs the full firmware); that the CM4 crypt image unlocks its root at
+boot; how long `erase` (a secure discard) takes on eMMC.
+
 ## Operator procedure
 
 1. Pick the scenario in the **Provision** panel: **Open** or **Secure** (the default comes from
    `provisioning.default_mode`; the page remembers your choice).
-2. Insert the target **SD card** into the board.
-3. **Hold the power button**, connect **USB-C** to the station, release the button. The board enumerates
-   as *BCM2712 Boot*. Use a port that can supply enough current.
-4. Click **Connect board** and pick *BCM2712 Boot* in Chrome's chooser. The page registers the board with
-   the server (`hello`). Its secrets are generated now if this serial has never been seen, and are reused otherwise.
+2. Insert the target **SD card** into the board (a Compute Module 4 with eMMC needs none).
+3. **Raspberry Pi 5:** **hold the power button**, connect **USB-C** to the station, release the button. The board
+   enumerates as *BCM2712 Boot*. Use a port that can supply enough current. **Compute Module 4:** see "Compute
+   Module 4" (nRPIBOOT jumper, the carrier's USB device port); it enumerates as *BCM2711 Boot*.
+4. Click **Connect board** and pick *BCM2712 Boot* (or *BCM2711 Boot*) in Chrome's chooser. The page registers the
+   board with the server (`hello`). Its secrets are generated now if this serial has never been seen, and are
+   reused otherwise.
 5. Click **Provision**. The scenario is sent to the server first. Before any irreversible step (OTP writes,
    the device key generation, erase), the page shows what will happen and asks you to type the serial
    (`confirm_irreversible`). Stage 1 runs, the board reboots into RPIBOOT by itself, and stage 2 runs. If
@@ -465,9 +550,10 @@ as in stage 3. The station images need this version's crypt layer for the growth
 6. When the gadget has booted, click **Connect fastboot gadget** and pick *Raspberry Pi …* in the chooser.
    Chrome's list updates while Linux boots. Stage 3 identifies the board, (secure) exports its device key,
    then flashes the image with a progress bar and **powers the board off** (`shutdown`).
-7. Unplug the board and power it from its own supply. Its first boot sets it up from the first-boot files
-   (account, SSH, Wi-Fi, host name, time zone, keyboard). The board is not rebooted into the new system on
-   the station's USB port on purpose: unplugging it during that first boot is what this avoids.
+7. Unplug the board and power it from its own supply (a CM4: remove its nRPIBOOT jumper first). Its first boot
+   sets it up from the first-boot files (account, SSH, Wi-Fi, host name, time zone, keyboard). The board is not
+   rebooted into the new system on the station's USB port on purpose: unplugging it during that first boot is
+   what this avoids.
 
 The page skips stages that are already done. Switching a provisioned board to the other scenario resets it
 to stage 1: every stage is redone (the EEPROM, the gadget signing and the image all differ). A board whose
@@ -498,7 +584,7 @@ serverless "Advanced (manual)" section of earlier versions is gone).
 
 ## The secure scenario and the device key export
 
-The BCM2712 has one device-unique OTP key slot (`rpi-fw-crypto` key-id 1, ECDSA P-256). The crypt
+The BCM2712 (and the BCM2711 of a CM4) has one device-unique OTP key slot (`rpi-fw-crypto` key-id 1, ECDSA P-256). The crypt
 image unlocks its LUKS root at every boot with `HMAC-SHA256(that key, the storage device id)` computed by the
 firmware (initramfs keyscript `hwkey`). In the secure scenario the station keeps **a copy of that key**, so it
 can derive the LUKS key of any card used in the board:
@@ -649,11 +735,12 @@ is shown on the page; unknown keys produce a warning.
 | `image.wifi_password` | (none) | Wi-Fi passphrase (8-63 characters or a 64-digit hex key; empty = open network) |
 | `image.wifi_country` | `UA` | Wi-Fi country known to wireless-regdb, two letters (`00` = world; the page offers the list) |
 | `image.wifi_hidden` | `false` | the Wi-Fi network does not broadcast its name |
-| `builds.auto` | `true` | build what is missing (tools, gadget, both images) once the station is signed in |
+| `builds.auto` | `true` | build what is missing (tools, gadget, the images of every family) once the station is signed in |
 | `builds.tools.image_tag` | `otp-tools:latest` | Docker tag of the tools image |
-| `builds.gadget.targets` | `pi5-family` | pi-gen-micro device list of the fastboot gadget |
+| `builds.gadget.targets` | `pi5-family,cm4` | pi-gen-micro targets of the fastboot gadget, comma-separated (spaces are read as commas); stage 2 refuses a board whose family no target covers (`pi5-family`/`pi5`/`cm5`/`500` for a Pi 5, `cm4`/`pi4-family` for a CM4). A sheet that still says `pi5-family` (the old default) is read as the new one |
 | `builds.gadget.image_tag` | `otp-gadget-builder:trixie` | Docker tag of the gadget builder image |
 | `builds.gadget.volume` | `otp-pgm-work` | Docker volume with the gadget build tree |
+| `builds.image.families` | `pi5`, `cm4` | board families the station builds its OS image for, one per line (`pi5` = Raspberry Pi 5 / CM5 / Pi 500, `cm4` = Compute Module 4); a clear and a crypt image each; stage 3 of a board whose family is not listed waits with a note naming this setting |
 | `builds.image.overrides` | (none) | extra `IGconf_KEY=VALUE` overrides for rpi-image-gen, one per line (`IGconf_image_pmap` is set per scenario) |
 | `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
 | `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
@@ -716,7 +803,8 @@ More rules of the secure scenario:
 * **OTP burnt but the stage-1 report lost: the station works it out.** The BCM2712 boot ROM runs the plain
   `recovery.bin` only while the OTP holds no key hash, and the one counter-signed with our key only once it holds
   ours (usbboot `secure-boot-recovery5/README.md`); the wrong one it takes with status 0 and then keeps, silently.
-  So the station keeps an assumption in the record (`facts.otp_lock`, shown on the page as "probably locked …"):
+  So the station keeps an assumption in the record (`facts.otp_lock`, shown on the page as "probably locked …";
+  a CM4's boot ROM runs the plain second stage in both states, see "Compute Module 4"):
   * a secure stage 1 that broke off after the board got `program_pubkey=1` and the whole `pieeprom.bin`, with no
     `CUSTOMER_KEY_HASH` in its report, makes the next stage 1 assume the lock (counter-signed second stage, no
     second `program_pubkey`; the Open scenario is refused meanwhile);
@@ -818,6 +906,7 @@ otp_server/
   google_account.py        Google OAuth login, token, the station spreadsheet
   secrets_gen.py           RSA key, customer key hash, device secret, device key parsing, LUKS key
   modules.py               board registry logic, scenarios, device key, stage verdicts
+  boards.py                the board families (Raspberry Pi 5 / Compute Module 4) and what differs between them
   storage/                 base.py (record schema), gsheets.py (the modules worksheet)
   docker.py, jobs.py       Docker CLI runner; background jobs with logs and SSE
   artifacts/               tools image, stage 1, gadget + stage 2, OS images + stage 3, custom images (custom.py),
@@ -838,9 +927,10 @@ docker/
 image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
-  layer/                   station layers: otp-rpios-packages (generated), otp-rpios-lite, otp-rpios-setup, otp-apps
-  rpios_packages.py        writes otp-rpios-packages.yaml from a Raspberry Pi OS Lite release's .info file
-  example.yaml             the config of the default OS image settings
+  layer/                   station layers: otp-rpios-packages and otp-rpios-kernel-2712 / -v8 (generated), otp-rpios-lite,
+                           otp-rpios-setup, otp-apps
+  rpios_packages.py        writes the package layers from a Raspberry Pi OS Lite release's .info file
+  example.yaml             the config of the default OS image settings (example-cm4.yaml: the Compute Module 4's)
   rpi-image-gen/           submodule
 index.html, css/app.css
 js/server.js               API client; flow.js provisioning state machine; app.js UI
@@ -918,8 +1008,13 @@ hashes, so apt would otherwise never notice a new or changed helper package).
 ```
 uv run --group dev python -B -m pytest -q     # server: config, settings, Google account, secrets, storage, modules, jobs, docker, artifacts, OS image config, password hash, API, CLI, the key export script
 uv run python -B tests/web/run_selftest.py    # page: headless Chrome against a fake API (-v for every line)
-uv run python -B tests/web/run_e2e.py         # page + real server on the real artifacts + a mock board, both scenarios
+uv run python -B tests/web/run_e2e.py         # page + real server on the real artifacts + a mock board, scenarios A-D
 ```
+
+`run_e2e.py` runs scenarios A and B (a mock Pi 5, open and secure) and C and D (a mock CM4, when the cm4 images
+exist); `--scenario A|B|C|D|both|cm4|all` picks them. Its server has only the default settings plus the station's
+`image.name`: when the station image carries packages or apps, pass the sheet's values with `--set`
+(`--set 'image.packages=["<id>"]' --set 'image.apps=["<line>"]'`), or every image set is "rebuild needed" for it.
 
 The suites test the Google code against fakes (no network access); the station itself has run against real
 Google (sign-in, spreadsheet, settings, registry). `OTP_DOCKER_TESTS=1` enables a smoke test against the real Docker engine. The page runners find
@@ -932,7 +1027,7 @@ On Windows, some tests run shell code with the `sh` and `bash` found on `PATH`. 
 (PowerShell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`): without them the `sh` tests are skipped
 and `bash` is WSL's launcher (`C:\Windows\System32\bash.exe`), which fails the kernel command line test with
 `/bin/bash: line 4: : No such file or directory`. `C:\Program Files\Git\bin` is not the same: its `sh.exe` puts
-Git's own tools before the test's stubs. With `usr\bin` first: 1204 passed, 3 skipped (2026-10-28).
+Git's own tools before the test's stubs. With `usr\bin` first: 1252 passed, 3 skipped (2026-11-09).
 
 ## Troubleshooting
 

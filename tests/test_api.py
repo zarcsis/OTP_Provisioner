@@ -34,7 +34,8 @@ SERIAL = "a7eb274c"
 #: The page is served on loopback; any other Host is refused (DNS rebinding guard).
 BASE = "http://127.0.0.1:8765"
 MODULE_KEYS = {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_locked", "created", "updated", "chip",
-               "board", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata", "facts", "events"}
+               "board", "family", "unsupported", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata",
+               "facts", "events"}
 OTP_KEYS = {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_provisioned", "lock_suspected",
             "lock_note", "device_key", "device_key_fingerprint", "device_key_exported"}
 JOB_KEYS = {"id", "target", "title", "status", "started", "finished", "rc", "error", "lines"}

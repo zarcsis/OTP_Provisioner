@@ -9,14 +9,13 @@
 ---
 # Raspberry Pi reference 2026-10-06
 # Generated using pi-gen, https://github.com/RPi-Distro/pi-gen, b2cd98a9ee08a31ef7d0110ed09f2492bbd972ec, stage2
-# 625 packages; left out (Raspberry Pi 5 image, the kernel metapackages pull the rest):
+# 623 packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (the
+# metapackages pull them):
 #   linux-headers-6.18.50+rpt-common-rpi
 #   linux-headers-6.18.50+rpt-rpi-2712
 #   linux-headers-6.18.50+rpt-rpi-v8
-#   linux-headers-rpi-v8
 #   linux-image-6.18.50+rpt-rpi-2712
 #   linux-image-6.18.50+rpt-rpi-v8
-#   linux-image-rpi-v8
 #   linux-kbuild-6.18.50+rpt
 mmdebstrap:
   packages:
@@ -449,8 +448,6 @@ mmdebstrap:
     - linux-base-6.18.50+rpt-rpi-v8
     - linux-base-rpi-2712
     - linux-base-rpi-v8
-    - linux-headers-rpi-2712
-    - linux-image-rpi-2712
     - linux-libc-dev
     - linux-sysctl-defaults
     - locales

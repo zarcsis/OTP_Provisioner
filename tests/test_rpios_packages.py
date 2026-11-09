@@ -28,17 +28,26 @@ def info(names: list[tuple[str, str]]) -> str:
     return "\n".join(head + rows + filler) + "\n"
 
 
-def test_parse_drops_versioned_and_other_board_kernels(gen):
+def test_parse_drops_versioned_kernels_and_splits_the_flavours(gen):
     text = info([("linux-image-rpi-2712", "arm64"), ("linux-image-6.18.50+rpt-rpi-2712", "arm64"),
+                 ("linux-headers-rpi-2712", "arm64"),
                  ("linux-headers-6.18.50+rpt-common-rpi", "all"), ("linux-kbuild-6.18.50+rpt", "arm64"),
-                 ("linux-image-rpi-v8", "arm64"), ("linux-headers-rpi-v8", "arm64"),
+                 ("linux-image-rpi-v8", "arm64"), ("linux-headers-rpi-v8", "arm64"), ("linux-base-rpi-v8", "arm64"),
                  ("binutils-common:arm64", "arm64"), ("libc6:armhf", "armhf"), ("foo", "armhf"), ("bar", "all")])
-    release, generator, keep, drop = gen.parse(text)
+    release, generator, keep, drop, kernels = gen.parse(text)
     assert release == "Raspberry Pi reference 2099-01-01" and "pi-gen" in generator
-    assert {"linux-image-rpi-2712", "binutils-common", "libc6:armhf", "foo:armhf", "bar"} <= set(keep)
+    assert {"binutils-common", "libc6:armhf", "foo:armhf", "bar", "linux-base-rpi-v8"} <= set(keep)
+    assert not [n for n in keep if gen.KERNEL_META.match(n)]
     assert drop == sorted(["linux-image-6.18.50+rpt-rpi-2712", "linux-headers-6.18.50+rpt-common-rpi",
-                           "linux-kbuild-6.18.50+rpt", "linux-image-rpi-v8", "linux-headers-rpi-v8"])
+                           "linux-kbuild-6.18.50+rpt"])
+    assert kernels == {"2712": ["linux-headers-rpi-2712", "linux-image-rpi-2712"],
+                       "v8": ["linux-headers-rpi-v8", "linux-image-rpi-v8"]}
     assert keep == sorted(set(keep))
+
+
+def test_parse_needs_both_kernels(gen):
+    with pytest.raises(SystemExit):
+        gen.parse(info([("linux-image-rpi-2712", "arm64")]))      # no v8 kernel: not the arm64 Lite release
 
 
 def test_parse_rejects_other_files(gen):
@@ -59,6 +68,13 @@ def test_committed_layer_is_what_the_generator_writes(gen):
     assert gen.render(release, generator, keep, drop) == text
     assert release.startswith("Raspberry Pi reference ")
     for name in ("raspi-config", "network-manager", "cloud-init", "rpi-cloud-init-mods", "userconf-pi",
-                 "linux-image-rpi-2712", "openssh-server", "avahi-daemon", "raspberrypi-sys-mods"):
+                 "openssh-server", "avahi-daemon", "raspberrypi-sys-mods", "raspi-firmware"):
         assert name in keep, name
-    assert "linux-image-rpi-v8" not in keep and not [n for n in keep if gen.VERSIONED_KERNEL.match(n)]
+    assert not [n for n in keep if gen.VERSIONED_KERNEL.match(n) or gen.KERNEL_META.match(n)]
+    # the kernel layers: one per flavour, from the same release, the metapackages of that flavour only
+    for flavour in gen.FLAVOURS:
+        ktext = gen.kernel_layer(flavour).read_bytes().decode("utf-8")
+        names = yaml.safe_load(ktext)["mmdebstrap"]["packages"]
+        assert names == [f"linux-headers-rpi-{flavour}", f"linux-image-rpi-{flavour}"]
+        assert gen.render_kernel(flavour, release, generator, names) == ktext
+        assert f"# X-Env-Layer-Name: otp-rpios-kernel-{flavour}\n" in ktext

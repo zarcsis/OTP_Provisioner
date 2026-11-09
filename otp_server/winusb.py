@@ -1,13 +1,14 @@
 """Windows USB driver check (read-only).
 
 Chrome's WebUSB can only open a device on Windows when the device is bound to the WinUSB driver.
-Neither the BCM2712 boot ROM (USB ``0a5c:2712``, "RPIBOOT") nor the pi-gen-micro fastboot gadget
-(``18d1:4e40``) provides Microsoft OS descriptors, so Windows binds WinUSB only when a driver
-package for those hardware ids is installed in the driver store.
+Neither the BCM2712 boot ROM (USB ``0a5c:2712``, "RPIBOOT"), the BCM2711 one (``0a5c:2711``, a Compute
+Module 4) nor the pi-gen-micro fastboot gadget (``18d1:4e40``) provides Microsoft OS descriptors, so
+Windows binds WinUSB only when a driver package for those hardware ids is installed in the driver store.
 
-The official Raspberry Pi ``rpiboot_setup.exe`` (usbboot releases) installs ``rpiboot-winusb.inf``,
-which binds WinUSB to both ids. This module scans the installed third-party driver packages
-(``C:\\Windows\\INF\\oem*.inf``) for those ids and reports what it found; it never changes anything.
+The official Raspberry Pi ``rpiboot_setup.exe`` (usbboot releases) installs WinUSB packages for all of
+them. This module scans the installed third-party driver packages (``C:\\Windows\\INF\\oem*.inf``) for
+those ids and reports what it found; it never changes anything. ``rpiboot`` is the BCM2712 one (every
+station needs it); ``rpiboot_cm4`` only matters for Compute Module 4 boards.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import time
 from pathlib import Path
 
 RPIBOOT_HWID = r"USB\VID_0A5C&PID_2712"
+RPIBOOT_2711_HWID = r"USB\VID_0A5C&PID_2711"
 FASTBOOT_HWID = r"USB\VID_18D1&PID_4E40"
 
 INSTALL_HINT = (
@@ -117,10 +119,11 @@ def inf_binds_winusb(text: str, hwid: str) -> bool:
 def scan(inf_dir: Path | None = None) -> dict:
     """Scan ``oem*.inf`` in ``inf_dir`` and build the ``usb_driver`` status object (SPEC section 8).
 
-    :returns: ``{"platform": "windows", "rpiboot": bool, "fastboot": bool, "detail": str}``
+    :returns: ``{"platform": "windows", "rpiboot": bool, "fastboot": bool, "rpiboot_cm4": bool, "detail": str}``
     """
     d = Path(inf_dir) if inf_dir is not None else default_inf_dir()
     rpiboot: list[str] = []
+    rpiboot_cm4: list[str] = []
     fastboot: list[str] = []
     error = ""
     try:
@@ -137,6 +140,8 @@ def scan(inf_dir: Path | None = None) -> dict:
             continue
         if inf_binds_winusb(text, RPIBOOT_HWID):
             rpiboot.append(p.name)
+        if inf_binds_winusb(text, RPIBOOT_2711_HWID):
+            rpiboot_cm4.append(p.name)
         if inf_binds_winusb(text, FASTBOOT_HWID):
             fastboot.append(p.name)
 
@@ -157,9 +162,15 @@ def scan(inf_dir: Path | None = None) -> dict:
         if present:
             detail += f"Found: {'; '.join(present)}. "
         detail += INSTALL_HINT
+    if rpiboot_cm4:
+        detail += f" Compute Module 4 (0a5c:2711): {', '.join(rpiboot_cm4)}."
+    else:
+        detail += (" No WinUSB driver package for 0a5c:2711 (a Compute Module 4 in RPIBOOT mode): only needed for "
+                   "CM4 boards; rpiboot_setup.exe installs it too.")
     if error:
         detail = f"{error}. {detail}"
-    return {"platform": "windows", "rpiboot": ok_r, "fastboot": ok_f, "detail": detail}
+    return {"platform": "windows", "rpiboot": ok_r, "fastboot": ok_f, "rpiboot_cm4": bool(rpiboot_cm4),
+            "detail": detail}
 
 
 def check_usb_driver(inf_dir: Path | None = None, *, max_age: float = 30.0, force_platform: bool = False) -> dict | None:
@@ -181,4 +192,5 @@ def check_usb_driver(inf_dir: Path | None = None, *, max_age: float = 30.0, forc
     return result
 
 
-__all__ = ["RPIBOOT_HWID", "FASTBOOT_HWID", "INSTALL_HINT", "check_usb_driver", "scan", "inf_binds_winusb"]
+__all__ = ["RPIBOOT_HWID", "RPIBOOT_2711_HWID", "FASTBOOT_HWID", "INSTALL_HINT", "check_usb_driver", "scan",
+           "inf_binds_winusb"]

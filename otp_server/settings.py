@@ -43,6 +43,8 @@ REPLACED_DEFAULTS: dict[str, frozenset[str]] = {
     "builds.image.builder_tag": frozenset({"droneos-builder:trixie"}),
     "builds.image.volume": frozenset({"otp-droneos-work"}),
     "image.name": frozenset({"deb13-arm64-min"}),
+    # the gadget before it booted the Compute Module 4 too
+    "builds.gadget.targets": frozenset({"pi5-family"}),
 }
 #: Descriptions earlier versions wrote; such a cell is rewritten with the current text (any other text in the
 #: description column is the operator's note and stays).
@@ -93,9 +95,13 @@ DESCRIPTIONS: dict[str, str] = {
     "image.wifi_hidden": "the Wi-Fi network does not broadcast its name",
     "builds.auto": "build what is missing (tools, gadget, both images) once the station is signed in",
     "builds.tools.image_tag": "Docker tag of the tools image",
-    "builds.gadget.targets": "pi-gen-micro device list of the fastboot gadget",
+    "builds.gadget.targets": "pi-gen-micro targets of the fastboot gadget, comma-separated (pi5-family = Pi 5 / CM5 / "
+                             "Pi 500, cm4 = Compute Module 4); stage 2 needs one for the board's family",
     "builds.gadget.image_tag": "Docker tag of the gadget builder image",
     "builds.gadget.volume": "Docker volume with the gadget build tree",
+    "builds.image.families": "board families the station builds its OS image for, one per line: pi5 (Raspberry Pi 5 "
+                             "/ CM5 / Pi 500, BCM2712), cm4 (Compute Module 4, BCM2711); a clear and a crypt image "
+                             "each (~12 min per image)",
     "builds.image.overrides": "extra IGconf_KEY=VALUE overrides for rpi-image-gen, one per line "
                               "(IGconf_image_pmap is set per scenario)",
     "builds.image.builder_tag": "Docker tag of the image builder (rpi-image-gen)",

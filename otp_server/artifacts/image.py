@@ -13,7 +13,12 @@ set, so switching the mode back and forth does not rebuild what is already there
 while it matches the station: same rpi-image-gen revision, same image sources, image name, overrides
 and partition map (``config_hash``).
 
-The image is the same for every board. Stage 3 serves each board its own boot partition
+Both variants exist once per board family (:mod:`otp_server.boards`) named in ``builds.image.families``: the
+family picks the device layer and the kernel. A variant's label is ``clear`` / ``crypt`` for the Raspberry Pi 5
+(the names the station always had: ``current-clear.json``) and ``<family>-<variant>`` for the others
+(``cm4-crypt``, ``current-cm4-crypt.json``).
+
+The image is the same for every board of a family. Stage 3 serves each board its own boot partition
 (``boot-slot.sh``): the image's, with the board's first-boot files (:mod:`otp_server.firstboot`: account,
 SSH, Wi-Fi, host name, time zone as cloud-init files) and, on a board locked to our key, re-signed.
 
@@ -35,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import boards
 from .. import diskimage
 from .. import firstboot
 from .. import imageconfig
@@ -102,8 +108,15 @@ class ImageBuilder:
     def staging(self) -> Path:
         return self.root / "staging"
 
-    def current_json(self, variant: str) -> Path:
-        return self.root / f"current-{check_variant(variant)}.json"
+    def current_json(self, variant: str, family: boards.Family = boards.PI5) -> Path:
+        return self.root / f"current-{label(family, variant)}.json"
+
+    def families(self) -> list[boards.Family]:
+        """The families ``builds.image.families`` names, in that order."""
+        return [boards.FAMILIES[k] for k in getattr(self.icfg, "families", None) or ["pi5"] if k in boards.FAMILIES]
+
+    def builds_family(self, family: boards.Family) -> bool:
+        return family in self.families()
 
     @property
     def source_dir(self) -> Path:
@@ -115,12 +128,12 @@ class ImageBuilder:
         """The rpi-image-gen submodule."""
         return self.source_dir / "rpi-image-gen"
 
-    def rendered(self) -> imageconfig.RenderedConfig:
-        """The rpi-image-gen config of the station image (``image.name``, and the system packages and sandboxed
-        apps of ``image.packages`` / ``image.apps``)."""
+    def rendered(self, family: boards.Family = boards.PI5) -> imageconfig.RenderedConfig:
+        """The rpi-image-gen config of the station image for ``family`` (``image.name``, and the system packages
+        and sandboxed apps of ``image.packages`` / ``image.apps``)."""
         img = self.cfg.image
         inputs = self.packages.image_inputs(img) if (img.packages or img.apps) else None
-        return imageconfig.render(img, mount=CFG_MOUNT, inputs=inputs)
+        return imageconfig.render(img, mount=CFG_MOUNT, inputs=inputs, family=family)
 
     def overrides(self, variant: str) -> list[str]:
         """``builds.image.overrides`` plus the variant's provisioning map (``IGconf_image_pmap``, last)."""
@@ -152,10 +165,10 @@ class ImageBuilder:
         blob = "\n".join([rendered.digest(), self.sources_hash(), *self.overrides(variant)])
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
 
-    def config_hash(self, variant: str) -> str:
+    def config_hash(self, variant: str, family: boards.Family = boards.PI5) -> str:
         """sha256(image config + image sources + overrides of the variant)[:8] — part of the set name.
         Changes whenever the image built now would differ."""
-        return self._config_hash(self.rendered(), variant)
+        return self._config_hash(self.rendered(family), variant)
 
     VERSION_TTL = 10.0   # status is polled every few seconds; git describe --dirty is not free on Windows
 
@@ -196,18 +209,22 @@ class ImageBuilder:
         return where
 
     # ------------------------------------------------------------------ current sets
-    def current_set(self, variant: str) -> tuple[Path, dict] | None:
+    def current_set(self, variant: str, family: boards.Family = boards.PI5) -> tuple[Path, dict] | None:
         """(set dir, manifest) of the variant's image stage 3 serves, or None (also when it needs a rebuild)."""
-        cur = self.published_set(variant)
-        if cur is None or self.rebuild_reason(cur[1], variant) is not None:
+        cur = self.published_set(variant, family)
+        if cur is None or self.rebuild_reason(cur[1], variant, family) is not None:
             return None
         return cur
 
-    def missing_variants(self) -> list[str]:
-        """Variants without a servable set (not built, or a rebuild is needed)."""
-        return [v for v in VARIANTS if self.current_set(v) is None]
+    def wanted(self) -> list[tuple[boards.Family, str]]:
+        """Every (family, variant) the station builds."""
+        return [(f, v) for f in self.families() for v in VARIANTS]
 
-    def rebuild_reason(self, man: dict, variant: str) -> str | None:
+    def missing_variants(self) -> list[str]:
+        """Labels (:func:`label`) of the variants without a servable set (not built, or a rebuild is needed)."""
+        return [label(f, v) for f, v in self.wanted() if self.current_set(v, f) is None]
+
+    def rebuild_reason(self, man: dict, variant: str, family: boards.Family = boards.PI5) -> str | None:
         """Why a published set cannot be served with the current settings (None when it can).
 
         Pieces are split to ``provisioning.max_piece_size`` at build time; a set split with a larger
@@ -228,6 +245,10 @@ class ImageBuilder:
                     f"{max(built, largest)} bytes, more than provisioning.max_piece_size {cur}")
         if man.get("variant") and man.get("variant") != variant:
             return f"rebuild needed: image set {man.get('set', '')} is a {man.get('variant')} image, not {variant}"
+        have_f = str(man.get("family") or "pi5")          # sets built before there were families: Raspberry Pi 5
+        if have_f != family.key:
+            return (f"rebuild needed: image set {man.get('set', '')} is for the {have_f} family, not "
+                    f"{family.key} ({family.title})")
         have_v = str(man.get("version") or "")
         if have_v:
             want_v = self.version()
@@ -235,15 +256,15 @@ class ImageBuilder:
                 return (f"rebuild needed: rpi-image-gen is at {want_v}, image set {man.get('set', '')} was "
                         f"built from {have_v}")
         have_c = str(man.get("config_hash") or "")
-        if have_c and have_c != self.config_hash(variant):
+        if have_c and have_c != self.config_hash(variant, family):
             return (f"rebuild needed: the image name, builds.image.overrides or the station's image sources "
                     f"changed since image set {man.get('set', '')} was built")
         return None
 
-    def published_set(self, variant: str) -> tuple[Path, dict] | None:
-        """(set dir, manifest) named by current-<variant>.json when it is complete, whatever the settings."""
+    def published_set(self, variant: str, family: boards.Family = boards.PI5) -> tuple[Path, dict] | None:
+        """(set dir, manifest) named by current-<label>.json when it is complete, whatever the settings."""
         try:
-            name = read_json(self.current_json(variant)).get("set")
+            name = read_json(self.current_json(variant, family)).get("set")
         except (OSError, ValueError, AttributeError):
             return None
         if not name:
@@ -257,26 +278,29 @@ class ImageBuilder:
             return None
 
     # ------------------------------------------------------------------ build job
-    def build(self, job: Any, force: bool = False, variants: list[str] | None = None) -> None:
-        """Job body "Build OS images": every variant that does not match the settings (all with ``force``).
+    def build(self, job: Any, force: bool = False, variants: list[str] | None = None,
+              families: list[boards.Family] | None = None) -> None:
+        """Job body "Build OS images": every variant of every family (``builds.image.families``) that does not
+        match the settings (all with ``force``).
 
         Settings saved while a variant builds make it stale at once; the job then builds it again (up to
         :data:`MAX_ROUNDS` rounds), so it ends with images of the settings in effect.
         """
-        wanted = [check_variant(v) for v in (variants or VARIANTS)]
+        wanted = [(f, check_variant(v)) for f in (families or self.families()) for v in (variants or VARIANTS)]
         forced = set(wanted) if force else set()
         for round_no in range(MAX_ROUNDS):
             todo = []
-            for v in wanted:
-                cur = None if v in forced else self.current_set(v)
+            for f, v in wanted:
+                cur = None if (f, v) in forced else self.current_set(v, f)
                 if cur is not None:
-                    job.log(f"==> OS image ({v}) already built: {cur[0]}")
+                    job.log(f"==> OS image ({label(f, v)}) already built: {cur[0]}")
                 else:
-                    todo.append(v)
+                    todo.append((f, v))
             if not todo:
                 return
             if round_no:
-                job.log(f"==> the image settings changed during the build: building {', '.join(todo)} again")
+                job.log(f"==> the image settings changed during the build: building "
+                        f"{', '.join(label(f, v) for f, v in todo)} again")
             if not (self.source_dir / "build.sh").is_file():
                 raise RuntimeError(f"image sources not found at {self.source_dir} (image/build.sh)")
             if not (self.rig_dir / "rpi-image-gen").is_file():
@@ -284,14 +308,14 @@ class ImageBuilder:
                                    "git submodule update --init image/rpi-image-gen")
             with heavy_lock(self.cfg.work_dir, job.log):
                 self._sweep_config_dirs(job)
-                for v in todo:
-                    cur = None if v in forced else self.current_set(v)
+                for f, v in todo:
+                    cur = None if (f, v) in forced else self.current_set(v, f)
                     if cur is not None:      # built meanwhile (another process)
-                        job.log(f"==> OS image ({v}) already built: {cur[0]}")
+                        job.log(f"==> OS image ({label(f, v)}) already built: {cur[0]}")
                         continue
-                    self._build_locked(job, v)
-                    forced.discard(v)
-        stale = [v for v in wanted if self.current_set(v) is None]
+                    self._build_locked(job, v, f)
+                    forced.discard((f, v))
+        stale = [label(f, v) for f, v in wanted if self.current_set(v, f) is None]
         if stale:
             raise RuntimeError(f"the image settings changed during {MAX_ROUNDS} builds in a row; "
                                f"{', '.join(stale)} is still out of date: build again")
@@ -306,7 +330,7 @@ class ImageBuilder:
             if rmtree(d):
                 job.log(f"==> removed the config dir of an interrupted build: {d.name}")
 
-    def _build_locked(self, job: Any, variant: str) -> None:
+    def _build_locked(self, job: Any, variant: str, family: boards.Family = boards.PI5) -> None:
         self.docker.ensure_daemon(job.log)
         self.docker.ensure_arm64(job.log)
         self.tools.ensure(job.log)
@@ -314,15 +338,15 @@ class ImageBuilder:
                                 self.source_dir / "docker", log=job.log)
         version = self.version(max_age=0)
         commit = git_output(self.rig_dir, "rev-parse", "HEAD") or ""
-        rendered = self.rendered()
+        rendered = self.rendered(family)
         if rendered.problems:
             for pid in self.packages.image_inputs(self.cfg.image)["missing"]:
                 self.packages.prepare(job, pid, locked=True)       # we hold the heavy lock
-            rendered = self.rendered()
+            rendered = self.rendered(family)
         if rendered.problems:
             raise RuntimeError("the image cannot be built: " + "; ".join(rendered.problems))
         cfg_hash = self._config_hash(rendered, variant)
-        cfg_dir = self.write_config_dir(rendered, self.root / "cfg" / f"{job.id}-{variant}")
+        cfg_dir = self.write_config_dir(rendered, self.root / "cfg" / f"{job.id}-{label(family, variant)}")
         try:
             self.staging.mkdir(parents=True, exist_ok=True)
             mounts = [Mount.bind(self.source_dir, "/src", readonly=True),
@@ -331,7 +355,7 @@ class ImageBuilder:
                       Mount.bind(cfg_dir, CFG_MOUNT, readonly=True)]
             env = {"OTP_IMAGE_IN_CONTAINER": "1", "OTP_IMAGE_ROOT": "/src", "OTP_IMAGE_VERSION": version,
                    "OTP_IMAGE_CONFIG_ID": imageconfig.CONFIG_NAME}
-            job.log(f"==> rpi-image-gen {version} ({variant}): {' '.join(self.overrides(variant))}")
+            job.log(f"==> rpi-image-gen {version} ({variant}, {family.title}): {' '.join(self.overrides(variant))}")
             job.log(f"==> {imageconfig.CONFIG_NAME}:")
             for line in rendered.text.splitlines():
                 job.log(f"    {line}")
@@ -343,11 +367,11 @@ class ImageBuilder:
         finally:
             rmtree(cfg_dir)          # the config dir only lives as long as the build
         set_dir = self.collect(job, version=version, commit=commit, cfg_hash=cfg_hash, variant=variant,
-                               settings=rendered.summary)
+                               settings=rendered.summary, family=family)
         job.log(f"==> image set ready: {set_dir}")
 
     def collect(self, job: Any, *, version: str, commit: str, cfg_hash: str, variant: str,
-                settings: dict | None = None) -> Path:
+                settings: dict | None = None, family: boards.Family = boards.PI5) -> Path:
         """Run image-collect.sh into a .partial dir, validate, write manifest.json, publish the set."""
         max_piece = int(self.cfg.provisioning.max_piece_size)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -364,7 +388,11 @@ class ImageBuilder:
             if encrypted != (variant == "crypt"):
                 raise RuntimeError(f"the {variant} build produced an image that is "
                                    f"{'encrypted' if encrypted else 'not encrypted'} (IGconf_image_pmap ignored?)")
-            name = safe_name(f"{collect['image_name']}-{variant}-{version}-{cfg_hash}")
+            dclass = str(imagejson.meta(ij).get("IGconf_device_class") or "")
+            if dclass and dclass != family.device_class:
+                raise RuntimeError(f"the {label(family, variant)} build produced an image for device class {dclass!r}, "
+                                   f"expected {family.device_class!r}")
+            name = safe_name(f"{collect['image_name']}-{label(family, variant)}-{version}-{cfg_hash}")
             final = self.root / name
             n = 2
             while final.exists():
@@ -373,6 +401,7 @@ class ImageBuilder:
             manifest = {
                 "name": collect["image_name"],
                 "variant": variant,
+                "family": family.key,
                 "version": version,
                 "set": final.name,
                 "built": now_iso(),
@@ -395,7 +424,7 @@ class ImageBuilder:
         except BaseException:
             job.log(f"collect failed; partial set left for inspection: {part}")
             raise
-        write_json(self.current_json(variant), {"set": final.name})
+        write_json(self.current_json(variant, family), {"set": final.name})
         if not self.icfg.keep_raw_image:
             for raw in self.staging.glob("*.img"):
                 try:
@@ -405,15 +434,17 @@ class ImageBuilder:
                     job.log(f"warning: cannot remove {raw}: {exc}")
         return final
 
-    def variant_status(self, variant: str) -> dict:
-        """``{"ready", "set", "version", "path", "size", "built", "detail"}`` of one variant."""
-        out = {"ready": False, "set": "", "version": "", "path": "", "size": None, "built": None, "detail": ""}
-        cur = self.published_set(variant)
+    def variant_status(self, variant: str, family: boards.Family = boards.PI5) -> dict:
+        """``{"ready", "set", "version", "path", "size", "built", "detail", "family"}`` of one variant."""
+        out = {"ready": False, "set": "", "version": "", "path": "", "size": None, "built": None, "detail": "",
+               "family": family.key}
+        cur = self.published_set(variant, family)
         if cur is None:
-            out["detail"] = f"the {variant} image is not built yet"
+            out["detail"] = (f"the {variant} image is not built yet" if family is boards.PI5 else
+                             f"the {variant} image for the {family.title} is not built yet")
             return out
         d, man = cur
-        why = self.rebuild_reason(man, variant)
+        why = self.rebuild_reason(man, variant, family)
         if why is not None:
             out["detail"] = why
             return out
@@ -427,16 +458,20 @@ class ImageBuilder:
         return out
 
     def status(self, job: Any = None) -> dict:
-        """Artifact status dict (SPEC §8) for target ``image``: ready when every variant is.
+        """Artifact status dict (SPEC §8) for target ``image``: ready when every variant of every family in
+        ``builds.image.families`` is.
 
-        ``variants`` holds the per-variant status; the top-level fields describe the crypt set when it is
-        ready, else the clear one.
+        ``variants`` holds the per-variant status by label (``clear``, ``crypt``, ``cm4-clear``, ...); the
+        top-level fields describe the first family's crypt set when it is ready, else its clear one.
         """
-        variants = {v: self.variant_status(v) for v in VARIANTS}
+        variants = {label(f, v): self.variant_status(v, f) for f, v in self.wanted()}
         base = {"target": "image", "ready": all(s["ready"] for s in variants.values()), "source": None,
                 "version": "", "path": "", "size": None, "built": None, "detail": "",
-                "job": job.to_dict() if job is not None else None, "variants": variants}
-        shown = next((variants[v] for v in ("crypt", "clear") if variants[v]["ready"]), None)
+                "job": job.to_dict() if job is not None else None, "variants": variants,
+                "families": [f.key for f in self.families()]}
+        first = self.families()[0] if self.families() else boards.PI5
+        shown = next((variants[label(first, v)] for v in ("crypt", "clear")
+                      if label(first, v) in variants and variants[label(first, v)]["ready"]), None)
         if shown is not None:
             base.update(source="built", version=shown["version"], path=shown["path"], size=shown["size"],
                         built=shown["built"])
@@ -444,7 +479,8 @@ class ImageBuilder:
         return base
 
     # ------------------------------------------------------------------ stage 3
-    def source_set(self, variant: str, source: str | None = None) -> tuple[Path, dict, dict]:
+    def source_set(self, variant: str, source: str | None = None,
+                   family: boards.Family = boards.PI5) -> tuple[Path, dict, dict]:
         """``(set dir, manifest, source)`` of the image a board gets: ``source`` is "" for the station image
         or a custom image id; None = the ``image.custom`` setting. The third item says which:
         ``{"kind": "station" | "custom", "id", "name", "cloud_init"}``. NotReady while it is not there."""
@@ -452,18 +488,37 @@ class ImageBuilder:
         scenario = "secure" if variant == "crypt" else "open"
         src = str(getattr(self.cfg.image, "custom", "") or "") if source is None else str(source or "")
         if src:
+            # A custom image serves every family (it carries the kernels and firmware of its own; the boot slot
+            # checks the family's are there and stage 3 gives its image.json the family's device class).
             set_dir, man = self.custom.servable_set(src, variant)
             return set_dir, man, {"kind": "custom", "id": src, "name": str(man.get("name") or src),
                                   "cloud_init": bool(man.get("cloud_init"))}
-        cur = self.published_set(variant)
+        if not self.builds_family(family):
+            raise NotReady(f"the station builds no OS image for the {family.title} ({family.chip}): add {family.key} "
+                           f"to the setting builds.image.families (now {', '.join(f.key for f in self.families())})")
+        cur = self.published_set(variant, family)
+        what = f"the {scenario} scenario ({label(family, variant)})"
         if cur is None:
-            raise NotReady(f"the OS image for the {scenario} scenario ({variant}) is not built yet",
-                           self.jobs.active("image"))
+            raise NotReady(f"the OS image for {what} is not built yet", self.jobs.active("image"))
         set_dir, man = cur
-        why = self.rebuild_reason(man, variant)
+        why = self.rebuild_reason(man, variant, family)
         if why is not None:
             raise NotReady(why, self.jobs.active("image"))
         return set_dir, man, {"kind": "station", "id": "", "name": str(man.get("name") or ""), "cloud_init": True}
+
+    def _family_image_json(self, set_dir: Path, ij: dict, family: boards.Family) -> tuple[Path, dict]:
+        """The set's image.json, or a copy whose ``IGconf_device_class`` is the family's: ``oem idpinit`` refuses an
+        image.json whose device class does not name the board's model (rpiidp ``checkDeviceClass``), and a custom
+        set says ``pi5`` whatever boards it serves. The copy is content-keyed under ``<work>/artifacts/image-json``."""
+        path = set_dir / "image.json"
+        if str(imagejson.meta(ij).get("IGconf_device_class") or "") in ("", family.device_class):
+            return path, ij
+        new_ij = imagejson.with_device_class(ij, family.device_class)
+        key = hashlib.sha256(f"{set_dir.name}\0{self.hashes.sha256(path)}\0{family.key}".encode()).hexdigest()[:16]
+        out = Path(self.cfg.work_dir) / "artifacts" / "image-json" / f"{set_dir.name}-{family.key}-{key}.json"
+        if not out.is_file():
+            write_json(out, new_ij)
+        return out, new_ij
 
     @staticmethod
     def _seed_for(img_cfg: Any, serial: str, source: dict) -> firstboot.Seed:
@@ -474,26 +529,30 @@ class ImageBuilder:
         return firstboot.Seed(files={}, cmdline="", instance_id="", summary={"applied": False})
 
     def _board_boot(self, record: dict, set_dir: Path, simage: str, pieces: list[dict], *, signed: bool,
-                    seed: firstboot.Seed, secrets_fn, custom: bool = False) -> list[StageFile]:
+                    seed: firstboot.Seed, secrets_fn, custom: bool = False,
+                    family: boards.Family = boards.PI5) -> list[StageFile]:
         """The board's own boot slot pieces (boot-slot.sh), via a quick build: the image's boot partition
         with the board's first-boot files and cmdline additions, re-signed with the board key when
-        ``signed``. ``custom``: an operator's image -- signed, its own boot partition keeps its files
-        (``INPLACE=1``) and boot.img leaves out what a Pi 5 never loads (``PRUNE=pi5``); unsigned and
-        without first-boot files, its boot partition is served as it is."""
+        ``signed`` (boot.img for the board's family: ``BOARD``). ``custom``: an operator's image -- signed, its own
+        boot partition keeps its files (``INPLACE=1``) and boot.img leaves out what a board of the family never
+        loads (``PRUNE=pi5`` / ``cm4``); boot-slot.sh checks that the partition has the family's kernel (and on a
+        BCM2711 its firmware, which is what enforces lock_device_private_key there). Unsigned and without first-boot
+        files, a Raspberry Pi 5's boot partition is served as it is (a custom one for another family still goes
+        through that check)."""
         serial = str(record.get("serial") or "")
         if len(pieces) != 1:
             raise NotReady(f"boot partition image {simage} is split into {len(pieces)} pieces; "
                            "a split boot image is not supported")
-        if not signed and not seed.files and not seed.cmdline:
+        if not signed and not seed.files and not seed.cmdline and not (custom and family is not boards.PI5):
             return [StageFile(str(p["name"]), set_dir / str(p["name"]), int(p["size"]), str(p["sha256"]),
                               f"image {set_dir.name}") for p in pieces]
         khash = str(record.get("customer_key_hash") or "") if signed else ""
         max_piece = int(self.cfg.provisioning.max_piece_size)
         inplace = "1" if custom and signed else "0"
-        prune = "pi5" if custom and signed else ""
+        prune = family.boot_board if custom and signed else ""
         fp = fingerprint("stage3-boot", set_dir.name, simage, [p.get("sha256") for p in pieces], signed, khash,
                          seed.digest(), self.tools.hash(), self.tools.script_hash(BOOT_SCRIPT), max_piece,
-                         inplace, prune)
+                         inplace, prune, family.boot_board)
         out_dir = Path(self.cfg.work_dir) / "modules" / serial / "stage3" / fp
         seed_files = {f"files/{name}": data for name, data in seed.files.items()}
         seed_files["cmdline.append"] = (seed.cmdline + "\n").encode("utf-8")
@@ -504,7 +563,7 @@ class ImageBuilder:
             self.tools.ensure(job.log)
             part = fresh_partial(out_dir)
             env = {"SIMAGE": simage, "SIGN": "1" if signed else "0", "MAX_PIECE": str(max_piece),
-                   "INPLACE": inplace, "PRUNE": prune}
+                   "INPLACE": inplace, "PRUNE": prune, "BOARD": family.boot_board}
             mounts = [Mount.bind(set_dir, "/in", readonly=True), Mount.bind(part, "/out")]
             with TempFiles(self.cfg.work_dir, seed_files) as sdir:
                 mounts.append(Mount.bind(sdir, "/seed", readonly=True))
@@ -657,9 +716,10 @@ class ImageBuilder:
         serial = str(record.get("serial") or "")
         variant = "crypt" if secure else "clear"
         scenario = "secure" if secure else "open"
-        set_dir, man, source = self.source_set(variant)
+        family = _family(record)
+        set_dir, man, source = self.source_set(variant, family=family)
         custom = source["kind"] == "custom"
-        ij = imagejson.load(set_dir / "image.json")
+        ij_path, ij = self._family_image_json(set_dir, imagejson.load(set_dir / "image.json"), family)
         disk = imagejson.storage_device(ij)
         encrypted = imagejson.is_encrypted(ij)
         if encrypted != secure:
@@ -685,7 +745,7 @@ class ImageBuilder:
         seed = self._seed_for(self.cfg.image, serial, source)
         for b in boots:
             parts[b] = self._board_boot(record, set_dir, b, msim[b], signed=signed, seed=seed, secrets_fn=secrets_fn,
-                                        custom=custom)
+                                        custom=custom, family=family)
         if custom:
             osname = (man.get("os") or {}).get("pretty_name") or ""
             notes.append(f"custom image {source['name']}{' (' + osname + ')' if osname else ''}, uploaded to the station")
@@ -694,10 +754,13 @@ class ImageBuilder:
             notes.append("board OTP is locked to our key: boot partition re-signed for this board")
             notes.append("lock_device_private_key=1 in the signed config.txt: the running OS cannot read the OTP "
                          "device key (hmac and sign, which unlock the root, still work)")
-        ijm = man.get("image_json") or {}
-        ij_path = set_dir / "image.json"
-        ij_sf: StageFile | None = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
-                                            str(ijm.get("sha256") or self.hashes.sha256(ij_path)), origin)
+        if ij_path == set_dir / "image.json":
+            ijm = man.get("image_json") or {}
+            ij_sf: StageFile | None = StageFile("image.json", ij_path, int(ijm.get("size") or ij_path.stat().st_size),
+                                                str(ijm.get("sha256") or self.hashes.sha256(ij_path)), origin)
+        else:
+            ij_sf = self.hashes.stage_file("image.json", ij_path,
+                                           f"{origin}, device class {family.device_class} ({family.title})")
         pending = ""
         verify: list[dict] = []
         encrypted_root = None
@@ -752,9 +815,10 @@ class ImageBuilder:
             "scenario": scenario,
             "image": {"name": man.get("name", ""), "version": man.get("version", ""),
                       "set": man.get("set", set_dir.name), "built": man.get("built"),
-                      "variant": variant, "device_class": man.get("device_class", ""),
+                      "variant": variant,
+                      "device_class": imagejson.meta(ij).get("IGconf_device_class") or man.get("device_class", ""),
                       "storage_type": man.get("storage_type", ""), "encrypted": encrypted,
-                      "source": source["kind"], "custom": source["id"]},
+                      "source": source["kind"], "custom": source["id"], "family": family.key},
             "storage_device": disk,
             "pending": pending,
             "image_json": _entry(ij_sf, file_url(base_url, serial, 3, "image.json")) if ij_sf else None,
@@ -782,9 +846,10 @@ class ImageBuilder:
         the card's CID (both come from one stage 3 run), or while a part is being built.
         """
         serial = str(record.get("serial") or "")
-        set_dir, man, src = self.source_set("crypt", source)
+        family = _family(record)
+        set_dir, man, src = self.source_set("crypt", source, family=family)
         custom = src["kind"] == "custom"
-        ij = imagejson.load(set_dir / "image.json")
+        _ij_path, ij = self._family_image_json(set_dir, imagejson.load(set_dir / "image.json"), family)
         if not imagejson.is_encrypted(ij):
             raise NotReady(f"image set {set_dir.name} is not an encrypted (crypt) set")
         if not (secrets_fn() or {}).get("device_private_pem"):
@@ -796,7 +861,7 @@ class ImageBuilder:
             raise NotReady(f"image set {set_dir.name} has {len(boots)} boot partition images, expected one")
         seed = self._seed_for(self.cfg.image, serial, src)
         boot_files = self._board_boot(record, set_dir, boots[0], msim[boots[0]], signed=True, seed=seed,
-                                      secrets_fn=secrets_fn, custom=custom)
+                                      secrets_fn=secrets_fn, custom=custom, family=family)
         luks = self._station_luks(record, set_dir, ij, msim, secrets_fn)
         if luks is None:
             raise NotReady(f"the station does not hold the OTP device key of {serial} yet")
@@ -847,10 +912,26 @@ class ImageBuilder:
                 "files are signed; cloud-init files come from the station)",
                 "the root partition, its LUKS2 mapping and the file system grow to the whole card at the first boot "
                 "(otp-growroot)",
-            ],
+            ] + ([f"{family.title}: a CM4 Lite takes the file on its SD card in a reader. The eMMC of a module locked "
+                  "to its key cannot be written this way: rpiboot's mass-storage gadget is not signed with the board's "
+                  "key and the module refuses it; run stage 3 again instead"] if family is boards.CM4 else []),
             "shas": shas,
         }
         return summary, plan, paths
+
+
+def label(family: boards.Family, variant: str) -> str:
+    """The name of one image of the station: ``clear`` / ``crypt`` for the Raspberry Pi 5 (the names it always
+    had), ``<family>-<variant>`` for another family."""
+    variant = check_variant(variant)
+    return variant if family is boards.PI5 else f"{family.key}-{variant}"
+
+
+def _family(record: dict) -> boards.Family:
+    try:
+        return boards.family_of(record)
+    except ValueError as exc:
+        raise NotReady(str(exc)) from None
 
 
 def re_name(name: str) -> str:
