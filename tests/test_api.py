@@ -1026,6 +1026,8 @@ def test_static_routes(env):
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
     assert r.headers["cache-control"] == "no-store"
     assert r.content == (root / "index.html").read_bytes()
+    # the icon is inline: without it the browser asks for /favicon.ico, which is a 404 here by design
+    assert b'<link rel="icon" href="data:image/svg+xml,' in r.content
     r = env.client.get("/js/app.js")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/javascript")
     assert r.content == (root / "js" / "app.js").read_bytes()
