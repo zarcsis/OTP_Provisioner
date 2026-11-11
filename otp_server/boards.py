@@ -57,6 +57,9 @@ class Family:
     rpiboot_how: str
     #: What the operator does after stage 3 so that the board boots its new OS.
     after_flash: str
+    #: Image layer that puts Arm Trusted Firmware in as the armstub when ``builds.image.cm4_tfa`` is on (empty: the
+    #: family's own boot firmware already runs TF-A, as a Raspberry Pi 5's does).
+    tfa_layer: str = ""
 
 
 PI5 = Family(
@@ -72,8 +75,10 @@ CM4 = Family(
     second_stage="bootcode4.bin", pieeprom_size=512 * 1024, countersigned_recovery=False, reboot_order=False,
     device_layer="rpi-cm4", kernel_layer="otp-rpios-kernel-v8", device_class="cm4", boot_board="cm4",
     gadget_targets=frozenset({"pi4-family", "cm4"}), board_types=frozenset({0x14}),
-    rpiboot_how="fit the nRPIBOOT jumper (CM4 IO Board: J2 'disable eMMC boot') and power the board on",
-    after_flash="remove the nRPIBOOT jumper, then power it from its own supply",
+    rpiboot_how="fit the nRPIBOOT jumper (CM4 IO Board: J2 'disable eMMC boot'; carriers with a BOOT switch: "
+                "switch it on) and power the board on",
+    after_flash="remove the nRPIBOOT jumper (or switch BOOT off), then power-cycle it on its own supply",
+    tfa_layer="otp-tfa-rpi4",
 )
 FAMILIES: dict[str, Family] = {f.key: f for f in (PI5, CM4)}
 _BY_CHIP = {f.chip: f for f in FAMILIES.values()}

@@ -57,7 +57,12 @@ locked), the gadget rebuilt for `pi5-family,cm4`, all four images rebuilt (the C
 kernel only, `aes-xts-plain64`, an initramfs with `dm-crypt`, `aes-neon-bs`, the `hwkey` keyscript and `rpi-fw-crypto`),
 the real `boot-slot.sh` on them (a CM4's signed `boot.img`: `kernel8.img`, `initramfs8`, `start4.elf` that knows
 `lock_device_private_key`), and the e2e runner on the real artifacts, 514 checks in scenarios A-D (C, D: a mock CM4).
-No CM4 has been provisioned. README "Compute Module 4" ends with what a first run on a module must confirm.
+
+**Status (2026-11-11):** the first real CM4 (`8726622b`, Rev 1.1, 1 GB, 8 GB eMMC, Waveshare CM4-NANO-B) passed phases
+1 and 2 of the wiki's *Compute Module 4 test plan* (open scenario, first boot, the sandboxed apps: probe 23/2/0), run by
+a tester with the station on macOS (Apple Silicon, OrbStack) at `66c3966`. Confirmed: the ROM's 8-hex serial, the
+WebUSB timings, `getvar:public-key` from the cut-down `start4cd.elf`, `erase` in ~3 s. Its findings are fixed (item 10)
+and answered on the wiki's test plan page. The secure scenario has not run on a CM4.
 
 ## How it was written
 
@@ -88,6 +93,11 @@ checked against a real board between steps:
    `firmware-2711` with `bootcode4.bin`, one gadget for `pi5-family,cm4`, an image pair per family
    (`builds.image.families`), the kernel package layers split per flavour, the family's device class in every
    image.json a board gets, the page accepting the BCM2711. Not on hardware yet (Status).
+10. (2026-11-11) After the first CM4 on hardware: `scripts/init-top/otp-aes` in every image's initramfs (the constant-
+   time AES on a CPU without AES instructions), the CM4's shutdown text, `facts.device_key_origin`, the stage-1
+   `JTAG_LOCKED` verdict, optional Arm Trusted Firmware for the CM4 (`builds.image.cm4_tfa`, layer `otp-tfa-rpi4`),
+   macOS as a station host (native arm64 engine, `cp --sparse=auto` fallback, `tests/hosttools.py`), and the package
+   layer leaving libcamera's soname package to its dependencies (Raspberry Pi's archive went to libcamera 0.8).
 
 Design decisions that were the owner's and should not be re-litigated:
 
@@ -162,10 +172,13 @@ image/
                               layer and the kernel layers otp-rpios-kernel-2712 / -v8 (one per family)
   example.yaml, example-cm4.yaml   the default config of each family (kept equal to imageconfig.render by a test)
   layer/otp-apps.yaml         the sandboxed apps (in the config only when image.apps is set)
+  layer/otp-tfa-rpi4.yaml     Arm Trusted Firmware as a CM4's armstub (only with builds.image.cm4_tfa)
+  layer/otp-rpios-setup.d/    its kernel command line fragment and initramfs-tools files (otp-aes)
 examples/apps/                the demo: vn-demo-provider (system), vn-demo-detector (app), build.py (stdlib .deb builder)
   rpi-image-gen/              submodule (v2.9.0)
 external/usbboot, external/pi-gen-micro   submodules (shallow); usbboot carries rpi-eeprom
-tests/                        pytest (server), tests/web/ (page self-test, e2e with a real server + mock board)
+tests/                        pytest (server), tests/web/ (page self-test, e2e with a real server + mock board);
+                              hosttools.py: GNU tools / bash 4 checks for the host-run shell tests
 ```
 
 Build artifacts never live in the repo: `%LOCALAPPDATA%\OTP_Provisioner` on Windows,
@@ -180,8 +193,8 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1258 tests, ~1.5 min; needs no Docker, no Google, no hardware
-uv run python -B tests/web/run_selftest.py    # ~650 checks: the page in headless Chrome against a fake API + mock board
+uv run --group dev python -B -m pytest -q     # ~1285 tests, ~1.5 min; needs no Docker, no Google, no hardware
+uv run python -B tests/web/run_selftest.py    # ~660 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
 
@@ -197,10 +210,11 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
 * `OTP_DOCKER_TESTS=1` adds a smoke test against the real engine. Two `test_keyexport_script.py` cases
   skip on Windows (POSIX permissions); the first-boot block test runs under Git Bash's `sh`.
 * On Windows the shell-code tests take `sh`/`bash` from `PATH`: put `C:\Program Files\Git\usr\bin` first. Without
-  it the `sh` tests skip and `bash` is WSL's `System32\bash.exe` (it gets neither the env nor the `C:/` paths), so
-  `test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on` fails; Git's `bin\sh.exe` puts Git's tools
-  before the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With
-  `usr\bin` first: 1255 passed, 3 skipped (2026-11-09). A tool shell (Claude Code's PowerShell) often lacks it.
+  it the `sh` tests skip, and so does the kernel command line test (`tests/hosttools.bash4` never takes WSL's
+  `System32\bash.exe`, which gets neither the env nor the `C:/` paths); Git's `bin\sh.exe` puts Git's tools before
+  the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With `usr\bin`
+  first: 1282 passed, 3 skipped (2026-11-11). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
+  need GNU `stat`/`sed` or bash 4 skip with a hint (`tests/hosttools.py`).
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
 * Everything else in the suites is mocks: a fake docker runner that writes plausible outputs, an in-memory
@@ -347,7 +361,12 @@ through the page once (secure, first run) and that is the accepted weak point of
   in `start4*.elf` inside `boot.img`, not in the EEPROM, so `boot-slot.sh` refuses a CM4 slot whose firmware does not
   know the option (`check_firmware_lock`: the string in every `start4*.elf`); the SoC has no AES instructions, and
   rpi-image-gen would pick Adiantum for its crypt image unless the config sets `luks2_cipher: aes-xts-plain64` (every
-  rendered config does: the station's containers are aes-xts). The gadget runs pi-gen-micro's cut-down
+  rendered config does: the station's containers are aes-xts). Left alone, the kernel builds `xts(aes)` from the
+  table-based `aes-arm64` (seen on `8726622b`); the initramfs script `otp-aes` loads `aes_neon_bs` first on a CPU
+  without the `aes` feature, so dm-crypt takes the constant-time `xts-aes-neonbs`. Without EL3 firmware (the BCM2711's
+  Raspberry Pi armstub has none) the kernel reports Spectre v2 and speculative store bypass Vulnerable;
+  `builds.image.cm4_tfa` adds Debian's Arm Trusted Firmware (rpi4 `bl31.bin`) as the armstub, off until a module
+  booted with it. The gadget runs pi-gen-micro's cut-down
   `start4cd.elf` on a CM4 (`gpu_mem=16`); it carries the crypto section, but that it serves the key export and
   `cryptcheck` is unconfirmed on hardware. rpiidp's `idpinit` checks `IGconf_device_class` against the model
   (`/proc/device-tree/model`): `pi4`/`cm4` accept a CM4, `pi5`/`cm5` only BCM2712 boards.
@@ -492,6 +511,30 @@ run from the station image on `2a03e58f` on 2026-10-28)**
 * **The image's ext4 uses 16 KiB blocks**: an x86 kernel cannot mount it; inspect with `debugfs`.
   `losetup --partscan` works on drvfs under WSL for raw `.img` files.
 
+**The first CM4 on hardware (2026-11-11, `8726622b`, a tester's report)**
+* **In the initramfs is not loaded.** `aes-neon-bs` was in every crypt initramfs, nothing loaded it, and the kernel
+  built `xts(aes)` from the table-based `aes-arm64` (not constant-time, with untrusted apps on the CPU). Layer
+  `otp-rpios-setup` now ships `otp-rpios-setup.d/device/initramfs-tools/{hooks,scripts/init-top}/otp-aes`
+  (rpi-image-gen rsyncs `<layer>.d/device/initramfs-tools` into `/etc/initramfs-tools` and runs `update-initramfs`),
+  `custom-crypt/otp-aes` the same for prepared custom images. The files must be 100755 in git: `build.sh` takes the
+  staged modes from the index, and mkinitramfs skips a hook that is not executable.
+* **A BCM2711 halts through a reset.** After stage 3's `shutdown` the module came back as *BCM2711 Boot* while
+  nRPIBOOT was low. `POWER_OFF_ON_HALT` is not the cause (on a BCM2711 it acts only with `WAKE_ON_GPIO=0`); the page
+  text now says what happens.
+* **A module can come with an OTP device key.** `getvar:public-key` answered in the open run, nobody had generated it.
+  The flow exports an existing key as it is; the page now sends `generated`, the first export records
+  `facts.device_key_origin` (`existing` when not generated now or already recorded) and the page warns.
+* **Raspberry Pi's archive broke the package set.** On 2026-11-04 libcamera went to 0.8; the 2026-10-06 release's
+  `libcamera0.7` needs `libcamera-ipa` of its own version, which the archive no longer has, and every image build
+  failed in mmdebstrap. `rpios_packages.py` leaves `libcamera<N.N>` out (libcamera-ipa and rpicam-apps pull it). Check
+  such breaks quickly with `apt-get install -s` of the whole set in a `debian:trixie` arm64 container with Raspberry
+  Pi's archive (its key: the `raspberrypi-archive-keyring` deb; the old `.gpg.key` is SHA-1 bound and refused).
+* **macOS (Apple Silicon, OrbStack)**: the arm64 engine has no `qemu-aarch64` binfmt entry and must not get one
+  (`_probe_arm64` accepts a native engine); the host bind mount refuses `fallocate(PUNCH_HOLE)`, so `copy_out` falls
+  back to `cp --sparse=auto`; BSD `stat`/`sed` and bash 3.2 fail host-run shell tests (`tests/hosttools.py` skips them
+  with a hint); the e2e runner took `%LOCALAPPDATA%` only (now the server's `default_work_dir()`) and printed
+  "0 passed, 0 failed" with nothing to run (now exit 2).
+
 **Builds on Windows**
 * **Docker Desktop registers its own `aarch64` binfmt handler**, but rpi-image-gen checks for
   `/proc/sys/fs/binfmt_misc/qemu-aarch64` by name; `docker.py` runs `tonistiigi/binfmt --install arm64`
@@ -540,6 +583,11 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   (the crypt hook); `tests/test_custom_images.py` keeps them byte-equal. The keyscript `otp-hwkey` must give
   the same bytes as `hwkey` + `luks_key()` (sysfs CID + `\n`, 64 hex, no newline), and must hand the message to
   `rpi-fw-crypto` in a regular file, never a pipe (bookworm's cannot read one).
+* `otp-aes` exists twice: `image/layer/otp-rpios-setup.d/device/initramfs-tools/scripts/init-top/otp-aes` and
+  `docker/scripts/custom-crypt/otp-aes`; `tests/test_custom_images.py` keeps them byte-equal and the layer's
+  initramfs files 100755 in git.
+* `builds.image.cm4_tfa` stays off by default until Arm Trusted Firmware has booted on a CM4 (test plan phase 2b); the
+  Pi 5 never gets the layer (`Family.tfa_layer` is empty: its firmware runs TF-A already).
 * The Imager file is assembled from the same per-board pieces stage 3 serves (signed slot, container); it must
   not gain anything the page may not see (it carries what stage 3 carries: ciphertext, signed boot files,
   first-boot files).
@@ -680,10 +728,14 @@ For the planned split (server on another machine, Sheets replaced, the open scen
 **The Compute Module 4**
 * Its family is the boot ROM's (`BCM2711`), but so is a Pi 4 Model B's, a Pi 400's and a CM4S's: only
   `USER_BOARDREV` from stage 1 (type `0x14`) says it is a CM4. A port that skips stage 1 cannot tell them apart.
-* It enters RPIBOOT through the nRPIBOOT jumper and stays in it for stages 2 and 3 because of the jumper (no
-  `set_reboot_order` on a BCM2711); the operator removes it after stage 3. `shutdown` only halts a CM4.
+* It enters RPIBOOT through the nRPIBOOT jumper (or a carrier's BOOT switch) and stays in it for stages 2 and 3
+  because of it (no `set_reboot_order` on a BCM2711); the operator releases it after stage 3. `shutdown` halts a
+  CM4 through a reset, so with nRPIBOOT still low it comes straight back in RPIBOOT.
 * Its gadget and OS firmware (`start4*.elf`) come from Raspberry Pi's apt repository at build time and decide
   whether rpi-fw-crypto and `lock_device_private_key` work (on a Pi 5 the EEPROM decides). The gadget's
   raspi-firmware version is not part of the gadget key: a firmware regression would not rebuild anything.
-* Unconfirmed on hardware (2026-11-09): the 8-hex USB serial of the BCM2711 ROM, the WebUSB timings, the cut-down
-  firmware's crypto service in the gadget, the CM4 crypt image's initramfs, the eMMC erase time.
+* Confirmed on `8726622b` (2026-11-11): the ROM's 8-hex USB serial, the WebUSB timings, `getvar:public-key` from
+  the cut-down firmware, `erase` in ~3 s, the sandbox. Unconfirmed: the key export, `fwcrypto init` and `cryptcheck`
+  through the cut-down firmware, the CM4 crypt image's initramfs unlocking the root, Arm Trusted Firmware.
+* Its AES is software: make sure `aes_neon_bs` is loaded before dm-crypt (check `lsmod`, `/proc/crypto`), or the
+  kernel uses the table-based `aes-arm64`. Without EL3 firmware the A72's Spectre v2 / v4 stay unmitigated.

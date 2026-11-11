@@ -18,7 +18,11 @@ Three layers (``layer/``):
   ``linux-headers-rpi-v8``), for the ``cm4`` family.
 
 The official image carries both kernels (it boots every model); a station image carries its family's. Left out
-everywhere: the versioned kernel packages (``linux-image-6.12.47+rpt-rpi-2712`` ...), which the metapackages pull.
+everywhere, because other packages pull them: the versioned kernel packages (``linux-image-6.12.47+rpt-rpi-2712``
+...), which come with the metapackages, and libcamera's soname package (``libcamera0.7`` ...), which comes with
+``libcamera-ipa`` and ``rpicam-apps``. Raspberry Pi's archive moves libcamera between image releases, and the old
+soname package needs ``libcamera-ipa`` of its own version: on 2026-11-04 libcamera-ipa went to 0.8, and an image
+naming ``libcamera0.7`` (the 2026-10-06 release's) could no longer be built.
 """
 from __future__ import annotations
 
@@ -30,6 +34,8 @@ from pathlib import Path
 LAYER_DIR = Path(__file__).resolve().parent / "layer"
 OUT = LAYER_DIR / "otp-rpios-packages.yaml"
 VERSIONED_KERNEL = re.compile(r"^linux-(?:image|headers|kbuild)-\d")
+#: libcamera's soname packages: left to libcamera-ipa / rpicam-apps, which pull the archive's current one.
+LIBCAMERA_SONAME = re.compile(r"^libcamera\d+\.\d+$")
 #: The kernel metapackages of each flavour; each flavour has its own layer.
 KERNEL_META = re.compile(r"^linux-(?:image|headers)-rpi-(2712|v8)$")
 FLAVOURS = ("2712", "v8")
@@ -71,7 +77,7 @@ def parse(info: str) -> tuple[str, str, list[str], list[str], dict[str, list[str
         m = KERNEL_META.match(bare)
         if m:
             kernels[m.group(1)].append(bare)
-        elif VERSIONED_KERNEL.match(bare):
+        elif VERSIONED_KERNEL.match(bare) or LIBCAMERA_SONAME.match(bare):
             drop.append(name)
         else:
             keep.append(name)
@@ -97,8 +103,9 @@ def render(release: str, generator: str, keep: list[str], drop: list[str]) -> st
         "---",
         f"# {release}",
         f"# {generator}",
-        f"# {len(keep)} packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (the",
-        "# metapackages pull them):",
+        f"# {len(keep)} packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (other",
+        "# packages pull them: the kernel metapackages the versioned kernels, libcamera-ipa and rpicam-apps the",
+        "# libcamera of the archive):",
     ]
     head += [f"#   {name}" for name in drop]
     body = ["mmdebstrap:", "  packages:"] + [f"    - {name}" for name in keep]

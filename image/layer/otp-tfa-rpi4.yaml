@@ -1,0 +1,30 @@
+# METABEGIN
+# X-Env-Layer-Name: otp-tfa-rpi4
+# X-Env-Layer-Category: device
+# X-Env-Layer-Desc: Arm Trusted Firmware as the armstub of a Compute Module 4
+#  (BCM2711): Debian's arm-trusted-firmware build for the rpi4 platform
+#  (bl31.bin) next to start4.elf, loaded by config.txt (fragment 90-otp-tfa).
+#  The stub the Raspberry Pi firmware uses on a BCM2711 has no EL3 services, so
+#  the kernel reports the Cortex-A72 vulnerable to Spectre v2 and to speculative
+#  store bypass; TF-A gives it the SMCCC workarounds (and PSCI, which it puts
+#  into the device tree). In the config only when builds.image.cm4_tfa is on.
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Requires: otp-rpios-setup
+# METAEND
+---
+mmdebstrap:
+  packages:
+    - arm-trusted-firmware
+  customize-hooks:
+    - |-
+      # The rpi4 platform's BL31 into the boot partition, where the firmware loads the armstub from
+      # (armstub=bl31.bin in config.txt). On a secure board it goes into the signed boot.img with the rest.
+      set -eu
+      src="$1/usr/lib/arm-trusted-firmware/rpi4/bl31.bin"
+      if [ ! -s "$src" ]; then
+          echo "otp-tfa-rpi4: $src is missing (package arm-trusted-firmware)" >&2
+          exit 1
+      fi
+      install -m 0644 -D "$src" "$1/boot/firmware/bl31.bin"
+      echo "otp-tfa-rpi4: bl31.bin $(wc -c < "$1/boot/firmware/bl31.bin") bytes, arm-trusted-firmware" \
+           "$(chroot "$1" dpkg-query -W -f '${Version}' arm-trusted-firmware)"

@@ -452,6 +452,14 @@ def _run_script(tmp_path: Path, env_extra: dict, boot_conf: str, config_txt: str
 CFG_PLAIN = "uart_2ndstage=1\nset_reboot_order=0x3\nrecovery_reboot=1\n"
 
 
+def _needs_gnu_stat() -> None:
+    """Past its guards stage1.sh measures files with GNU ``stat -c %s`` (it runs in the Debian tools image)."""
+    from hosttools import GNU_HINT, is_gnu
+    bash = _bash()
+    if bash is None or not is_gnu("stat", bash):
+        pytest.skip(f"stage1.sh needs GNU stat past its guards ({GNU_HINT})")
+
+
 def test_script_refuses_unsigned_with_signed_boot(tmp_path):
     cp = _run_script(tmp_path, {"MODE": "unsigned", "SIGN_RECOVERY": "0"},
                      "[all]\r\nBOOT_UART=1\r\n[cm5]\r\nSIGNED_BOOT=1\r\n", CFG_PLAIN)
@@ -460,6 +468,7 @@ def test_script_refuses_unsigned_with_signed_boot(tmp_path):
 
 
 def test_script_unsigned_signed_boot_0_passes_the_guard(tmp_path):
+    _needs_gnu_stat()
     cp = _run_script(tmp_path, {"MODE": "unsigned", "SIGN_RECOVERY": "0"}, "[all]\nSIGNED_BOOT=0\n", CFG_PLAIN)
     assert "SIGNED_BOOT" not in cp.stderr
     assert "firmware directory not found" in cp.stderr          # got past the guard, stopped at the fake ext
@@ -492,6 +501,7 @@ def test_script_chip_and_lock_guards(tmp_path, extra, cfg, msg):
 @pytest.mark.parametrize("extra", [{"CHIP": "2711", "MODE": "unsigned", "SIGN_RECOVERY": "0"},
                                    {"CHIP": "2711", "MODE": "signed", "SIGN_RECOVERY": "0", "LOCKED": "1"}])
 def test_script_cm4_passes_the_guards_to_its_firmware(tmp_path, extra):
+    _needs_gnu_stat()
     signed = extra["MODE"] == "signed"
     cp = _run_script(tmp_path, {"EXPECT_CKH": "ab" * 32, **extra}, "[all]\nSIGNED_BOOT=1\n" if signed else "[all]\n",
                      "uart_2ndstage=1\nrecovery_reboot=1\n")

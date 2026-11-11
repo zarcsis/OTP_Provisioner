@@ -1,0 +1,20 @@
+#!/bin/sh
+# otp-aes - initramfs init-top script of the OTP provisioning station: a CPU without the ARMv8 AES
+# instructions (BCM2711: Compute Module 4) gets the bit-sliced NEON AES before anything asks the kernel for
+# AES (cryptroot opens the encrypted root later, in local-top). Left to itself the kernel builds xts(aes) from
+# the scalar aes-arm64, which looks bytes up in tables and is not constant-time; xts-aes-neonbs is, and its
+# higher priority makes dm-crypt pick it once the module is loaded. A CPU with the AES instructions (BCM2712:
+# Raspberry Pi 5) uses them (aes-ce) and needs nothing here. The module stays loaded after switch_root.
+# Installed as scripts/init-top/otp-aes by the image layer otp-rpios-setup and by custom-image.sh (crypt);
+# tests/test_custom_images.py keeps the two copies equal.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+grep -qw aes /proc/cpuinfo && exit 0
+if ! modprobe -q aes_neon_bs; then
+    echo "otp-aes: aes_neon_bs did not load: dm-crypt uses the table-based AES" > /dev/kmsg 2>/dev/null || true
+fi
+exit 0

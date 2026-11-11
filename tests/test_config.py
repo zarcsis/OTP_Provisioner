@@ -81,6 +81,7 @@ def test_defaults(tmp_path):
     assert b.image.families == ["pi5", "cm4"]
     assert (b.image.builder_tag, b.image.volume, b.image.keep_raw_image) == (
         "otp-image-builder:trixie", "otp-image-work", False)
+    assert b.image.cm4_tfa is False          # Arm Trusted Firmware on the CM4: off until confirmed on a module
     i = cfg.image
     assert (i.name, i.hostname, i.timezone, i.user, i.password_hash) == (
         "rpios-trixie-arm64-lite", "pi5-{serial}", "Europe/Kyiv", "pi", "")
@@ -342,7 +343,7 @@ def test_text_values_from_cells(tmp_path):
 
 BOOL_KEYS = [("server", "open_browser"), ("provisioning", "jtag_lock"), ("provisioning", "recovery_passphrase"),
              ("provisioning", "confirm_irreversible"), ("provisioning", "erase_storage"), ("builds", "auto"),
-             ("builds.image", "keep_raw_image"), ("docker", "start_desktop")]
+             ("builds.image", "keep_raw_image"), ("builds.image", "cm4_tfa"), ("docker", "start_desktop")]
 
 
 def _nested(section: str, key: str, value) -> dict:
@@ -644,7 +645,7 @@ def test_summary(make_cfg, tmp_path):
                                      "volume": "otp-pgm-work"}
     assert s["builds"]["image"] == {"overrides": [], "builder_tag": "otp-image-builder:trixie",
                                     "volume": "otp-image-work", "keep_raw_image": False,
-                                    "families": [f for f in cfg.builds.image.families]}
+                                    "families": [f for f in cfg.builds.image.families], "cm4_tfa": False}
     d = s["docker"]
     assert set(d) == {"binary", "start_desktop", "desktop_path", "idle_timeout"}
     assert d["desktop_path"] == (str(cfg.docker.desktop_path) if cfg.docker.desktop_path else None)

@@ -77,7 +77,7 @@ def _module(serial: str, stage: str, label: str, updated: str, *, locked: bool =
         "otp": {"customer_key_hash": khash if locked else "", "locked": locked, "locked_to_our_key": locked,
                 "secure_boot_provisioned": locked, "jtag_locked": False, "device_key": device_key,
                 "device_key_fingerprint": "9c0d7e21f4a3b58c6d2e1f0a9b8c7d6e" if device_key else "",
-                "device_key_exported": exported},
+                "device_key_exported": exported, "device_key_origin": "station" if exported else ""},
         "metadata": {}, "facts": {"fastboot": {"mmc-cid": "035344534333324780b6e2a8d9012d00"}} if exported else {},
         "events": events or [{"t": "2026-09-30T09:12:44Z", "kind": "hello", "note": "created"}],
     }
@@ -468,10 +468,15 @@ def _device_key(m: dict, body: dict) -> tuple[int, Any]:
     already = bool(otp.get("device_key_exported")) and otp.get("device_key_fingerprint") == fp
     if otp.get("device_key_exported") and not already:
         return 400, {"detail": f"module {m['serial']}: a different device private key is already stored"}
+    if not already:                       # otp_server/modules.py store_device_key: the key's origin
+        generated = body.get("generated")
+        otp["device_key_origin"] = ("existing" if generated is False or otp.get("device_key")
+                                    else "station" if generated else "")
     otp.update(device_key=True, device_key_exported=True, device_key_fingerprint=fp)
     if not already:
         m["events"].append({"t": _now(), "kind": "device_key_export", "note": f"device key {fp[:16]} exported"})
-    return 200, {"module": m, "device_key": {"fingerprint": fp, "already": already, "zero_words": 0}}
+    return 200, {"module": m, "device_key": {"fingerprint": fp, "already": already, "zero_words": 0,
+                                             "origin": otp.get("device_key_origin", "")}}
 
 
 def _manifest(m: dict, n: int) -> dict:

@@ -334,11 +334,12 @@ def _q(value: str) -> str:
 
 
 def render(img: Any, *, mount: str = "/cfg", inputs: dict | None = None,
-           family: boards.Family = boards.PI5) -> RenderedConfig:
+           family: boards.Family = boards.PI5, tfa: bool = False) -> RenderedConfig:
     """The rpi-image-gen config of the station image named ``img.name`` for boards of ``family``; ``mount`` is
     where the build container sees the config dir. ``inputs``
     (:meth:`otp_server.artifacts.packages.Packages.image_inputs`): the system packages (``packages:``, installed
-    like the image's own) and the sandboxed apps (layer ``otp-apps``) the settings put into the image."""
+    like the image's own) and the sandboxed apps (layer ``otp-apps``) the settings put into the image. ``tfa``
+    (``builds.image.cm4_tfa``): the family's Arm Trusted Firmware layer, if it has one."""
     lines = [
         f"# rpi-image-gen config written by OTP_Provisioner: Raspberry Pi OS Lite for the {family.title}.",
         "# The same image for every board; stage 3 writes each board's account, SSH, Wi-Fi, host name and",
@@ -365,6 +366,9 @@ def render(img: Any, *, mount: str = "/cfg", inputs: dict | None = None,
     files: dict[str, bytes] = {}
     blobs: dict[str, Blob] = {}
     summary: dict[str, Any] = {"name": img.name, "base": "Raspberry Pi OS Lite", "family": family.key}
+    if tfa and family.tfa_layer:
+        lines.append(f"  tfa: {family.tfa_layer}")
+        summary["armstub"] = "Arm Trusted Firmware (rpi4)"
     problems: list[str] = []
     if inputs and (inputs.get("system") or inputs.get("apps")):
         problems += list(inputs.get("problems") or [])

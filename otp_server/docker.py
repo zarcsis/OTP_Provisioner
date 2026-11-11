@@ -319,12 +319,19 @@ class DockerRunner:
         arm64 chroots) checks for ``/proc/sys/fs/binfmt_misc/qemu-aarch64`` by name and refuses to
         build without it. ``tonistiigi/binfmt --install arm64`` adds that entry (flags POCF), which is
         what ``image/build.sh --docker`` does on the host.
+
+        An arm64 engine (Apple Silicon: OrbStack, Docker Desktop; an arm64 Linux host) runs arm64 natively and
+        needs no entry: ``image/build.sh`` skips its check there (``host_is_arm64``), and registering qemu for
+        the engine's own architecture would send every native binary in its VM through the emulator.
         """
         rc, out = self._capture(["run", "--rm", "--platform", "linux/arm64", PROBE_IMAGE, "uname", "-m"],
                                 timeout=600)
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         if not (rc == 0 and lines and lines[-1] == "aarch64"):
             return False, (lines[-1] if lines else f"rc {rc}")
+        rc, out = self._capture(["info", "--format", "{{.Architecture}}"], timeout=30)
+        if rc == 0 and out.strip() in ("aarch64", "arm64"):
+            return True, "aarch64 (native engine)"
         rc, out = self._capture(["run", "--rm", "--privileged", "--entrypoint", "sh", PROBE_IMAGE, "-c",
                                  BINFMT_CHECK], timeout=120)
         if rc != 0:

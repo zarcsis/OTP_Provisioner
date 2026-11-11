@@ -351,7 +351,8 @@ class ModuleService:
             _add_event(rec, "mode", note)
             return self._save(rec)
 
-    def store_device_key(self, serial: str, key_der: bytes, reported_pem: str) -> tuple[dict, dict]:
+    def store_device_key(self, serial: str, key_der: bytes, reported_pem: str,
+                         generated: bool | None = None) -> tuple[dict, dict]:
         """Keep the board's OTP device private key exported by the fastboot gadget (``secure`` mode).
 
         ``key_der`` is the gadget's ``rpi-fw-crypto privkey --key-id 1`` output (DER, or the raw
@@ -360,7 +361,12 @@ class ModuleService:
         knows the board's device key, that one too (an OTP key can never change). A second export of
         the same key changes nothing.
 
-        :returns: ``(record, info)`` with ``info = {"fingerprint", "already", "zero_words"}``;
+        ``generated`` is the page's word on whether the gadget generated the key at the station's request in
+        this run. The first export records where the key came from (``facts.device_key_origin``): ``station``,
+        or ``existing`` when the key was there before (not generated now, or already seen on this board): then
+        whoever generated it may hold a copy, and the board's encrypted root is only as secret as that copy.
+
+        :returns: ``(record, info)`` with ``info = {"fingerprint", "already", "zero_words", "origin"}``;
             ``zero_words`` > 0 means OTP rows of the key are zero (a key write that was cut short).
         :raises KeyError: unknown module. :raises ValueError: unusable key or a public-key mismatch.
         """
@@ -382,14 +388,21 @@ class ModuleService:
             if rec["device_private_pem"]:
                 if not same_public_key(rec["device_private_pem"], pub):
                     raise ValueError(f"module {rec['serial']}: a different device private key is already stored")
-                return copy.deepcopy(rec), {"fingerprint": fp, "already": True, "zero_words": zero}
+                return copy.deepcopy(rec), {"fingerprint": fp, "already": True, "zero_words": zero,
+                                            "origin": self.device_key_origin(rec)}
+            origin = ("existing" if generated is False or rec["device_key_pem"]
+                      else "station" if generated else "")
             rec["device_private_pem"] = priv
             rec["device_key_pem"] = pub
             note = f"device key {fp[:16]} exported"
+            if origin:
+                rec["facts"]["device_key_origin"] = origin
+                note += ("; generated at the station's request" if origin == "station" else
+                         "; it was in OTP before (not generated at this station's request): its origin is unknown")
             if zero:
                 note += f"; WARNING: {zero} of its 8 OTP words are zero (key generation was probably interrupted)"
             _add_event(rec, "device_key_export", note)
-            return self._save(rec), {"fingerprint": fp, "already": False, "zero_words": zero}
+            return self._save(rec), {"fingerprint": fp, "already": False, "zero_words": zero, "origin": origin}
 
     def record_result(self, serial: str, stage: int, result: dict) -> tuple[dict, dict]:
         """Apply the page's report of a stage run (rules in SPEC section 7).
@@ -744,6 +757,15 @@ class ModuleService:
         return self.is_locked(record) and bool(ours) and h == ours
 
     @staticmethod
+    def device_key_origin(record: dict) -> str:
+        """``facts.device_key_origin``: ``station`` (generated at the station's request), ``existing`` (in OTP
+        before the station exported it: origin unknown) or ``""`` (not exported yet, or exported before the
+        station recorded it)."""
+        facts = (record or {}).get("facts")
+        origin = facts.get("device_key_origin") if isinstance(facts, dict) else None
+        return origin if origin in ("station", "existing") else ""
+
+    @staticmethod
     def jtag_locked(record: dict) -> bool:
         """The board reported ``JTAG_LOCKED=1`` in a stage 1 (``facts.jtag_locked``, never cleared: OTP)."""
         facts = (record or {}).get("facts")
@@ -810,6 +832,7 @@ class ModuleService:
                 "device_key": bool(r["device_key_pem"]),
                 "device_key_fingerprint": _fingerprint(r["device_key_pem"]) if r["device_key_pem"] else "",
                 "device_key_exported": bool(r["device_private_pem"]),
+                "device_key_origin": self.device_key_origin(r),
             },
             "metadata": r["metadata"],
             "facts": r["facts"],

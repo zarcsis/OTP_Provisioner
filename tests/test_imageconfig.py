@@ -48,6 +48,40 @@ def test_render_for_the_compute_module_4():
     assert (REPO_ROOT / "image" / "example-cm4.yaml").read_bytes().decode("utf-8") == cm4.text
 
 
+def test_render_with_arm_trusted_firmware_for_the_compute_module_4():
+    """builds.image.cm4_tfa: the CM4 image gets layer otp-tfa-rpi4 (a new digest, so the cm4 sets rebuild); the
+    Raspberry Pi 5's firmware runs TF-A already, so its image is the same with or without the setting."""
+    from otp_server import boards
+    yaml = pytest.importorskip("yaml")
+    plain, tfa = ic.render(image(), family=boards.CM4), ic.render(image(), family=boards.CM4, tfa=True)
+    assert yaml.safe_load(tfa.text)["layer"] == {"base": "otp-rpios-lite", "kernel": "otp-rpios-kernel-v8",
+                                                 "station": "otp-rpios-setup", "tfa": "otp-tfa-rpi4"}
+    assert tfa.summary["armstub"] == "Arm Trusted Firmware (rpi4)" and "armstub" not in plain.summary
+    assert tfa.digest() != plain.digest()
+    pi5 = ic.render(image(), family=boards.PI5, tfa=True)
+    assert pi5.text == ic.render(image()).text and "armstub" not in pi5.summary
+    assert boards.PI5.tfa_layer == "" and boards.CM4.tfa_layer == "otp-tfa-rpi4"
+
+
+def test_otp_tfa_rpi4_layer():
+    """Debian's arm-trusted-firmware (trixie: 2.12, /usr/lib/arm-trusted-firmware/rpi4/bl31.bin) next to
+    start4.elf, loaded as the armstub by a config.txt fragment for the CM4 only."""
+    yaml = pytest.importorskip("yaml")
+    path = LAYERS / "otp-tfa-rpi4.yaml"
+    meta = _meta(path)
+    assert meta["X-Env-Layer-Name"] == "otp-tfa-rpi4" and _requires(path) == {"otp-rpios-setup"}
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert doc["mmdebstrap"]["packages"] == ["arm-trusted-firmware"]
+    hook = doc["mmdebstrap"]["customize-hooks"][0]
+    assert 'src="$1/usr/lib/arm-trusted-firmware/rpi4/bl31.bin"' in hook
+    assert 'install -m 0644 -D "$src" "$1/boot/firmware/bl31.bin"' in hook and "exit 1" in hook
+    frag = LAYERS / "otp-tfa-rpi4.d" / "for" / "rpi-boot-firmware" / "config.txt.d" / "90-otp-tfa"
+    body = frag.read_bytes()
+    assert b"\r" not in body
+    lines = [ln for ln in body.decode().splitlines() if ln and not ln.startswith("#")]
+    assert lines == ["[cm4]", "armstub=bl31.bin", "enable_gic=1", "enable_uart=1"]
+
+
 def test_render_ignores_the_board_settings():
     """Account, SSH, Wi-Fi, host name and time zone are written per board at stage 3, never into the image."""
     base = ic.render(image())
@@ -164,7 +198,7 @@ def test_station_layers_require_layers_that_exist():
             "otp-rpios-kernel-v8"} <= names
     from otp_server import boards
     for fam in boards.FAMILIES.values():                  # every layer a family's config names exists
-        assert {fam.device_layer, fam.kernel_layer} <= names, fam.key
+        assert {fam.device_layer, fam.kernel_layer, *([fam.tfa_layer] if fam.tfa_layer else [])} <= names, fam.key
 
 
 def test_otp_rpios_lite_layer():
@@ -230,7 +264,9 @@ def test_otp_rpios_setup_enables_apparmor_service(tmp_path):
 #: rpi-image-gen's linux-base assembles /etc/kernel/cmdline from every layer's cmdline.d fragments (late hook,
 #: after all customize hooks); rpi-linux-base installs it as /boot/firmware/cmdline.txt.
 CMDLINE_HOOK = REPO_ROOT / "image" / "rpi-image-gen" / "layer" / "base" / "linux-base.d" / "hooks" / "late" / "preimage10-cmdline"
-BASH = shutil.which("bash")
+from hosttools import BASH_HINT, bash4  # noqa: E402
+
+BASH = bash4()                      # rpi-image-gen's hooks use mapfile: bash >= 4 (macOS's /bin/bash is 3.2)
 CMDLINE_FRAGMENTS = {
     "apparmor": LAYERS / "otp-rpios-setup.d" / "for" / "linux-base" / "cmdline.d" / "60-apparmor",
     "memcg": LAYERS / "otp-apps.d" / "for" / "linux-base" / "cmdline.d" / "60-memcg",
@@ -256,7 +292,7 @@ def assemble_cmdline(tmp_path: Path, *fragments: Path) -> str:
     return out.read_bytes().decode("utf-8")
 
 
-@pytest.mark.skipif(BASH is None, reason="no bash on PATH (on Windows Git Bash provides one)")
+@pytest.mark.skipif(BASH is None, reason=f"{BASH_HINT}; on Windows Git Bash provides one")
 def test_cmdline_fragments_turn_apparmor_and_the_memory_cgroup_on(tmp_path):
     """The Raspberry Pi kernel has AppArmor built in but an empty default LSM list (CONFIG_LSM=""), and the
     firmware disables the memory cgroup: the station's fragments select AppArmor (replacing any earlier LSM

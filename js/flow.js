@@ -47,9 +47,11 @@
     const SUPPORTED_CHIPS = {
         BCM2712: { family: 'pi5', title: 'Raspberry Pi 5 / CM5 / Pi 500', rpiboot: 'hold the power button while plugging in USB-C',
             stopped: 'powered off', afterFlash: 'unplug it and power it from its own supply' },
-        // a CM4 has no power-off circuit of its own: `shutdown` halts it
-        BCM2711: { family: 'cm4', title: 'Compute Module 4', rpiboot: 'fit the nRPIBOOT jumper and power the board on',
-            stopped: 'halted', afterFlash: 'remove the nRPIBOOT jumper (it would boot into RPIBOOT again), then power-cycle it on its own supply' },
+        // A BCM2711 halts through a reset into its bootloader, and with nRPIBOOT still fitted the boot ROM takes the
+        // USB boot path first: after `shutdown` the module shows up again as "BCM2711 Boot" (seen on 8726622b).
+        BCM2711: { family: 'cm4', title: 'Compute Module 4', rpiboot: 'fit the nRPIBOOT jumper (or switch the carrier\'s BOOT switch on) and power the board on',
+            stopped: 'shut down (with nRPIBOOT still fitted it comes straight back as "BCM2711 Boot" in RPIBOOT mode, which is expected)',
+            afterFlash: 'remove the nRPIBOOT jumper or switch BOOT off, then power-cycle it on its own supply' },
     };
     const SUPPORTED_TEXT = 'Raspberry Pi 5 / CM5 / Pi 500 (BCM2712) and Compute Module 4 (BCM2711)';
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -838,11 +840,15 @@
         const r = await client.exportDeviceKey(keyExport, { log: (l, m) => this.log(l, m), timeoutMs: this.opt.keyExportTimeoutMs });
         const pem = await client.publicKey();
         if (!pem) throw new Error('the gadget exported a device key but getvar:public-key returned none');
-        const res = await this.api.deviceKey(this.serial, { key_der_b64: toBase64(r.der), device_key_pem: pem });
+        const res = await this.api.deviceKey(this.serial, { key_der_b64: toBase64(r.der), device_key_pem: pem, generated: !!r.generated });
         this._setModule(res.module);
         const dk = res.device_key || {};
         this.log('ok', `OTP device key ${dk.already ? 'was already on the server' : 'stored on the server'} (${String(dk.fingerprint || '').slice(0, 16)})`);
         if (dk.zero_words) this.log('warn', `${dk.zero_words} of the 8 OTP words of the device key are zero: its generation was probably interrupted (power loss?)`);
+        if (!dk.already && dk.origin === 'existing') {
+            this.log('warn', 'The OTP device key was in OTP before (the station did not generate it): whoever generated it may '
+                + 'hold a copy, and this board\'s encrypted root is only as secret as that copy. Do not ship the board unless you know its history.');
+        }
         return pem;
     };
 

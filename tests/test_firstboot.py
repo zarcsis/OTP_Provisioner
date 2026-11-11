@@ -221,6 +221,9 @@ def _run_block(root: Path, script: str) -> list[str]:
 
 @pytest.mark.skipif(SH is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
 def test_first_boot_block_runs_until_it_has_completed_once(tmp_path):
+    from hosttools import GNU_HINT, is_gnu
+    if not is_gnu("sed", SH):
+        pytest.skip(f"the first-boot block edits files with GNU sed -i, as on the board ({GNU_HINT})")
     img = image(user="op", ssh=True, ssh_password_login=False, ssh_authorized_keys=[KEY], wifi_country="AR")
     script = fb.firstboot_script(img)
     root = tmp_path

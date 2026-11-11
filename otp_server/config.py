@@ -97,6 +97,7 @@ DEFAULTS: dict[str, Any] = {
             "builder_tag": "otp-image-builder:trixie",
             "volume": "otp-image-work",
             "keep_raw_image": False,
+            "cm4_tfa": False,
         },
     },
     "docker": {"binary": "docker", "start_desktop": True, "desktop_path": None, "idle_timeout": 1800},
@@ -179,6 +180,9 @@ class ImageBuildCfg:
     volume: str
     keep_raw_image: bool
     families: list[str] = field(default_factory=lambda: ["pi5"])
+    #: The Compute Module 4 images boot through Arm Trusted Firmware (layer otp-tfa-rpi4): the kernel gets the
+    #: Spectre v2 / v4 workarounds the Raspberry Pi armstub of a BCM2711 lacks. Off until confirmed on a module.
+    cm4_tfa: bool = False
 
 
 @dataclass
@@ -657,6 +661,7 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
             volume=_str(image.get("volume"), "builds.image.volume") or "",
             keep_raw_image=_bool(image.get("keep_raw_image"), "builds.image.keep_raw_image"),
             families=families,
+            cm4_tfa=_bool(image.get("cm4_tfa", False), "builds.image.cm4_tfa"),
         ),
     )
 

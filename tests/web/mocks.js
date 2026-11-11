@@ -675,7 +675,7 @@
                 m = { serial, stage: 'new', stage_label: LABELS.new, mode: this.defaultMode, mode_chosen: '', mode_locked: false,
                     chip: '', board: '', duid: '', mac: '', created: 'now', updated: 'now',
                     secrets: { rsa_key: true, customer_key_hash: 'ab'.repeat(32), device_secret: true, rsa_key_fingerprint: 'cd'.repeat(32) },
-                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, jtag_locked: false, device_key: false, device_key_fingerprint: '', device_key_exported: false },
+                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, jtag_locked: false, device_key: false, device_key_fingerprint: '', device_key_exported: false, device_key_origin: '' },
                     metadata: {}, facts: {}, events: [] };
                 this.modules.set(serial, m);
                 return [m, true];
@@ -725,13 +725,17 @@
             const fingerprint = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', spki)));
             if (m.device_private_spki && m.device_private_spki !== hex(spki)) throw apiError(400, `module ${serial}: a different device private key is already stored`);
             const already = !!m.device_private_spki;
+            // otp_server/modules.py store_device_key: where the key came from, recorded at the first export
+            if (!already) {
+                m.otp.device_key_origin = body.generated === false || m.otp.device_key ? 'existing' : (body.generated ? 'station' : '');
+            }
             m.device_private_spki = hex(spki);
             m.device_key_pem = body.device_key_pem;
             m.otp.device_key = true;
             m.otp.device_key_exported = true;
             m.otp.device_key_fingerprint = fingerprint;
             if (!already) m.events.push({ t: 'now', kind: 'device_key_export', note: `device key ${fingerprint.slice(0, 16)} exported` });
-            return { module: this._copy(m), device_key: { fingerprint, already, zero_words: this.zeroWords } };
+            return { module: this._copy(m), device_key: { fingerprint, already, zero_words: this.zeroWords, origin: m.otp.device_key_origin || '' } };
         }
         _advance(m, stage) {
             if (STAGES.indexOf(stage) > STAGES.indexOf(m.stage)) { m.stage = stage; m.stage_label = LABELS[stage]; }

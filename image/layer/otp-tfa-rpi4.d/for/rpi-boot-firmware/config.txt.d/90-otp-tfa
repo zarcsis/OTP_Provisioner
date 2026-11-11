@@ -1,0 +1,6 @@
+[cm4]
+# Arm Trusted Firmware (layer otp-tfa-rpi4) as the armstub: the Spectre v2 / v4 workarounds for the kernel.
+# TF-A's rpi4 platform wants the GIC and the UART set up by the firmware.
+armstub=bl31.bin
+enable_gic=1
+enable_uart=1

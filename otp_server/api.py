@@ -325,7 +325,8 @@ def api_router(svc: Any) -> APIRouter:
     @r.post("/modules/{serial}/device-key")
     def module_device_key(serial: str, body: Any = Body(default=None)) -> dict:
         """The board's OTP device private key as the fastboot gadget exported it (``secure`` mode):
-        ``{"key_der_b64": base64 of the gadget's key file, "device_key_pem": getvar:public-key}``.
+        ``{"key_der_b64": base64 of the gadget's key file, "device_key_pem": getvar:public-key,
+        "generated": the gadget generated it at the station's request in this run}``.
         Stored only when it matches the public key the board reports; the key never comes back out."""
         b = body_dict(body)
         raw_b64 = b.get("key_der_b64")
@@ -335,8 +336,12 @@ def api_router(svc: Any) -> APIRouter:
             der = base64.b64decode(raw_b64.strip(), validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(400, detail="key_der_b64 is not valid base64") from None
-        rec, info = call(modules().store_device_key, serial, der, b.get("device_key_pem"))
-        return {"module": view(rec), "device_key": {k: info[k] for k in ("fingerprint", "already", "zero_words")}}
+        generated = b.get("generated")
+        if generated is not None and not isinstance(generated, bool):
+            raise HTTPException(400, detail="generated must be true, false or absent")
+        rec, info = call(modules().store_device_key, serial, der, b.get("device_key_pem"), generated)
+        return {"module": view(rec),
+                "device_key": {k: info[k] for k in ("fingerprint", "already", "zero_words", "origin")}}
 
     @r.post("/modules/{serial}/otp")
     def module_otp(serial: str, body: Any = Body(default=None)) -> dict:

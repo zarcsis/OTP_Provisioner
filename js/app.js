@@ -307,7 +307,7 @@
         const m = serial ? (flow.module && flow.module.serial === serial ? flow.module : srv.modules.find((x) => x.serial === serial)) : null;
         if (!m) {
             box.replaceChildren(el('p', { class: 'muted' }, checking() ? 'Checking the server…' : api.available
-                ? 'No board connected. Put the board into RPIBOOT mode (Raspberry Pi 5: hold the power button while connecting USB-C; Compute Module 4: fit the nRPIBOOT jumper, connect the carrier\'s USB device port, power on) and click Connect board.'
+                ? 'No board connected. Put the board into RPIBOOT mode (Raspberry Pi 5: hold the power button while connecting USB-C; Compute Module 4: fit the nRPIBOOT jumper or switch the carrier\'s BOOT switch on, connect the carrier\'s USB device port, power on) and click Connect board.'
                 : 'The server is not reachable, so boards cannot be provisioned from here. Start it with "uv run server.py" and reload.'));
             return;
         }
@@ -335,6 +335,7 @@
                 kv('Secure boot', otp.secure_boot_provisioned ? 'provisioned' : 'not provisioned'),
                 kv('JTAG', otp.jtag_locked ? 'VideoCore JTAG locked (permanent)' : 'not locked'),
                 kv('Device key', otp.device_key ? el('span', { title: otp.device_key_fingerprint || '' }, 'ECDSA ✓ ' + shortHex(otp.device_key_fingerprint, 16) + (otp.device_key_exported ? ' · private key on the server' : '')) : '—', 'mono'),
+                otp.device_key_origin === 'existing' ? kv('Key origin', 'in OTP before the station exported it: unknown, whoever made it may hold a copy', 'bad') : null,
                 kv('DUID', m.duid, 'mono'),
                 kv('MAC', m.mac, 'mono'),
                 kv('Board rev', m.boardrev, 'mono'),

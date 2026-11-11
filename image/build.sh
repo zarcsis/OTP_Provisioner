@@ -731,7 +731,11 @@ copy_out() {
     local f=$1 b
     b=${f##*/}
     PART_FILE=$(mktemp "$OUTDIR/.$b.XXXXXX.part") || die "cannot create a temporary file in $OUTDIR"
-    if ! cp --sparse=always -- "$f" "$PART_FILE"; then
+    # --sparse=always punches holes (fallocate PUNCH_HOLE), which some host bind mounts refuse (macOS ->
+    # OrbStack: "error deallocating ...: Invalid argument"); --sparse=auto then keeps the source's holes by
+    # seeking and punches nothing.
+    if ! cp --sparse=always -- "$f" "$PART_FILE" 2>/dev/null \
+        && ! { warn "cp --sparse=always failed in $OUTDIR; copying with --sparse=auto"; cp --sparse=auto -- "$f" "$PART_FILE"; }; then
         rm -f -- "$PART_FILE"
         PART_FILE=''
         die "copying the image to $OUTDIR failed; the built image is $f"

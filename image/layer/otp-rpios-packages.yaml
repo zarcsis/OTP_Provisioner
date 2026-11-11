@@ -9,8 +9,10 @@
 ---
 # Raspberry Pi reference 2026-10-06
 # Generated using pi-gen, https://github.com/RPi-Distro/pi-gen, b2cd98a9ee08a31ef7d0110ed09f2492bbd972ec, stage2
-# 623 packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (the
-# metapackages pull them):
+# 622 packages; the kernel metapackages are in otp-rpios-kernel-<flavour>; left out (other
+# packages pull them: the kernel metapackages the versioned kernels, libcamera-ipa and rpicam-apps the
+# libcamera of the archive):
+#   libcamera0.7
 #   linux-headers-6.18.50+rpt-common-rpi
 #   linux-headers-6.18.50+rpt-rpi-2712
 #   linux-headers-6.18.50+rpt-rpi-v8
@@ -200,7 +202,6 @@ mmdebstrap:
     - libc6
     - libc6-dev
     - libcamera-ipa
-    - libcamera0.7
     - libcap-ng0
     - libcap2
     - libcap2-bin

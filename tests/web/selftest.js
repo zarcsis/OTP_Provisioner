@@ -903,6 +903,9 @@
             eq(dk && fbs && T.hex(T.unb64(dk[2].key_der_b64)) === T.hex(fbs.deviceKey.der), true, 'secure: key_der_b64 = the gadget\'s key.der');
             eq(dk && fbs && dk[2].device_key_pem.trim() === fbs.deviceKey.pem.trim(), true, 'secure: device_key_pem = getvar:public-key');
             eq(flow.module && flow.module.otp.device_key_exported, true, 'secure: the server record says the key was exported');
+            eq(dk && dk[2].generated, true, 'secure: the page tells the server the gadget generated the key on request');
+            eq(flow.module && flow.module.otp.device_key_origin, 'station', 'secure: the record says the station generated the key');
+            eq(ev.logs.some((l) => /was in OTP before/.test(l)), false, 'secure: no warning about a key of unknown origin');
             assert(ev.logs.includes('info: Board a7eb274c: secure scenario'), 'secure: the first scenario choice of a new board is logged plainly', ev.logs.filter((l) => /scenario/.test(l)).join(' | '));
             eq(ev.logs.some((l) => /every stage is redone/.test(l)), false, 'secure: … and does not claim "every stage is redone" (nothing was reset)');
             eq(api.gated, 2, 'secure: the early manifests of stages 2 and 3 are refused (409) until stage 1 has burnt our key hash');
@@ -998,7 +1001,7 @@
             assert(ev.logs.some((l) => /Sending bootcode4\.bin .* from bootfiles\.bin:2711\/bootcode4\.bin/.test(l)), 'cm4: stage 2 takes 2711/bootcode4.bin from bootfiles.bin', ev.logs.filter((l) => /Sending/.test(l)).join(' | '));
             const b1 = api.calls.find((c) => c[0] === 'result' && c[2] === 1);
             eq(b1 && b1[3].metadata.USER_BOARDREV, 'c03141', 'cm4: the stage-1 report carries the board type (USER_BOARDREV, the server refuses a Pi 4 Model B)');
-            assert(/the board is halted: remove the nRPIBOOT jumper/.test(flow.stages[3].detail), 'cm4: stage 3 says the module halted and tells the operator to remove the nRPIBOOT jumper', flow.stages[3].detail);
+            assert(/the board is shut down \(with nRPIBOOT still fitted it comes straight back as "BCM2711 Boot".*\): remove the nRPIBOOT jumper or switch BOOT off/.test(flow.stages[3].detail), 'cm4: stage 3 says the module shut down, may come back in RPIBOOT, and tells the operator to remove the jumper', flow.stages[3].detail);
             eq(flow.boardKind().family, 'cm4', 'cm4: the flow knows the board family');
         }
         {
@@ -1420,6 +1423,9 @@
             const dk = api.calls.find((c) => c[0] === 'deviceKey');
             eq(dk && T.hex(T.unb64(dk[2].key_der_b64)), T.hex(KEY_A.der), 'existing key: posted to the server');
             assert(ev.logs.some((l) => /^warn: 2 of the 8 OTP words of the device key are zero/.test(l)), 'existing key: zero_words > 0 → warning', ev.logs.filter((l) => /OTP/.test(l)).join(' | '));
+            eq(dk && dk[2].generated, false, 'existing key: the page tells the server the key was not generated now');
+            eq(flow.module && flow.module.otp.device_key_origin, 'existing', 'existing key: the record says the key was in OTP before');
+            assert(ev.logs.some((l) => /^warn: The OTP device key was in OTP before \(the station did not generate it\)/.test(l)), 'existing key: the operator is warned that its origin is unknown', ev.logs.filter((l) => /OTP/.test(l)).join(' | '));
             eq(api.calls.some((c) => c[0] === 'setMode'), false, 'existing key: the scenario was already chosen');
         }
         {

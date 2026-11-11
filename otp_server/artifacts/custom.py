@@ -37,7 +37,7 @@ VARIANTS = ("clear", "crypt")
 SCRIPT = "custom-image.sh"
 #: Everything in docker/scripts a prepared set depends on.
 SCRIPT_FILES = ("custom-image.sh", "ext4_sparse.py", "custom-crypt/otp-hwkey", "custom-crypt/otp-cryptroot.hook",
-                "custom-crypt/otp-growroot", "custom-crypt/otp-growroot.service")
+                "custom-crypt/otp-aes", "custom-crypt/otp-growroot", "custom-crypt/otp-growroot.service")
 #: The dm-crypt mapping a prepared crypt image unlocks its root as (crypttab, fstab, cmdline.txt).
 MAPPER = "cryptroot"
 _ID_RE = re.compile(r"^[0-9a-f]{16}$")

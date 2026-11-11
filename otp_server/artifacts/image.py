@@ -133,7 +133,8 @@ class ImageBuilder:
         and sandboxed apps of ``image.packages`` / ``image.apps``)."""
         img = self.cfg.image
         inputs = self.packages.image_inputs(img) if (img.packages or img.apps) else None
-        return imageconfig.render(img, mount=CFG_MOUNT, inputs=inputs, family=family)
+        return imageconfig.render(img, mount=CFG_MOUNT, inputs=inputs, family=family,
+                                  tfa=self.cfg.builds.image.cm4_tfa)
 
     def overrides(self, variant: str) -> list[str]:
         """``builds.image.overrides`` plus the variant's provisioning map (``IGconf_image_pmap``, last)."""

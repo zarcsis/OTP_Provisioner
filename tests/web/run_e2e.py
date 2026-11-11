@@ -63,12 +63,14 @@ REPO = TESTS.parents[1]
 sys.path.insert(0, str(REPO))
 
 from otp_server import boards, imagejson
+from otp_server.config import default_work_dir  # noqa: E402
 from otp_server.artifacts.image import label  # noqa: E402
 from otp_server.secrets_gen import public_key_fingerprint, same_public_key  # noqa: E402
 
 CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/usr/bin/google-chrome", "/usr/bin/chromium",
 ]
 LIVE_SERVER = "http://127.0.0.1:8765"
@@ -132,7 +134,9 @@ def get_bytes(url: str) -> bytes:
 
 
 def work_dir() -> pathlib.Path:
-    return pathlib.Path(os.environ.get("OTP_WORK_DIR") or pathlib.Path(os.environ.get("LOCALAPPDATA", "")) / "OTP_Provisioner")
+    """The work dir the station uses: ``OTP_WORK_DIR`` or the server's platform default (macOS and Linux:
+    ``$XDG_DATA_HOME/otp-provisioner`` or ``~/.local/share/otp-provisioner``)."""
+    return pathlib.Path(os.environ.get("OTP_WORK_DIR") or default_work_dir())
 
 
 def sha256_file(p: pathlib.Path) -> str:
@@ -1007,6 +1011,11 @@ def main(argv: list[str] | None = None) -> int:
             log(f"skipping scenario(s) {', '.join(skipped)}: the station builds no image for their family "
                 f"(builds.image.families; current-*.json of the work dir)")
         names = [n for n in names if n not in skipped]
+        if not names:
+            # nothing would run, and "0 passed, 0 failed" reads like success (a work dir with no images)
+            print(f"-- no scenario can run: no image set in {work} (set OTP_WORK_DIR to the station's work dir)",
+                  file=sys.stderr)
+            return 2
     try:
         for n in names:
             log(f"=== scenario {n} ({SCENARIOS[n]['serial']}, {SCENARIOS[n]['mode']}) ===")

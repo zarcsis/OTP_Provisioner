@@ -549,6 +549,69 @@ def test_station_crypt_layer_carries_the_same_otp_growroot():
     assert "systemctl enable otp-growroot.service" in hook
 
 
+# ---------------------------------------------------------------------- the constant-time AES on a CM4
+LAYER_INITRAMFS = REPO / "image" / "layer" / "otp-rpios-setup.d" / "device" / "initramfs-tools"
+
+
+def test_station_layer_and_custom_crypt_load_the_same_bit_sliced_aes():
+    script = (LAYER_INITRAMFS / "scripts" / "init-top" / "otp-aes").read_bytes()
+    assert script == (REPO / "docker" / "scripts" / "custom-crypt" / "otp-aes").read_bytes()
+    hook = (LAYER_INITRAMFS / "hooks" / "otp-aes").read_bytes()
+    for body in (script, hook):
+        assert body.startswith(b"#!/bin/sh\n") and b"\r" not in body
+    assert b"manual_add_modules aes-neon-bs" in hook
+    cryptroot = (REPO / "docker" / "scripts" / "custom-crypt" / "otp-cryptroot.hook").read_text(encoding="utf-8")
+    assert "aes-neon-bs" in cryptroot                    # the custom image's hook puts the module in
+    custom = (REPO / "docker" / "scripts" / "custom-image.sh").read_text(encoding="utf-8")
+    assert '"${R}/etc/initramfs-tools/scripts/init-top/otp-aes"' in custom
+    assert "scripts/init-top/otp-aes; do" in custom and "CRYPTO_AES_ARM64_BS:aes-neon-bs" in custom
+
+
+def test_initramfs_scripts_of_the_layer_are_executable_in_git():
+    """rpi-image-gen copies <layer>.d/device/initramfs-tools with rsync -a, and build.sh gives the staged files
+    the modes git records: a hook or script without 100755 would be skipped by mkinitramfs / the initramfs."""
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("no git")
+    rels = [p.relative_to(REPO).as_posix() for p in LAYER_INITRAMFS.rglob("*") if p.is_file()]
+    out = subprocess.run([git, "-C", str(REPO), "ls-files", "-s", "--", *rels], capture_output=True, text=True)
+    modes = {line.split("\t", 1)[1]: line.split()[0] for line in out.stdout.splitlines()}
+    assert sorted(modes) == sorted(rels), "every file of the layer's initramfs-tools dir is tracked"
+    assert set(modes.values()) == {"100755"}, modes
+
+
+def _run_otp_aes(root: Path, cpuinfo: str, modprobe_rc: int = 0) -> tuple[subprocess.CompletedProcess, str]:
+    """scripts/init-top/otp-aes with /proc/cpuinfo under ``root`` and a modprobe stub that records its arguments."""
+    (root / "proc").mkdir(parents=True, exist_ok=True)
+    (root / "proc" / "cpuinfo").write_text(cpuinfo, encoding="utf-8")
+    bindir = root / "bin"
+    bindir.mkdir(exist_ok=True)
+    posix = str(root).replace("\\", "/")
+    (bindir / "modprobe").write_bytes(f'#!/bin/sh\necho "$*" >> "{posix}/modprobe.log"\nexit {modprobe_rc}\n'.encode())
+    (bindir / "modprobe").chmod(0o755)
+    body = (LAYER_INITRAMFS / "scripts" / "init-top" / "otp-aes").read_text(encoding="utf-8")
+    body = body.replace("/proc/cpuinfo", posix + "/proc/cpuinfo").replace("/dev/kmsg", posix + "/kmsg")
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run([SH, "-c", body, "otp-aes"], capture_output=True, env=env, timeout=60)
+    log = root / "modprobe.log"
+    return r, log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+CPUINFO_A72 = "processor\t: 0\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU part\t: 0xd08\n"
+CPUINFO_A76 = "processor\t: 0\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid\n"
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_otp_aes_loads_the_bit_sliced_aes_only_without_the_aes_instructions(tmp_path):
+    r, log = _run_otp_aes(tmp_path / "cm4", CPUINFO_A72)
+    assert r.returncode == 0 and log == "-q aes_neon_bs\n", (r.stderr, log)
+    r, log = _run_otp_aes(tmp_path / "pi5", CPUINFO_A76)
+    assert r.returncode == 0 and log == "", "aes-ce is there: nothing to load"
+    r, log = _run_otp_aes(tmp_path / "fail", CPUINFO_A72, modprobe_rc=1)
+    assert r.returncode == 0 and log == "-q aes_neon_bs\n", "a module that does not load never stops the boot"
+    assert "table-based AES" in (tmp_path / "fail" / "kmsg").read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------- the keyscript, run
 SH = shutil.which("sh")
 

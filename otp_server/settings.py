@@ -107,6 +107,9 @@ DESCRIPTIONS: dict[str, str] = {
     "builds.image.builder_tag": "Docker tag of the image builder (rpi-image-gen)",
     "builds.image.volume": "Docker volume with the image build tree",
     "builds.image.keep_raw_image": "keep the raw .img next to the sparse pieces",
+    "builds.image.cm4_tfa": "Compute Module 4 images boot through Arm Trusted Firmware (Debian's bl31.bin for rpi4 "
+                            "as the armstub): the kernel gets the Spectre v2/v4 workarounds the stock BCM2711 stub "
+                            "lacks; experimental, rebuilds the cm4 images",
     "docker.binary": "docker CLI to run",
     "docker.start_desktop": "Windows: start Docker Desktop when the engine is down",
     "docker.desktop_path": "Docker Desktop executable (empty = the standard location)",

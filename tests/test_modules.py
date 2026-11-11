@@ -429,7 +429,7 @@ def test_public_view(module_service):
                            "secure_boot_provisioned": False, "jtag_locked": False, "lock_suspected": False,
                            "lock_note": "", "device_key": True,
                            "device_key_fingerprint": public_key_fingerprint(EC_PEM),
-                           "device_key_exported": False}
+                           "device_key_exported": False, "device_key_origin": ""}
     assert view["events"][-1]["kind"] == "device_key"
     empty = module_service.public_view({"serial": "cccccccc"})
     assert empty["secrets"]["rsa_key"] is False and empty["secrets"]["rsa_key_fingerprint"] == ""
@@ -733,7 +733,7 @@ def test_store_device_key_from_der(module_service, store, fmt):
     key = _p256()
     pub = _pub(key)
     rec, info = module_service.store_device_key("A7EB274C", _der(key, fmt), pub.replace("\n", "\r\n"))
-    assert info == {"fingerprint": public_key_fingerprint(pub), "already": False, "zero_words": 0}
+    assert info == {"fingerprint": public_key_fingerprint(pub), "already": False, "zero_words": 0, "origin": ""}
     assert rec["device_private_pem"].startswith("-----BEGIN PRIVATE KEY-----\n")  # PKCS#8
     assert "\r" not in rec["device_private_pem"]
     assert _scalar(rec["device_private_pem"]) == key.private_numbers().private_value
@@ -761,6 +761,28 @@ def test_store_device_key_keeps_a_matching_reported_key(module_service):
     module_service.add_facts("a7eb274c", {"device_key_pem": _pub(key)})
     rec, info = module_service.store_device_key("a7eb274c", _der(key), _pub(key))
     assert info["already"] is False and rec["device_private_pem"] and rec["device_key_pem"] == _pub(key)
+
+
+def test_store_device_key_records_where_the_key_came_from(module_service):
+    """The first export records the key's origin: generated at the station's request, or in OTP before (the page
+    says it was not generated now, or the board reported the key in an earlier run, e.g. an open one). An existing
+    key's origin is unknown: whoever generated it may hold a copy."""
+    cases = [("aaaa0001", True, False, "station"), ("aaaa0002", False, False, "existing"),
+             ("aaaa0003", True, True, "existing"), ("aaaa0004", None, True, "existing"), ("aaaa0005", None, False, "")]
+    for serial, generated, seen_before, origin in cases:
+        module_service.hello(serial)
+        key = _p256()
+        if seen_before:                                   # e.g. getvar:public-key in an open run's stage-3 result
+            module_service.add_facts(serial, {"device_key_pem": _pub(key)})
+        rec, info = module_service.store_device_key(serial, _der(key), _pub(key), generated)
+        assert info["origin"] == origin and module_service.device_key_origin(rec) == origin, serial
+        assert module_service.public_view(rec)["otp"]["device_key_origin"] == origin
+        note = rec["events"][-1]["note"]
+        assert ("generated at the station's request" in note) == (origin == "station")
+        assert ("its origin is unknown" in note) == (origin == "existing")
+        # a second export changes nothing, whatever the page says this time
+        again, info2 = module_service.store_device_key(serial, _der(key), _pub(key), not generated)
+        assert info2["already"] is True and info2["origin"] == origin and again == rec
 
 
 def test_store_device_key_must_match_the_reported_key(module_service, store):

@@ -66,7 +66,9 @@ Module 4" for what a first run must confirm).
      file can be committed for the team.
 * **Docker** with arm64 emulation: Docker Desktop on Windows (Linux engine), or Docker Engine on Linux. The
   gadget and image builds run in `linux/arm64` containers. The server registers the arm64 binfmt handler
-  when it is missing (see Troubleshooting). The builds need internet access.
+  when it is missing (see Troubleshooting). The builds need internet access. **macOS** on Apple Silicon works too
+  (first run 2026-11-10, with OrbStack): the engine is arm64 and runs the builds natively, without qemu, and the
+  browser needs no driver. The work dir is `~/.local/share/otp-provisioner` (or `$XDG_DATA_HOME/otp-provisioner`).
 * **USB driver on Windows:** Chrome can only open devices bound to WinUSB. Install the official
   `rpiboot_setup.exe` (from the [usbboot releases](https://github.com/raspberrypi/usbboot/releases)).
   It binds WinUSB to `0a5c:2712` (BCM2712 boot ROM), `0a5c:2711` (BCM2711 boot ROM, a Compute Module 4) and
@@ -244,7 +246,9 @@ worksheet. Open and secure boards get the same settings.
   of an official Raspberry Pi OS Lite release, generated from the release's `.info` file by
   `python image/rpios_packages.py <url or path of the .info>`, without the kernels: the generator puts the
   kernel metapackages of each flavour into `otp-rpios-kernel-2712` (Pi 5) and `otp-rpios-kernel-v8` (CM4), and an
-  image gets its family's. `otp-rpios-lite` puts it on rpi-image-gen's Debian and Raspberry Pi base and keeps the
+  image gets its family's. It also leaves out libcamera's soname package (`libcamera0.7` …): Raspberry Pi's archive
+  moves libcamera between image releases (0.8 on 2026-11-04), the release's soname package then cannot be installed,
+  and `libcamera-ipa` / `rpicam-apps` pull the current one. `otp-rpios-lite` puts it on rpi-image-gen's Debian and Raspberry Pi base and keeps the
   manual pages and documentation the official image has. `otp-rpios-setup` does what pi-gen configures
   beyond packages: `pi` locked with no login shell (cloud-init or the wizard set it up), SSH off and host
   keys made at first boot, Wi-Fi off until a country is set (`WirelessEnabled=false`), Bluetooth not
@@ -472,11 +476,14 @@ same three stages. The board's family comes from the boot ROM it reports (`chip`
 
 **RPIBOOT mode.** On the CM4 IO Board fit jumper **J2** ("Fit jumper to disable eMMC Boot": nRPIBOOT), connect the
 board's USB device port (micro-USB "USB slave") to the station and power the board from its own supply; on another
-carrier, whatever pulls nRPIBOOT low and brings the CM4's USB 2.0 OTG port out. The EEPROM must not be
-write-protected (EEPROM_nWP). Keep the jumper fitted for all three stages: after stage 1 the module comes back in
-RPIBOOT because of it (the Pi 5 does it with `set_reboot_order=0x3`, a BCM2712 feature the CM4 does not get).
-Remove it after stage 3 and power-cycle: the module boots its new OS from eMMC (from the SD card on a CM4 Lite).
-The gadget halts the module at the end of stage 3 (a CM4 has no power-off circuit of its own).
+carrier, whatever pulls nRPIBOOT low and brings the CM4's USB 2.0 OTG port out. Carriers such as the Waveshare
+CM4-NANO-B have a **BOOT switch** instead: on, it pulls nRPIBOOT low and routes the CM4's USB to the USB-C port, which
+also powers the board; off, the module boots normally. The EEPROM must not be write-protected (EEPROM_nWP). Keep
+nRPIBOOT low for all three stages: after stage 1 the module comes back in RPIBOOT because of it (the Pi 5 does it with
+`set_reboot_order=0x3`, a BCM2712 feature the CM4 does not get). At the end of stage 3 the gadget shuts the module
+down; a BCM2711 halts through a reset, so while nRPIBOOT is low it comes straight back as *BCM2711 Boot* (expected,
+the page says so; `POWER_OFF_ON_HALT` does not change it). Remove the jumper (switch BOOT off) and power-cycle: the
+module boots its new OS from eMMC (from the SD card on a CM4 Lite).
 
 **Only the CM4.** The Pi 4 Model B, Pi 400 and CM4S have the same boot ROM. The board reports its type in stage 1
 (`USER_BOARDREV`); anything but a CM4 (type `0x14`) fails that stage, and every stage is refused for it from then on
@@ -500,8 +507,16 @@ burns the key hash.
   refuses a CM4 boot partition (and a prebuilt `boot.img`) whose `start4*.elf` does not know the option (Raspberry Pi
   firmware older than 2025-08), since the OS could then read the OTP key;
 * the BCM2711 has no AES instructions: rpi-image-gen would pick Adiantum for its LUKS2 container, but the station builds
-  every container in `aes-xts-plain64` and sets that cipher in every image config, so the CM4 runs dm-crypt on NEON
-  (slower than a Pi 5).
+  every container in `aes-xts-plain64` and sets that cipher in every image config. Left to itself the kernel then
+  builds `xts(aes)` from the table-based `aes-arm64`, which is not constant-time (seen on a module); every station
+  image, and every prepared custom crypt image, loads the bit-sliced `aes_neon_bs` in its initramfs
+  (`scripts/init-top/otp-aes`, only on a CPU without the AES instructions) before cryptroot opens the root, so
+  dm-crypt runs the constant-time `xts-aes-neonbs` (about 60-70 MiB/s, slower than a Pi 5);
+* the kernel reports the Cortex-A72 vulnerable to Spectre v2 and speculative store bypass: those mitigations need EL3
+  firmware, and the Raspberry Pi armstub of a BCM2711 has none (a Pi 5 boots through Arm Trusted Firmware). With
+  `builds.image.cm4_tfa` the CM4 images boot through Debian's Arm Trusted Firmware (`arm-trusted-firmware`, platform
+  rpi4: `bl31.bin`, `armstub=bl31.bin`, `enable_gic=1`, `enable_uart=1` under `[cm4]`; layer `otp-tfa-rpi4`). Off by
+  default until a module has booted with it (test plan phase 2b on the wiki).
 
 **Stage 2** serves the same gadget: built for `pi5-family,cm4`, it carries the CM4's firmware (`start4cd.elf`,
 `fixup4cd.dat`: pi-gen-micro's cut-down firmware for `gpu_mem=16`) and device trees; the kernel (`rpi-v8`) is the same.
@@ -526,11 +541,16 @@ initramfs with `dm-crypt`, `aes-neon-bs`, the `hwkey` keyscript and `rpi-fw-cryp
 signed CM4 `boot.img` with `kernel8.img`, `initramfs8`, `start4.elf` and the key lock); the end-to-end runner on the real
 artifacts with a mock CM4 (scenarios C and D).
 
-**Not confirmed on a real CM4 yet**: that the BCM2711
-boot ROM reports the 8-hex serial the page keys boards by; the WebUSB timings (set against a Pi 5); that the gadget's
-cut-down `start4cd.elf` serves rpi-fw-crypto (`getvar:public-key`, the key export, `oem fwcrypto init`,
-`oem cryptcheck`; if it does not, the gadget needs the full firmware); that the CM4 crypt image unlocks its root at
-boot; how long `erase` (a secure discard) takes on eMMC.
+**On a real CM4** (`8726622b`, CM4 Rev 1.1, 1 GB, 8 GB eMMC, Waveshare CM4-NANO-B; 2026-11-10/11, the station on
+macOS): the open scenario, the first boot and the sandboxed apps passed (wiki: *Compute Module 4 test plan*, phases 1
+and 2). Confirmed there: the BCM2711 ROM reports the 8-hex serial the page keys boards by; the WebUSB timings fit (no
+retries); the gadget's cut-down `start4cd.elf` answers `getvar:public-key`; `erase` takes about 3 s; the sandbox probe
+`23 PASS, 2 INFO, 0 FAIL`. The module had a device key in OTP before any secure run (see "The secure scenario and the
+device key export"); the run also found the table-based AES and the unmitigated Spectre v2 / v4 above.
+
+**Not confirmed on a real CM4 yet**: that the gadget's `start4cd.elf` serves the key export, `oem fwcrypto init` and
+`oem cryptcheck` (if it does not, the gadget needs the full firmware); that the CM4 crypt image unlocks its root at
+boot, on `xts-aes-neonbs`; Arm Trusted Firmware on a module; the secure scenario as a whole.
 
 ## Operator procedure
 
@@ -644,6 +664,13 @@ How the key gets to the server:
   server accepts it only when its public half equals the key the board reports (and the device key already
   recorded for the board, if any), and stores it in the registry (`device_private_pem`). Stage 3 continues
   (erase, IDP) only after that; a secure stage 3 without an exported key is not accepted.
+* **Where the key came from.** The page also says whether the gadget generated the key at the station's request in
+  this run (`generated`). The first export records it as `facts.device_key_origin`: `station`, or `existing` when the
+  key was in OTP before (not generated now, or already reported in an earlier run, an open one for instance). A
+  module can come with a key: the first CM4 on hardware had one that nobody had generated on this station. An
+  existing key is exported as it is (`genkey` never overwrites one), but its origin is unknown, and whoever generated
+  it may hold a copy, so the board's encrypted root is only as secret as that copy: the page warns, the board card
+  shows **Key origin**, and such a board should not ship.
 * **The key leaves the board once.** When the station holds it, stage 3 no longer asks for it (no
   `key_export` in the manifest; the page checks `getvar:public-key` against the stored key and stops before
   erasing on a mismatch), and stage 2 serves the board **its own signed gadget**: `stage2-sign.sh` adds
@@ -745,6 +772,7 @@ is shown on the page; unknown keys produce a warning.
 | `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
 | `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
 | `builds.image.keep_raw_image` | `false` | keep the raw `.img` next to the sparse pieces |
+| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Experimental (not yet booted on a module); switching it rebuilds the cm4 images |
 | `docker.binary` | `docker` | docker CLI to run |
 | `docker.start_desktop` | `true` | Windows: start Docker Desktop when the engine is down |
 | `docker.desktop_path` | (standard location) | Docker Desktop executable |
@@ -781,7 +809,7 @@ What the irreversible operations burn (the page lists each one and asks for the 
 | --- | --- | --- |
 | `program_pubkey=1` (stage 1 `config.txt`) | secure scenario, board not yet locked | Burns the SHA-256 of this board's RSA public key into OTP. From then on the SoC only runs EEPROM and boot images signed with that key. Lose the key and the board is bricked for this station. |
 | `program_jtag_lock=1` (stage 1) | secure scenario **and** `provisioning.jtag_lock`, board not reported locked yet | Permanently disables VideoCore JTAG. |
-| device key generation (stage 3: the gadget's export request / `oem fwcrypto init`) | secure scenario, blank key slot | The firmware generates the device-unique ECDSA P-256 key in OTP. It cannot be changed or erased; a copy goes to the station. |
+| device key generation (stage 3: the gadget's export request / `oem fwcrypto init`) | secure scenario, blank key slot (a key already in OTP is exported as it is, nothing is generated) | The firmware generates the device-unique ECDSA P-256 key in OTP. It cannot be changed or erased; a copy goes to the station. |
 | `erase:<disk>` (stage 3) | `erase_storage: true` | Wipes the SD card / eMMC / NVMe before IDP writes the partition table. |
 
 The open scenario writes nothing to OTP.
@@ -933,7 +961,8 @@ image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
   layer/                   station layers: otp-rpios-packages and otp-rpios-kernel-2712 / -v8 (generated), otp-rpios-lite,
-                           otp-rpios-setup, otp-apps
+                           otp-rpios-setup (+ otp-rpios-setup.d: kernel command line fragment, initramfs otp-aes),
+                           otp-apps, otp-tfa-rpi4 (CM4, builds.image.cm4_tfa)
   rpios_packages.py        writes the package layers from a Raspberry Pi OS Lite release's .info file
   example.yaml             the config of the default OS image settings (example-cm4.yaml: the Compute Module 4's)
   rpi-image-gen/           submodule
@@ -1028,11 +1057,14 @@ on purpose: run Python with `-B` (or `PYTHONDONTWRITEBYTECODE=1`) so no `__pycac
 `.venv` stays out of git through the `.gitignore` uv writes inside it. The `dev` group (pytest, httpx2, PyYAML) is
 installed only for `--group dev`; a station's `uv run server.py` does not need it.
 
-On Windows, some tests run shell code with the `sh` and `bash` found on `PATH`. Put Git's Unix tools first
-(PowerShell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`): without them the `sh` tests are skipped
-and `bash` is WSL's launcher (`C:\Windows\System32\bash.exe`), which fails the kernel command line test with
-`/bin/bash: line 4: : No such file or directory`. `C:\Program Files\Git\bin` is not the same: its `sh.exe` puts
-Git's own tools before the test's stubs. With `usr\bin` first: 1255 passed, 3 skipped (2026-11-09).
+Some tests run the station's shell code on the host, and that code is written for Debian (GNU coreutils and sed,
+bash 4 or later; `tests/hosttools.py` checks). On Windows put Git's Unix tools first (PowerShell:
+`$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`): without them the `sh` tests and the kernel command line test
+are skipped (WSL's `C:\Windows\System32\bash.exe` is never used). `C:\Program Files\Git\bin` is not the same: its
+`sh.exe` puts Git's own tools before the test's stubs. On macOS the tests that need GNU `stat`/`sed` or bash 4 skip
+with a hint; `brew install coreutils gnu-sed bash` with the gnubin directories first on `PATH` runs them. With
+`usr\bin` first on Windows: 1282 passed, 3 skipped (2026-11-11). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
+platform default) and exits with 2 when no scenario can run there.
 
 ## Troubleshooting
 

@@ -155,3 +155,29 @@ def test_run_names_its_container_and_idle_timeout_config(monkeypatch):
     cfg = SimpleNamespace(docker=SimpleNamespace(binary="docker", start_desktop=False, desktop_path=None,
                                                  idle_timeout=5))
     assert DockerRunner(cfg).idle_timeout == 5.0
+
+
+@pytest.mark.parametrize("engine_arch, binfmt_rc, want", [
+    ("x86_64", 0, (True, "aarch64")),                                   # emulated, entry present
+    ("x86_64", 1, (False, "no qemu-aarch64 binfmt entry in the Docker VM (image/build.sh requires it)")),
+    ("aarch64", 1, (True, "aarch64 (native engine)")),                  # Apple Silicon / arm64 Linux: no entry needed
+    ("arm64", 1, (True, "aarch64 (native engine)")),
+])
+def test_probe_arm64_accepts_a_native_arm64_engine(monkeypatch, engine_arch, binfmt_rc, want):
+    """A native arm64 engine (macOS with OrbStack or Docker Desktop on Apple Silicon) runs arm64 containers without
+    a qemu-aarch64 binfmt entry, and the station must not register qemu for the engine's own architecture."""
+    r = runner()
+    calls = []
+
+    def fake_capture(args, timeout=30.0):
+        calls.append(list(args))
+        if args[:2] == ["run", "--rm"] and "uname" in args:
+            return 0, "aarch64\n"
+        if args[0] == "info":
+            return 0, engine_arch + "\n"
+        return binfmt_rc, ""
+
+    monkeypatch.setattr(r, "_capture", fake_capture)
+    assert r._probe_arm64() == want
+    ran_binfmt_check = any("--privileged" in c for c in calls)
+    assert ran_binfmt_check is (engine_arch == "x86_64")

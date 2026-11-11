@@ -37,7 +37,7 @@ MODULE_KEYS = {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_lo
                "board", "family", "unsupported", "duid", "mac", "factory_uuid", "boardrev", "secrets", "otp", "metadata",
                "facts", "events"}
 OTP_KEYS = {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_provisioned", "jtag_locked", "lock_suspected",
-            "lock_note", "device_key", "device_key_fingerprint", "device_key_exported"}
+            "lock_note", "device_key", "device_key_fingerprint", "device_key_exported", "device_key_origin"}
 JOB_KEYS = {"id", "target", "title", "status", "started", "finished", "rc", "error", "lines"}
 STATUS_KEYS = {"version", "google", "google_ready", "settings", "config", "storage", "docker", "usb_driver",
                "artifacts", "custom_images", "packages", "jobs"}
@@ -715,7 +715,7 @@ def test_device_key_export_ok(env, fmt):
     body = r.json()
     assert set(body) == {"module", "device_key"}
     fp = public_key_fingerprint(pub)
-    assert body["device_key"] == {"fingerprint": fp, "already": False, "zero_words": 0}
+    assert body["device_key"] == {"fingerprint": fp, "already": False, "zero_words": 0, "origin": ""}
     m = body["module"]
     assert set(m) == MODULE_KEYS
     assert m["otp"]["device_key_exported"] is True and m["otp"]["device_key"] is True
@@ -733,6 +733,18 @@ def test_device_key_export_ok(env, fmt):
     r = env.client.post(f"/api/modules/{SERIAL}/device-key", json={"key_der_b64": _b64(der), "device_key_pem": pub})
     assert r.status_code == 200 and r.json()["device_key"]["already"] is True
     assert env.store.puts == puts
+
+
+def test_device_key_export_passes_on_whether_the_key_was_generated(env):
+    hello(env.client)
+    der, pub, _ = _p256()
+    url = f"/api/modules/{SERIAL}/device-key"
+    r = env.client.post(url, json={"key_der_b64": _b64(der), "device_key_pem": pub, "generated": "yes"})
+    assert r.status_code == 400 and "generated must be true, false or absent" in r.json()["detail"]
+    r = env.client.post(url, json={"key_der_b64": _b64(der), "device_key_pem": pub, "generated": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["device_key"]["origin"] == "existing"
+    assert r.json()["module"]["otp"]["device_key_origin"] == "existing"
 
 
 def test_device_key_export_errors(env):
