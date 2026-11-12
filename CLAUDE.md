@@ -70,7 +70,11 @@ cryptcheck` keyslot 0, an unattended boot unlocking the root through the firmwar
 `xts-aes-neonbs`, `poweroff` holding) and every required case of phase 5, with a new Pi 5 (`d49c6c2e`) as the open
 regression run. UART logs came through that Pi 5 as a bridge. Arm Trusted Firmware booted the open image but broke the
 secure one (F10, fixed in item 11, not yet re-run on hardware). The Imager file's first boot with `otp-growpart` has
-not run on hardware (an SD-card board is needed).
+not run on hardware (an SD-card board is needed). The same day the locked Pi 5 `ebbdf4fd` was re-provisioned at
+`48a4cb9` (the locked path: counter-signed recovery and signed EEPROM without `program_pubkey`, the signed gadget with
+`2712/pubkey.bin` from `bootfiles.bin`, the board's own gadget, no second key export, `cryptcheck`) and booted
+unattended (`HMAC_LOCKED`, the lock line in `boot.img`, `xts-aes-ce`); its 5.9G file system on a 14.3G mapping showed
+that `otp-growroot` never found the station image's root (fixed in item 11).
 
 ## How it was written
 
@@ -107,7 +111,8 @@ checked against a real board between steps:
    macOS as a station host (native arm64 engine, `cp --sparse=auto` fallback, `tests/hosttools.py`), and the package
    layer leaving libcamera's soname package to its dependencies (Raspberry Pi's archive went to libcamera 0.8).
 11. (2026-11-12) After the CM4's secure run: `device_tree_address` for Arm Trusted Firmware (F10); the encrypted root's
-   partition grown in the initramfs before cryptroot (`otp-growpart`), `otp-growroot` no longer resizing a mapping
+   partition grown in the initramfs before cryptroot (`otp-growpart`), `otp-growroot` finding the root through its device
+   link (it never acted on the station image) and no longer resizing a mapping
    that fills its partition, `rpi-resize` masked on crypt images; the firmware HMAC locked after the unlock in custom
    crypt images too (`otp-hwlock`); the page asking for a reload when the station's page files changed under it;
    the stage-3 disconnect text; `{family}` in `image.hostname` (default `{family}-{serial}`).
@@ -562,10 +567,15 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   not `device_tree_end`, which could pad the tree to its end and leave `fdt_open_into` no room.
 * **`cryptsetup resize` needs the passphrase even with nothing to do** when a LUKS2 mapping's key is in the kernel
   keyring (checked in a container: "Nothing to read on input"), and after the unlock the station image locks the
-  firmware HMAC the keyscript needs. So `otp-growroot` failed at every boot of a station crypt image (its marker
-  never written), `rpi-resize`'s systemd-growfs logged `crypt_resize() … Operation not permitted`, and the Imager
-  file of a station crypt image could never grow its mapping. Now the initramfs grows the partition before the
-  container is opened, `otp-growroot` leaves a mapping that fills its partition alone, `rpi-resize` is masked.
+  firmware HMAC the keyscript needs. `rpi-resize`'s systemd-growfs logged `crypt_resize() … Operation not
+  permitted`, and the Imager file of a station crypt image could never grow its mapping. Now the initramfs grows the
+  partition before the container is opened, `otp-growroot` leaves a mapping that fills its partition alone,
+  `rpi-resize` is masked.
+* **`otp-growroot` never acted on the station image.** It looked for a root named `/dev/mapper/*`, and the station
+  image mounts it as `/dev/disk/by-slot/system` (a link to `/dev/dm-N`): "not on a dm-crypt mapping: nothing to do",
+  marker written. `rpi-resize` had grown the file system all along; masked in `48a4cb9`, it left a 5.9G file system
+  on a 14.3G mapping (Pi 5 `ebbdf4fd`, 2026-11-12). The root is resolved with `readlink -f` now and its mapping
+  named from `/sys/class/block/dm-N/dm/name`.
   Also: Raspberry Pi OS Lite has no `resizepart` (Debian's `util-linux-extra`), which `otp-growroot` used; the kernel
   learns a partition's new size through `partx -u -n N` (util-linux) now, `resizepart`/`blockdev --rereadpt` as
   fallbacks. Checked on a loop disk in a privileged container: the partition grown before `cryptsetup open`, the

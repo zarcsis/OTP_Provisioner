@@ -726,14 +726,26 @@ def test_otp_growpart_grows_the_last_partition_before_the_container_is_opened(tm
     assert r.returncode == 0 and calls == ""
 
 
-def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_rc: int) -> tuple[subprocess.CompletedProcess, str]:
+def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_rc: int,
+                  source: str = "disk/by-slot/system") -> tuple[subprocess.CompletedProcess, str]:
     """otp-growroot with /sys/class/block, /etc/crypttab and its marker under ``root``; cryptsetup, findmnt,
     sfdisk, resize2fs, df stubbed (cryptsetup resize answers ``resize_rc`` without a key, the keyscript
-    ``keyscript_rc``)."""
+    ``keyscript_rc``). The root is mounted from ``<root>/dev/<source>``, a link to ``dev/dm-0`` as on a board:
+    ``disk/by-slot/system`` (the station image's fstab) or ``mapper/cryptroot`` (a custom image's)."""
     bindir = root / "bin"
     log = _posix(root / "calls.log")
     p = _posix(root)
-    _stub(bindir, "findmnt", 'echo /dev/mapper/cryptroot\n')
+    (root / "dev" / "dm-0").write_bytes(b"")
+    for link in ("mapper/cryptroot", "disk/by-slot/system"):
+        (root / "dev" / link).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(root / "dev" / "dm-0", root / "dev" / link)
+        except OSError:
+            pytest.skip("no symbolic links on this host")
+    (root / "sys" / "devices" / "dm-0" / "dm").mkdir(parents=True)
+    (root / "sys" / "devices" / "dm-0" / "dm" / "name").write_text("cryptroot\n")
+    _symlink_dir(root / "sys" / "class" / "block" / "dm-0", root / "sys" / "devices" / "dm-0")
+    _stub(bindir, "findmnt", f'echo "{p}/dev/{source}"\n')
     _stub(bindir, "cryptsetup", f'case "$1" in\n'
                                 f'  status) printf "  device:  {p}/dev/mmcblk0p2\\n  offset:  {moff} sectors\\n'
                                 f'  size:    {msize} sectors\\n" ;;\n'
@@ -760,13 +772,21 @@ def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_r
 def test_otp_growroot_leaves_a_mapping_that_fills_its_partition_alone(tmp_path):
     """cryptsetup resize of a LUKS2 mapping with its key in the kernel keyring asks for the passphrase even when
     there is nothing to do, and the keyscript fails once the firmware HMAC is locked: a mapping that already ends
-    where the partition ends is not touched, only the file system grows."""
+    where the partition ends is not touched, only the file system grows. The station image mounts its root as
+    /dev/disk/by-slot/system: otp-growroot took that for a root without dm-crypt and never grew anything, which
+    showed once rpi-resize was masked (a 5.9G file system on a 14.3G mapping, Pi 5 ebbdf4fd, 2026-11-12)."""
     psize = 30582784
     root = _fake_disk(tmp_path / "full", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
     r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=1, keyscript_rc=1)
     assert r.returncode == 0, r.stderr.decode(errors="replace") + r.stdout.decode(errors="replace")
-    assert "cryptsetup" not in calls and "keyscript" not in calls and "resize2fs /dev/mapper/cryptroot" in calls
+    # (the shell may spell the resolved path its own way, e.g. /tmp/... under Git Bash)
+    assert "cryptsetup" not in calls and "keyscript" not in calls
+    assert calls.startswith("resize2fs ") and calls.strip().endswith("/full/dev/dm-0"), calls
     assert (root / "state" / "root-grown").is_file()
+    # a custom image's fstab names the mapping itself: the same
+    root = _fake_disk(tmp_path / "mapper", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
+    r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=1, keyscript_rc=1, source="mapper/cryptroot")
+    assert r.returncode == 0 and calls.strip().endswith("/mapper/dev/dm-0"), calls
     # a mapping shorter than its partition: resized with the key from the keyscript when the keyring has none
     root = _fake_disk(tmp_path / "short", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
     r, calls = _run_growroot(root, 32768, 8355840, resize_rc=1, keyscript_rc=0)

@@ -17,12 +17,19 @@ DONE=/var/lib/otp-station/root-grown
 log() { echo "otp-growroot: $*"; }
 finish() { mkdir -p "${DONE%/*}"; : > "$DONE"; exit 0; }
 
-dev=$(findmnt -n -o SOURCE /)
-case "$dev" in
-    /dev/mapper/*) ;;
-    *) log "the root file system is on $dev, not on a dm-crypt mapping: nothing to do"; finish ;;
+# The root's device mapper name. findmnt names the root as fstab does: /dev/mapper/<name> (custom images) or
+# /dev/disk/by-slot/system (the station image, a link to /dev/dm-N); both resolve to dm-N, whose name sysfs knows.
+src=$(findmnt -n -o SOURCE /)
+dev=$(readlink -f "$src" 2>/dev/null || echo "$src")
+dm=$(basename "$dev")
+name=
+case "$dm" in
+    dm-*) name=$(cat "/sys/class/block/$dm/dm/name" 2>/dev/null || true) ;;
 esac
-name=${dev#/dev/mapper/}
+if [ -z "$name" ] || ! cryptsetup status "$name" >/dev/null 2>&1; then
+    log "the root file system is on $src, not on a dm-crypt mapping: nothing to do"
+    finish
+fi
 part=$(cryptsetup status "$name" | awk '$1 == "device:" { print $2 }')
 [ -b "$part" ] || { log "cannot find the device under $name"; exit 1; }
 pname=$(basename "$(readlink -f "$part")")
