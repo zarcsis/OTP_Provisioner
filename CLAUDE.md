@@ -69,13 +69,15 @@ and answered on the wiki's test plan page.
 cryptcheck` keyslot 0, an unattended boot unlocking the root through the firmware HMAC, `privkey` refused, the root on
 `xts-aes-neonbs`, `poweroff` holding) and every required case of phase 5, with a new Pi 5 (`d49c6c2e`) as the open
 regression run. UART logs came through that Pi 5 as a bridge. Arm Trusted Firmware booted the open image but broke the
-secure one (F10, fixed in item 11, not yet re-run on hardware). The Imager file's first boot with `otp-growpart` has
-not run on hardware (an SD-card board is needed). The same day the locked Pi 5 `ebbdf4fd` was re-provisioned at
+secure one (F10, fixed in item 11, not yet re-run on hardware). The same day the locked Pi 5 `ebbdf4fd` was re-provisioned at
 `48a4cb9` (the locked path: counter-signed recovery and signed EEPROM without `program_pubkey`, the signed gadget with
 `2712/pubkey.bin` from `bootfiles.bin`, the board's own gadget, no second key export, `cryptcheck`) and booted
 unattended (`HMAC_LOCKED`, the lock line in `boot.img`, `xts-aes-ce`); its 5.9G file system on a 14.3G mapping showed
 that `otp-growroot` never found the station image's root (fixed in item 11). Flashed again at `101be1f` (stages 2-3):
 `otp-growroot` "done: 14G root file system", the mapping filling its partition, `rpi-resize` masked, nothing failed.
+Then its Imager file on the same card: `otp-growpart` grew partition 2 from 12730368 to 30007296 sectors in the
+initramfs before cryptroot, the LUKS2 mapping opened at the partition's size, `otp-growroot` grew the file system to
+14G, `HMAC_LOCKED` after the unlock, cloud-init done, nothing failed.
 
 ## How it was written
 

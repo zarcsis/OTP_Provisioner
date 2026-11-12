@@ -566,7 +566,7 @@ the 12 s pause plus Chrome's ~5 s), `erase` in about 3 s.
 
 **Not confirmed on a real CM4 yet**: Arm Trusted Firmware on the secure image with `device_tree_address` (it booted
 the open image, and broke the secure one before that setting); the Imager file's first boot (not possible on an eMMC
-module; on an SD card it runs `otp-growpart`).
+module; on an SD card it runs `otp-growpart`, which did its work on a locked Pi 5 on 2026-11-12).
 
 ## Operator procedure
 
