@@ -74,7 +74,8 @@ not run on hardware (an SD-card board is needed). The same day the locked Pi 5 `
 `48a4cb9` (the locked path: counter-signed recovery and signed EEPROM without `program_pubkey`, the signed gadget with
 `2712/pubkey.bin` from `bootfiles.bin`, the board's own gadget, no second key export, `cryptcheck`) and booted
 unattended (`HMAC_LOCKED`, the lock line in `boot.img`, `xts-aes-ce`); its 5.9G file system on a 14.3G mapping showed
-that `otp-growroot` never found the station image's root (fixed in item 11).
+that `otp-growroot` never found the station image's root (fixed in item 11). Flashed again at `101be1f` (stages 2-3):
+`otp-growroot` "done: 14G root file system", the mapping filling its partition, `rpi-resize` masked, nothing failed.
 
 ## How it was written
 
