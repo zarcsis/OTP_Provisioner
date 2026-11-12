@@ -45,6 +45,8 @@ REPLACED_DEFAULTS: dict[str, frozenset[str]] = {
     "image.name": frozenset({"deb13-arm64-min"}),
     # the gadget before it booted the Compute Module 4 too
     "builds.gadget.targets": frozenset({"pi5-family"}),
+    # before the host name knew the board family (a CM4 came up as pi5-<serial>)
+    "image.hostname": frozenset({"pi5-{serial}"}),
 }
 #: Descriptions earlier versions wrote; such a cell is rewritten with the current text (any other text in the
 #: description column is the operator's note and stays).
@@ -80,7 +82,8 @@ DESCRIPTIONS: dict[str, str] = {
     "image.apps": "sandboxed apps built into the station image, one per line: <package id> slot=<1..64> "
                   "[grant=<permission>,...] [memory=<MiB>] [cpus=<n>] [tasks=<n>]; each runs in its own container "
                   "with its own UID range (the slot); a change rebuilds the image",
-    "image.hostname": "host name of the boards; {serial} = the board's 8-hex serial (pi5-{serial})",
+    "image.hostname": "host name of the boards; {serial} = the board's 8-hex serial, {family} = pi5 or cm4 "
+                      "({family}-{serial})",
     "image.timezone": "time zone of the image's tzdata (Europe/Kyiv, UTC, ...; the page offers the list)",
     "image.keyboard": "keyboard layout of the boards' console (xkb: us, gb, ua, ...; the page offers the list). "
                       "Raspberry Pi OS itself defaults to gb, where Shift+2 is \" and Shift+' is @",

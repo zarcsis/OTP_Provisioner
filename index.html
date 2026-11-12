@@ -80,7 +80,7 @@
                 </div>
                 <div class="progress hidden" id="package-upload-progress"><div></div></div>
                 <h3>System</h3>
-                <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63" placeholder="pi5-{serial}" title="{serial} = the board's 8-hex serial"></label>
+                <label class="field"><span>Hostname</span><input type="text" name="hostname" class="mono" spellcheck="false" maxlength="63" placeholder="{family}-{serial}" title="{serial} = the board's 8-hex serial, {family} = pi5 or cm4"></label>
                 <label class="field"><span>Time zone</span><select name="timezone"></select></label>
                 <label class="field"><span>Keyboard</span><select name="keyboard" title="Console keyboard layout: the account password is typed with it"></select></label>
                 <h3>Account</h3>
@@ -140,6 +140,10 @@
             <div id="offline-box" class="callout offline hidden">
                 <div><b>The server is not reachable.</b> Provisioning needs it (it holds the board secrets and builds every
                     file). Start it with <code>uv run server.py</code> and reload.</div>
+            </div>
+            <div id="stale-box" class="callout offline hidden">
+                <div><b>The station was updated after this page was loaded.</b> This tab still runs the old page: reload
+                    it (Ctrl+F5) before you provision a board.</div>
             </div>
             <div id="steps" class="steps"></div>
             <div id="need-box" class="callout hidden"></div>

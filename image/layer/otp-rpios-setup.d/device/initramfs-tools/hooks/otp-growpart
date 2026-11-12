@@ -1,0 +1,23 @@
+#!/bin/sh
+# initramfs-tools hook of the OTP provisioning station: the tools scripts/init-premount/otp-growpart needs to grow
+# the encrypted root's partition before cryptroot opens it (an image with a crypttab only). Installed by the image
+# layer otp-rpios-setup and by custom-image.sh (crypt); tests/test_custom_images.py keeps the copies equal.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+grep -qE '^[[:space:]]*[^#[:space:]]' /etc/crypttab 2>/dev/null || exit 0
+# sfdisk and blkid are needed, the others tell the kernel about the new size (whichever the image has)
+for tool in sfdisk blkid partx resizepart blockdev; do
+    path=$(command -v "$tool" 2>/dev/null || true)
+    for p in "$path" "/usr/sbin/$tool" "/sbin/$tool" "/usr/bin/$tool"; do
+        if [ -n "$p" ] && [ -x "$p" ]; then
+            copy_exec "$p" "/usr/sbin/$tool"
+            break
+        fi
+    done
+done

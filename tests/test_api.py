@@ -39,7 +39,7 @@ MODULE_KEYS = {"serial", "stage", "stage_label", "mode", "mode_chosen", "mode_lo
 OTP_KEYS = {"customer_key_hash", "locked", "locked_to_our_key", "secure_boot_provisioned", "jtag_locked", "lock_suspected",
             "lock_note", "device_key", "device_key_fingerprint", "device_key_exported", "device_key_origin"}
 JOB_KEYS = {"id", "target", "title", "status", "started", "finished", "rc", "error", "lines"}
-STATUS_KEYS = {"version", "google", "google_ready", "settings", "config", "storage", "docker", "usb_driver",
+STATUS_KEYS = {"version", "page", "google", "google_ready", "settings", "config", "storage", "docker", "usb_driver",
                "artifacts", "custom_images", "packages", "jobs"}
 SIGN_IN_FIRST = "sign in to Google first"
 
@@ -1534,7 +1534,7 @@ def test_image_settings_get_and_save_without_a_sheet(env):
     r = env.client.get("/api/image")
     assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
     view = r.json()
-    assert view["settings"]["hostname"] == "pi5-{serial}" and view["settings"]["password_set"] is False
+    assert view["settings"]["hostname"] == "{family}-{serial}" and view["settings"]["password_set"] is False
     assert view["settings"]["ssh_authorized_keys"] == [] and view["settings"]["wifi_password_set"] is False
     assert view["settings"]["sudo"] == "wizard"
     assert view["warnings"] == ["no password and no SSH key: the board's first boot stops at the Raspberry Pi OS "
@@ -1553,7 +1553,7 @@ def test_image_settings_get_and_save_without_a_sheet(env):
     st = body["settings"]
     assert st["hostname"] == "drone-7" and st["wifi_country"] == "PL" and st["password_set"] is True
     assert st["sudo"] == "passwd" and st["ssh_authorized_keys"] == [KEY]
-    assert body["warnings"] == ["every board gets the host name 'drone-7'; put {serial} in it (e.g. pi5-{serial}) "
+    assert body["warnings"] == ["every board gets the host name 'drone-7'; put {serial} in it (e.g. {family}-{serial}) "
                                 "to tell them apart on the network"]
     img = env.cfg.image
     assert img.password_hash.startswith("$6$") and img.wifi_password == " pass phrase "
@@ -1632,7 +1632,7 @@ def test_image_settings_sheet_failure_is_503(genv):
     genv.sheet.write_error = "Google unreachable (ConnectionError)"
     r = genv.client.post("/api/image", json={"hostname": "drone9"})
     assert r.status_code == 503 and "Google unreachable" in r.json()["detail"]
-    assert genv.cfg.image.hostname == "pi5-{serial}"
+    assert genv.cfg.image.hostname == "{family}-{serial}"
 
 
 def test_image_settings_need_the_google_login(genv):
@@ -1640,3 +1640,25 @@ def test_image_settings_need_the_google_login(genv):
         r = genv.client.request(method, "/api/image", json=body)
         assert r.status_code == 401
     assert genv.sheet.writes == []
+
+
+def test_page_version_follows_the_page_files(tmp_path):
+    """/api/status names a version of the page's files: a tab opened before the station was updated sees it change
+    and asks for a reload (the first CM4 run drove a board with the page of the previous release)."""
+    from types import SimpleNamespace
+
+    from otp_server.app import Services
+
+    web = tmp_path / "web"
+    (web / "js").mkdir(parents=True)
+    (web / "css").mkdir()
+    (web / "index.html").write_text("<html></html>")
+    (web / "js" / "flow.js").write_text("// one")
+    (web / "css" / "app.css").write_text("body {}")
+    svc = Services(cfg=SimpleNamespace(web_dir=web))
+    v1 = svc.page_version()
+    assert len(v1) == 16 and int(v1, 16) >= 0 and svc.page_version() == v1
+    (web / "js" / "flow.js").write_text("// two, longer")
+    assert svc.page_version() != v1
+    (web / "js" / "flow.js").write_text("// one")
+    assert svc.page_version() == v1                    # content, not time

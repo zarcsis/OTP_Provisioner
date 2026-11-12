@@ -271,6 +271,7 @@ def counts() -> dict[str, int]:
 def status() -> dict[str, Any]:
     s = {
         "version": VERSION,
+        "page": {"version": "0123456789abcdef"},
         "google": {"client": True, "client_file": "C:/station/OTP_Provisioner/google-oauth-client.json", "signed_in": True,
                    "email": "operator@example.com", "spreadsheet_id": SPREADSHEET_ID, "spreadsheet_url": SPREADSHEET_URL,
                    "error": ""},

@@ -1,0 +1,18 @@
+#!/bin/sh
+# otp-hwlock - initramfs local-premount script of the OTP provisioning station (custom crypt images): once
+# cryptroot has unlocked the root (local-top), lock the firmware HMAC with the OTP device key until the next boot
+# (rpi-fw-crypto set-key-status 1 HMAC_LOCKED), as the station image does with rpi-image-gen's hwlock. The running
+# system then cannot derive the root's LUKS key; it never needs it, since otp-growpart grows the partition before
+# the container is opened. A firmware or rpi-fw-crypto that does not know the lock leaves the key as it was.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+[ -r "${OTP_HWLOCK_CRYPTTAB:-/cryptroot/crypttab}" ] || exit 0
+command -v rpi-fw-crypto >/dev/null 2>&1 || exit 0
+if ! rpi-fw-crypto set-key-status 1 HMAC_LOCKED >/dev/null 2>&1; then
+    echo "otp-hwlock: could not lock the HMAC of the OTP device key" > /dev/kmsg 2>/dev/null || true
+fi
+exit 0

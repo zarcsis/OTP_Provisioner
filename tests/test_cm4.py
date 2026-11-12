@@ -96,6 +96,20 @@ def test_settings_read_the_old_gadget_default_as_the_new_one():
     assert "builds.image.families" in settings.DESCRIPTIONS
 
 
+def test_the_host_name_names_the_family():
+    """The default host name template has {family}: a CM4 came up as pi5-<serial> with the old one, which a sheet
+    that still holds it is read as the new default."""
+    from otp_server import settings
+    from otp_server.artifacts.image import ImageBuilder
+    from otp_server.config import DEFAULTS
+    assert DEFAULTS["image"]["hostname"] == "{family}-{serial}"
+    assert "pi5-{serial}" in settings.REPLACED_DEFAULTS["image.hostname"]
+    img = load_config().image
+    seed = ImageBuilder._seed_for(img, "8726622b", {"cloud_init": True}, boards.CM4)
+    assert seed.summary["hostname"] == "cm4-8726622b"
+    assert ImageBuilder._seed_for(img, "d49c6c2e", {"cloud_init": True}).summary["hostname"] == "pi5-d49c6c2e"
+
+
 def test_hello_refuses_other_chips(make_env):
     env = make_env()
     with pytest.raises(ValueError, match="Compute Module 4"):

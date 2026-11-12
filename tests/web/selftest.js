@@ -1163,8 +1163,10 @@
             const ok = await flow.provision();
             eq(ok, false, 'board unplugged while flashing → stage 3 fails');
             assert(/disconnected/.test(flow.stages[3].detail), 'clear "disconnected" message', flow.stages[3].detail);
+            assert(/gadget ran from RAM and is gone: .*run stage 2 again/.test(flow.stages[3].detail), 'stage 3: the board must run stage 2 again (the gadget lived in RAM)', flow.stages[3].detail);
             const r3 = api.calls.find((c) => c[0] === 'result');
             eq(r3 && r3[2] + ':' + r3[3].ok, '3:false', 'failed stage-3 result posted');
+            assert(r3 && /run stage 2 again/.test(r3[3].error), 'the server records the operator text too, not only the raw WebUSB error', r3 && r3[3].error);
             assert(r3 && r3[3].details.flashed.length === 0 && /BEGIN PUBLIC KEY/.test(r3[3].details.device_key_pem || ''), 'partial details (device key) kept in the failure report');
             deq(flow.plan(), [3], 'resume: stage 3 is still pending');
         }
@@ -1570,6 +1572,22 @@
         }
         await fakeReset();
         eq(gated(), false, 'fake API reset: signed in again');
+
+        // the station's page files change under an open tab (the station was updated): reload before provisioning
+        section = 'page-stale';
+        {
+            const box = document.getElementById('stale-box');
+            eq(`${box.classList.contains('hidden')}:${app.srv.pageVersion}`, 'true:0123456789abcdef', 'page version: the first one seen is kept, no banner');
+            await fakeStatus({ page: { version: 'fedcba9876543210' } });
+            eq(box.classList.contains('hidden'), false, 'page version changed: the banner asks for a reload');
+            eq(connBtn.disabled, true, 'page version changed: Connect board disabled');
+            eq(hintEl.textContent, 'the station was updated: reload this page (Ctrl+F5)', 'page version changed: the provision hint');
+            assert(document.getElementById('log').textContent.includes('reload the page (Ctrl+F5)'), 'page version changed: logged (it survives Copy log)');
+            // back to the page's own version for the sections below (a reload would do this)
+            app.srv.pageStale = false;
+            await fakeReset();
+            eq(`${box.classList.contains('hidden')}:${connBtn.disabled}`, 'true:false', 'same version again: no banner, Connect enabled');
+        }
 
         // ================================================================ T13 scenario radios
         section = 'page-scenario';

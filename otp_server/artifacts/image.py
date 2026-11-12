@@ -522,11 +522,11 @@ class ImageBuilder:
         return out, new_ij
 
     @staticmethod
-    def _seed_for(img_cfg: Any, serial: str, source: dict) -> firstboot.Seed:
+    def _seed_for(img_cfg: Any, serial: str, source: dict, family: boards.Family = boards.PI5) -> firstboot.Seed:
         """The board's first-boot files: the station's cloud-init seed, or nothing for an image without
         cloud-init (it boots with the configuration it was made with)."""
         if source.get("cloud_init", True):
-            return firstboot.render(img_cfg, serial)
+            return firstboot.render(img_cfg, serial, family.key)
         return firstboot.Seed(files={}, cmdline="", instance_id="", summary={"applied": False})
 
     def _board_boot(self, record: dict, set_dir: Path, simage: str, pieces: list[dict], *, signed: bool,
@@ -743,7 +743,7 @@ class ImageBuilder:
         if not boots:
             raise NotReady(f"image set {set_dir.name} has no boot partition image for the first-boot files; "
                            "rebuild the image")
-        seed = self._seed_for(self.cfg.image, serial, source)
+        seed = self._seed_for(self.cfg.image, serial, source, family)
         for b in boots:
             parts[b] = self._board_boot(record, set_dir, b, msim[b], signed=signed, seed=seed, secrets_fn=secrets_fn,
                                         custom=custom, family=family)
@@ -860,7 +860,7 @@ class ImageBuilder:
         boots = [b for b in imagejson.boot_simages(ij) if b in msim]
         if len(boots) != 1:
             raise NotReady(f"image set {set_dir.name} has {len(boots)} boot partition images, expected one")
-        seed = self._seed_for(self.cfg.image, serial, src)
+        seed = self._seed_for(self.cfg.image, serial, src, family)
         boot_files = self._board_boot(record, set_dir, boots[0], msim[boots[0]], signed=True, seed=seed,
                                       secrets_fn=secrets_fn, custom=custom, family=family)
         luks = self._station_luks(record, set_dir, ij, msim, secrets_fn)

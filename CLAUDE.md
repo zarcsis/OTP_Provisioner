@@ -62,7 +62,15 @@ the real `boot-slot.sh` on them (a CM4's signed `boot.img`: `kernel8.img`, `init
 1 and 2 of the wiki's *Compute Module 4 test plan* (open scenario, first boot, the sandboxed apps: probe 23/2/0), run by
 a tester with the station on macOS (Apple Silicon, OrbStack) at `66c3966`. Confirmed: the ROM's 8-hex serial, the
 WebUSB timings, `getvar:public-key` from the cut-down `start4cd.elf`, `erase` in ~3 s. Its findings are fixed (item 10)
-and answered on the wiki's test plan page. The secure scenario has not run on a CM4.
+and answered on the wiki's test plan page.
+
+**Status (2026-11-12):** the same module passed the secure scenario at `04e4fba` (phases 3-4: signed EEPROM and
+`program_pubkey`, the key export through `start4cd.elf` (a key that was already in OTP: origin `existing`), `oem
+cryptcheck` keyslot 0, an unattended boot unlocking the root through the firmware HMAC, `privkey` refused, the root on
+`xts-aes-neonbs`, `poweroff` holding) and every required case of phase 5, with a new Pi 5 (`d49c6c2e`) as the open
+regression run. UART logs came through that Pi 5 as a bridge. Arm Trusted Firmware booted the open image but broke the
+secure one (F10, fixed in item 11, not yet re-run on hardware). The Imager file's first boot with `otp-growpart` has
+not run on hardware (an SD-card board is needed).
 
 ## How it was written
 
@@ -98,6 +106,11 @@ checked against a real board between steps:
    `JTAG_LOCKED` verdict, optional Arm Trusted Firmware for the CM4 (`builds.image.cm4_tfa`, layer `otp-tfa-rpi4`),
    macOS as a station host (native arm64 engine, `cp --sparse=auto` fallback, `tests/hosttools.py`), and the package
    layer leaving libcamera's soname package to its dependencies (Raspberry Pi's archive went to libcamera 0.8).
+11. (2026-11-12) After the CM4's secure run: `device_tree_address` for Arm Trusted Firmware (F10); the encrypted root's
+   partition grown in the initramfs before cryptroot (`otp-growpart`), `otp-growroot` no longer resizing a mapping
+   that fills its partition, `rpi-resize` masked on crypt images; the firmware HMAC locked after the unlock in custom
+   crypt images too (`otp-hwlock`); the page asking for a reload when the station's page files changed under it;
+   the stage-3 disconnect text; `{family}` in `image.hostname` (default `{family}-{serial}`).
 
 Design decisions that were the owner's and should not be re-litigated:
 
@@ -161,7 +174,8 @@ docker/
   scripts/root-luks.sh, luks_encrypt.py      the board's LUKS2 container, encrypted exactly like dm-crypt
   scripts/image-collect.sh    rpi-image-gen output -> IDP set of sparse pieces + manifest
   scripts/custom-image.sh     an uploaded .img -> clear / crypt IDP set (ext4_sparse.py; custom-crypt/ = what the
-                              crypt variant installs: otp-hwkey keyscript, initramfs hook, otp-growroot + unit)
+                              crypt variant installs: otp-hwkey keyscript, initramfs hooks and scripts (otp-cryptroot,
+                              otp-aes, otp-growpart, otp-hwlock), otp-growroot + unit)
   gadget.Dockerfile, gadget-entrypoint.sh    arm64 pi-gen-micro builder (+ a stage that compiles rpi-fastbootd)
   apps.Dockerfile, scripts/app-*             otp-app-builder; the installer VM's kit, an app's rootfs, its install in the VM
   gadget-helpers/otp-keyexport/              pi-gen-micro package: exports / generates the OTP device key
@@ -173,7 +187,7 @@ image/
   example.yaml, example-cm4.yaml   the default config of each family (kept equal to imageconfig.render by a test)
   layer/otp-apps.yaml         the sandboxed apps (in the config only when image.apps is set)
   layer/otp-tfa-rpi4.yaml     Arm Trusted Firmware as a CM4's armstub (only with builds.image.cm4_tfa)
-  layer/otp-rpios-setup.d/    its kernel command line fragment and initramfs-tools files (otp-aes)
+  layer/otp-rpios-setup.d/    its kernel command line fragment and initramfs-tools files (otp-aes, otp-growpart)
 examples/apps/                the demo: vn-demo-provider (system), vn-demo-detector (app), build.py (stdlib .deb builder)
   rpi-image-gen/              submodule (v2.9.0)
 external/usbboot, external/pi-gen-micro   submodules (shallow); usbboot carries rpi-eeprom
@@ -193,8 +207,8 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1285 tests, ~1.5 min; needs no Docker, no Google, no hardware
-uv run python -B tests/web/run_selftest.py    # ~660 checks: the page in headless Chrome against a fake API + mock board
+uv run --group dev python -B -m pytest -q     # ~1295 tests, ~1.5 min; needs no Docker, no Google, no hardware
+uv run python -B tests/web/run_selftest.py    # ~665 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
 
@@ -213,7 +227,7 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
   it the `sh` tests skip, and so does the kernel command line test (`tests/hosttools.bash4` never takes WSL's
   `System32\bash.exe`, which gets neither the env nor the `C:/` paths); Git's `bin\sh.exe` puts Git's tools before
   the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With `usr\bin`
-  first: 1282 passed, 3 skipped (2026-11-11). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
+  first: 1292 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
   need GNU `stat`/`sed` or bash 4 skip with a hint (`tests/hosttools.py`).
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
@@ -332,6 +346,10 @@ through the page once (secure, first run) and that is the accepted weak point of
   (EEPROM ≥ 2025-08-20) then blocks raw reads (`privkey`, the private-key and user-OTP mailbox calls) but
   not `hmac`/`sign`/`pubkey`, so the keyscripts still work. Inside `boot.img` the line is covered by `boot.sig`.
   The gadget's `boot.img` must NOT get it: `otp-keyexport` reads the key with `privkey` on the first run.
+* **After the unlock the firmware HMAC is locked** until the next boot (`rpi-fw-crypto set-key-status 1
+  HMAC_LOCKED`: rpi-image-gen's `hwlock` in the station image, `otp-hwlock` in custom crypt images), so the running
+  system cannot derive the LUKS key either. Nothing after the initramfs may need the key: the root's partition grows
+  in the initramfs before cryptroot opens the container (`otp-growpart`), and the LUKS2 mapping opens at full size.
 * **The LUKS key** the board derives: `hex(HMAC-SHA256(d as 32 BE bytes, <block-device-id output>))`,
   64 lowercase hex, no newline; the message is the raw sysfs text of the SD CID *including its trailing
   `\n`* (`block-device-id` prints exactly that). Confirmed on hardware on 2026-10-06 (`oem cryptcheck`
@@ -535,6 +553,29 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   with a hint); the e2e runner took `%LOCALAPPDATA%` only (now the server's `default_work_dir()`) and printed
   "0 passed, 0 failed" with nothing to run (now exit 2).
 
+**The CM4's secure run (2026-11-12, `8726622b`, the tester's second report)**
+* **TF-A overwrote the initramfs (F10).** The firmware puts the device tree just below the initramfs (0x61 bytes
+  apart on the module); TF-A's `rpi4_prepare_dtb()` (`plat/rpi/rpi4/rpi4_setup.c`) runs `fdt_open_into(dtb, dtb,
+  0x100000)` in place and adds the PSCI nodes, writing over the initramfs's start: "invalid magic at start of
+  compressed archive", no initramfs, "Waiting for root device" forever. The open image happened to boot. Layer
+  `otp-tfa-rpi4` now sets `device_tree_address=0x4000000` (the kernel ends below 32 MiB, the initramfs is at the top);
+  not `device_tree_end`, which could pad the tree to its end and leave `fdt_open_into` no room.
+* **`cryptsetup resize` needs the passphrase even with nothing to do** when a LUKS2 mapping's key is in the kernel
+  keyring (checked in a container: "Nothing to read on input"), and after the unlock the station image locks the
+  firmware HMAC the keyscript needs. So `otp-growroot` failed at every boot of a station crypt image (its marker
+  never written), `rpi-resize`'s systemd-growfs logged `crypt_resize() … Operation not permitted`, and the Imager
+  file of a station crypt image could never grow its mapping. Now the initramfs grows the partition before the
+  container is opened, `otp-growroot` leaves a mapping that fills its partition alone, `rpi-resize` is masked.
+  Also: Raspberry Pi OS Lite has no `resizepart` (Debian's `util-linux-extra`), which `otp-growroot` used; the kernel
+  learns a partition's new size through `partx -u -n N` (util-linux) now, `resizepart`/`blockdev --rereadpt` as
+  fallbacks. Checked on a loop disk in a privileged container: the partition grown before `cryptsetup open`, the
+  mapping opened at the partition's size, `partx -u` on an open partition.
+* **A tab opened before the station was updated** ran the old page through a whole secure stage 3 (no
+  `generated` flag, the old shutdown text). `/api/status` carries `page.version` (sha256 of `index.html`, `css/`,
+  `js/`); the page keeps the first one and disables Connect/Provision with a reload banner when it changes.
+* **Stage 3's disconnect advice** said "Provision": after a cable pull the gadget (it runs from RAM) is gone, and
+  the board must run stage 2 again; the page says so now, and the server's record gets the same text.
+
 **Builds on Windows**
 * **Docker Desktop registers its own `aarch64` binfmt handler**, but rpi-image-gen checks for
   `/proc/sys/fs/binfmt_misc/qemu-aarch64` by name; `docker.py` runs `tonistiigi/binfmt --install arm64`
@@ -586,6 +627,9 @@ run from the station image on `2a03e58f` on 2026-10-28)**
 * `otp-aes` exists twice: `image/layer/otp-rpios-setup.d/device/initramfs-tools/scripts/init-top/otp-aes` and
   `docker/scripts/custom-crypt/otp-aes`; `tests/test_custom_images.py` keeps them byte-equal and the layer's
   initramfs files 100755 in git.
+* `otp-growpart` (initramfs script and hook) exists twice too: `image/layer/otp-rpios-setup.d/device/initramfs-tools`
+  and `docker/scripts/custom-crypt/` (`otp-growpart`, `otp-growpart.hook`); byte-equal by test. Nothing after the
+  initramfs resizes the LUKS2 mapping of a station crypt image (it would need the locked HMAC).
 * `builds.image.cm4_tfa` stays off by default until Arm Trusted Firmware has booted on a CM4 (test plan phase 2b); the
   Pi 5 never gets the layer (`Family.tfa_layer` is empty: its firmware runs TF-A already).
 * The Imager file is assembled from the same per-board pieces stage 3 serves (signed slot, container); it must
@@ -739,3 +783,7 @@ For the planned split (server on another machine, Sheets replaced, the open scen
   through the cut-down firmware, the CM4 crypt image's initramfs unlocking the root, Arm Trusted Firmware.
 * Its AES is software: make sure `aes_neon_bs` is loaded before dm-crypt (check `lsmod`, `/proc/crypto`), or the
   kernel uses the table-based `aes-arm64`. Without EL3 firmware the A72's Spectre v2 / v4 stay unmitigated.
+* Arm Trusted Firmware on a BCM2711 needs the 1 MiB after the device tree's start free (`fdt_open_into` in place):
+  pin the tree (`device_tree_address`) away from the initramfs, or the initramfs breaks.
+* Confirmed on `8726622b` (2026-11-12): the secure chain end to end, the key export and `cryptcheck` through the
+  cut-down firmware, the root unlocked through `start4.elf`'s HMAC, `xts-aes-neonbs` on the locked module.

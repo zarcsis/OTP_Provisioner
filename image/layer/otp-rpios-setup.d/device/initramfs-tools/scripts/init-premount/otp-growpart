@@ -1,0 +1,90 @@
+#!/bin/sh
+# otp-growpart - initramfs init-premount script of the OTP provisioning station: before cryptroot opens the
+# encrypted root (local-top), grow its partition up to the end of the disk when it is the last partition and
+# the disk is larger (a card written from the station's image file with Raspberry Pi Imager; a board flashed by
+# the station already has the whole card). The LUKS2 container has a dynamic data segment, so it then opens at
+# the partition's full size and nothing has to grow the mapping later: after the unlock the station image locks
+# the firmware HMAC the keyscript needs (rpi-image-gen's hwlock), and cryptsetup resize in the running system
+# needs the passphrase even for nothing to do. otp-growroot grows the ext4 file system at the first boot.
+# Installed as scripts/init-premount/otp-growpart by the image layer otp-rpios-setup and by custom-image.sh
+# (crypt); tests/test_custom_images.py keeps the two copies equal. Does nothing without a crypttab.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+TAB="${OTP_GROWPART_CRYPTTAB:-/cryptroot/crypttab}"   # overridable for tests only
+SYS="${OTP_GROWPART_SYS:-/sys}"
+DEV="${OTP_GROWPART_DEV:-/dev}"
+[ -r "$TAB" ] || exit 0
+
+log() { echo "otp-growpart: $*" > /dev/kmsg 2>/dev/null || echo "otp-growpart: $*" >&2; }
+
+for tool in sfdisk blkid; do
+    command -v "$tool" >/dev/null 2>&1 || { log "$tool is not in the initramfs: the root partition stays as it is"; exit 0; }
+done
+
+# The kernel's view of partition $2 of disk $1 after the table was written: partx (util-linux; resizepart is in
+# util-linux-extra, which Raspberry Pi OS Lite does not install), resizepart, or a re-read of the whole table (the
+# disk is not in use yet).
+tell_kernel() {
+    { command -v partx >/dev/null 2>&1 && partx -u -n "$2" "$1" 2>/dev/null; } \
+        || { command -v resizepart >/dev/null 2>&1 && resizepart "$1" "$2" "$3" 2>/dev/null; } \
+        || { command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "$1" 2>/dev/null; }
+}
+
+# The block device behind a crypttab source (LABEL=, UUID=, PARTUUID=, PARTLABEL= or a path); the device may
+# take a moment to appear after udev's trigger.
+resolve() {
+    n=0
+    while [ "$n" -lt 10 ]; do
+        case "$1" in
+            UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*)
+                d=$(blkid -o device -t "$1" 2>/dev/null | head -n 1)
+                [ -n "$d" ] || d=$(findfs "$1" 2>/dev/null) ;;
+            /*) d=$(readlink -f "$1" 2>/dev/null) ;;
+            *) return 1 ;;
+        esac
+        [ -n "$d" ] && [ -e "$d" ] && { echo "$d"; return 0; }
+        n=$((n + 1))
+        sleep 1
+    done
+    return 1
+}
+
+grow() {
+    pname=$(basename "$1")
+    [ -e "$SYS/class/block/$pname/partition" ] || return 0
+    disk=$(basename "$(readlink -f "$SYS/class/block/$pname/..")")
+    num=$(cat "$SYS/class/block/$pname/partition")
+    start=$(cat "$SYS/class/block/$pname/start")
+    size=$(cat "$SYS/class/block/$pname/size")
+    total=$(cat "$SYS/class/block/$disk/size")
+    label=$(sfdisk --dump "$DEV/$disk" 2>/dev/null | awk -F': *' '$1 == "label" { print $2 }')
+    last=$total
+    if [ "$label" = gpt ]; then
+        sfdisk --relocate gpt-bak-std "$DEV/$disk" >/dev/null 2>&1 || true
+        last=$((total - 33))
+    fi
+    for p in "$SYS/class/block/$disk/$disk"*; do
+        [ -e "$p/start" ] || continue
+        [ "$(cat "$p/start")" -gt "$start" ] && return 0      # another partition follows: leave it
+    done
+    want=$(( (last - start) / 2048 * 2048 ))
+    [ "$want" -gt "$size" ] || return 0
+    if ! echo "$start,$want" | sfdisk --no-reread --no-tell-kernel -N "$num" "$DEV/$disk" >/dev/null 2>&1; then
+        log "could not grow partition $num of $DEV/$disk; otp-growroot tries again"
+    elif tell_kernel "$DEV/$disk" "$num" "$want"; then
+        log "partition $num of $DEV/$disk: $size -> $want sectors, before the container is opened"
+    else
+        log "partition $num of $DEV/$disk written with $want sectors; the kernel sees it at the next boot"
+    fi
+}
+
+grep -v '^[[:space:]]*#' "$TAB" | while read -r name source rest; do
+    [ -n "$source" ] || continue
+    dev=$(resolve "$source") || { log "$name: $source not found"; continue; }
+    grow "$(readlink -f "$dev")"
+done
+exit 0

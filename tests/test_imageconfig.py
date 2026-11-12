@@ -79,7 +79,9 @@ def test_otp_tfa_rpi4_layer():
     body = frag.read_bytes()
     assert b"\r" not in body
     lines = [ln for ln in body.decode().splitlines() if ln and not ln.startswith("#")]
-    assert lines == ["[cm4]", "armstub=bl31.bin", "enable_gic=1", "enable_uart=1"]
+    # TF-A's rpi4 platform expands the device tree in place to 1 MiB (fdt_open_into): it needs that room after the
+    # device tree, which the firmware does not leave below the initramfs (F10 of the CM4 test, 2026-11-11)
+    assert lines == ["[cm4]", "armstub=bl31.bin", "enable_gic=1", "enable_uart=1", "device_tree_address=0x4000000"]
 
 
 def test_render_ignores_the_board_settings():
@@ -107,14 +109,14 @@ def test_render_is_valid_yaml_with_the_expected_variables():
 # ------------------------------------------------------------------ checks
 @pytest.mark.parametrize("value, want", [
     ("pi5", "pi5"), (" Drone7 ", "drone7"), ("pi5-{serial}", "pi5-{serial}"), ("{serial}", "{serial}"),
-    ("{SERIAL}-x", "{serial}-x"),
+    ("{SERIAL}-x", "{serial}-x"), ("{family}-{serial}", "{family}-{serial}"), ("drone-{FAMILY}", "drone-{family}"),
 ])
 def test_check_hostname(value, want):
     assert ic.check_hostname(value) == want
 
 
 @pytest.mark.parametrize("value", ["", "-pi", "pi-", "pi_5", "pi5-{serial", "pi5-{id}", "a" * 56 + "{serial}",
-                                   "pi5-{serial}-"])
+                                   "pi5-{serial}-", "{family}-", "a" * 53 + "-{family}{serial}"])
 def test_check_hostname_rejects(value):
     with pytest.raises(ValueError):
         ic.check_hostname(value)
@@ -143,7 +145,7 @@ def test_warnings():
     w = ic.warnings(image(password_hash="$6$a$b", wifi_country="00", **tpl))
     assert len(w) == 1 and "country 00" in w[0]
     w = ic.warnings(image(password_hash="$6$a$b", hostname="pi5"))
-    assert w == ["every board gets the host name 'pi5'; put {serial} in it (e.g. pi5-{serial}) to tell them apart "
+    assert w == ["every board gets the host name 'pi5'; put {serial} in it (e.g. {family}-{serial}) to tell them apart "
                  "on the network"]
 
 

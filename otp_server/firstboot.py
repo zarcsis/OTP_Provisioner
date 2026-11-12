@@ -51,6 +51,8 @@ META_DATA = "meta-data"
 #: Empty file: Raspberry Pi OS's sshswitch.service enables SSH when it finds it (and deletes it).
 SSH_FLAG = "ssh"
 SERIAL_PLACEHOLDER = "{serial}"
+#: The board family (``pi5``, ``cm4``): one template for a station that provisions both.
+FAMILY_PLACEHOLDER = "{family}"
 #: Written (after sync) once the first-boot block in ``bootcmd`` has completed; per cloud-init instance.
 FIRSTBOOT_MARK = "/var/lib/cloud/instance/otp-firstboot.done"
 
@@ -77,9 +79,10 @@ class Seed:
 
 
 # ------------------------------------------------------------------ helpers
-def hostname_for(template: str, serial: str) -> str:
-    """The board's host name: ``template`` with ``{serial}`` replaced by the 8-hex board serial."""
-    return template.replace(SERIAL_PLACEHOLDER, serial.lower())
+def hostname_for(template: str, serial: str, family: str = "pi5") -> str:
+    """The board's host name: ``template`` with ``{serial}`` replaced by the 8-hex board serial and ``{family}`` by
+    the board's family (``pi5``, ``cm4``)."""
+    return template.replace(SERIAL_PLACEHOLDER, serial.lower()).replace(FAMILY_PLACEHOLDER, family)
 
 
 def wifi_psk(ssid: str, password: str) -> str:
@@ -215,9 +218,10 @@ def network_config(img: Any) -> bytes | None:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def render(img: Any, serial: str) -> Seed:
-    """The first-boot files of board ``serial`` for the settings ``img`` (:class:`otp_server.config.ImageCfg`)."""
-    hostname = hostname_for(img.hostname, serial)
+def render(img: Any, serial: str, family: str = "pi5") -> Seed:
+    """The first-boot files of board ``serial`` (of ``family``) for the settings ``img``
+    (:class:`otp_server.config.ImageCfg`)."""
+    hostname = hostname_for(img.hostname, serial, family)
     files = {USER_DATA: user_data(img, hostname)}
     net = network_config(img)
     if net is not None:

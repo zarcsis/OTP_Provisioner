@@ -511,11 +511,23 @@
             return SUPPORTED_CHIPS[chip] || SUPPORTED_CHIPS.BCM2712;
         }
 
+        /** What the operator does when the board left USB during stage n (cable pulled, power lost). */
+        _goneText(n) {
+            const how = this.boardKind().rpiboot;
+            if (n === 3) {
+                // the fastboot gadget runs from RAM: after a replug the board is back in the boot ROM, not in the gadget
+                return 'the board was disconnected during stage 3 (cable pulled or power lost). The fastboot gadget ran from '
+                    + `RAM and is gone: put the board back into RPIBOOT mode (${how}), click "Connect board", run stage 2 again `
+                    + '(its Run button), then "Connect fastboot gadget" and run stage 3.';
+            }
+            return `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (${how}), click "Connect board", then "Provision" to resume from stage ${n}.`;
+        }
+
         _stageFailed(n, e) {
             let msg;
             if (e instanceof FlowAbort || this.aborted) msg = 'aborted by the operator';
             else if (e instanceof FlowCancelled) msg = e.message;
-            else if (isGone(e) || e instanceof DeviceGone) msg = `the board was disconnected during stage ${n}. Reconnect it in RPIBOOT mode (${this.boardKind().rpiboot}), click "Connect board", then "Provision" to resume from stage ${n}.`;
+            else if (isGone(e) || e instanceof DeviceGone) msg = this._goneText(n);
             else msg = errText(e);
             if (e instanceof SecondStageRejected && e.verdict && e.verdict.notes && e.verdict.notes.length) {
                 msg += `. ${e.verdict.notes.filter((t) => !/^page reported failure/.test(t)).join('. ')}`;
@@ -818,7 +830,9 @@
                 if (!posted) {
                     posted = true;
                     try {
-                        const rr = await this.api.result(this.serial, 3, { ok: false, error: errText(this.aborted ? new FlowAbort() : e), details });
+                        const why = this.aborted ? errText(new FlowAbort())
+                            : (isGone(e) || e instanceof DeviceGone) ? `${this._goneText(3)} (${errText(e)})` : errText(e);
+                        const rr = await this.api.result(this.serial, 3, { ok: false, error: why, details });
                         this._setModule(rr.module);
                     } catch (e2) { this.log('warn', `Could not report the failure to the server: ${errText(e2)}`); }
                 }

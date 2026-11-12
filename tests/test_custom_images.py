@@ -539,7 +539,7 @@ def test_station_crypt_layer_carries_the_same_otp_growroot():
     import yaml
 
     layer = yaml.safe_load((REPO / "image" / "layer" / "otp-rpios-setup.yaml").read_text(encoding="utf-8"))
-    hook = next(h for h in layer["mmdebstrap"]["customize-hooks"] if "otp-growroot" in h)
+    hook = next(h for h in layer["mmdebstrap"]["customize-hooks"] if 'cat > "$1/usr/local/sbin/otp-growroot"' in h)
     assert '[ "${IGconf_image_pmap:-clear}" = crypt ] || exit 0' in hook
     blocks = hook.split("<<'OTPEOF'\n")[1:]
     script, unit = (b.split("\nOTPEOF\n", 1)[0] + "\n" for b in blocks)
@@ -564,7 +564,8 @@ def test_station_layer_and_custom_crypt_load_the_same_bit_sliced_aes():
     assert "aes-neon-bs" in cryptroot                    # the custom image's hook puts the module in
     custom = (REPO / "docker" / "scripts" / "custom-image.sh").read_text(encoding="utf-8")
     assert '"${R}/etc/initramfs-tools/scripts/init-top/otp-aes"' in custom
-    assert "scripts/init-top/otp-aes; do" in custom and "CRYPTO_AES_ARM64_BS:aes-neon-bs" in custom
+    assert "scripts/init-top/otp-aes scripts/init-premount/otp-growpart" in custom      # the initramfs check
+    assert "CRYPTO_AES_ARM64_BS:aes-neon-bs" in custom
 
 
 def test_initramfs_scripts_of_the_layer_are_executable_in_git():
@@ -610,6 +611,189 @@ def test_otp_aes_loads_the_bit_sliced_aes_only_without_the_aes_instructions(tmp_
     r, log = _run_otp_aes(tmp_path / "fail", CPUINFO_A72, modprobe_rc=1)
     assert r.returncode == 0 and log == "-q aes_neon_bs\n", "a module that does not load never stops the boot"
     assert "table-based AES" in (tmp_path / "fail" / "kmsg").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------- growing the encrypted root
+def test_station_layer_and_custom_crypt_grow_the_partition_the_same_way():
+    crypt = REPO / "docker" / "scripts" / "custom-crypt"
+    script = (LAYER_INITRAMFS / "scripts" / "init-premount" / "otp-growpart").read_bytes()
+    hook = (LAYER_INITRAMFS / "hooks" / "otp-growpart").read_bytes()
+    assert script == (crypt / "otp-growpart").read_bytes() and hook == (crypt / "otp-growpart.hook").read_bytes()
+    for body in (script, hook, (crypt / "otp-hwlock").read_bytes()):
+        assert body.startswith(b"#!/bin/sh\n") and b"\r" not in body
+    for tool in (b"sfdisk", b"resizepart", b"blkid"):
+        assert tool in hook
+    custom = (crypt.parent / "custom-image.sh").read_text(encoding="utf-8")
+    for dest in ("scripts/init-premount/otp-growpart", "hooks/otp-growpart", "scripts/local-premount/otp-hwlock"):
+        assert f'"${{R}}/etc/initramfs-tools/{dest}"' in custom
+    assert "systemctl mask rpi-resize.service" in custom
+    layer = (REPO / "image" / "layer" / "otp-rpios-setup.yaml").read_text(encoding="utf-8")
+    assert 'chroot "$1" systemctl mask rpi-resize.service' in layer          # crypt: otp-growroot grows the root
+
+
+def _symlink_dir(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        pytest.skip("no symbolic links on this host")
+
+
+def _fake_disk(root: Path, parts: dict[int, tuple[int, int]], disk_size: int) -> Path:
+    """A sysfs tree like the kernel's: class/block/<name> links to devices/mmcblk0[/mmcblk0pN] with start/size."""
+    sysd = root / "sys"
+    disk = sysd / "devices" / "mmcblk0"
+    disk.mkdir(parents=True)
+    (disk / "size").write_text(f"{disk_size}\n")
+    (sysd / "class" / "block").mkdir(parents=True)
+    _symlink_dir(sysd / "class" / "block" / "mmcblk0", disk)
+    for num, (start, size) in parts.items():
+        p = disk / f"mmcblk0p{num}"
+        p.mkdir()
+        (p / "partition").write_text(f"{num}\n")
+        (p / "start").write_text(f"{start}\n")
+        (p / "size").write_text(f"{size}\n")
+        _symlink_dir(sysd / "class" / "block" / f"mmcblk0p{num}", p)
+    dev = root / "dev"
+    dev.mkdir()
+    for name in ["mmcblk0", *(f"mmcblk0p{n}" for n in parts)]:
+        (dev / name).write_bytes(b"")
+    return root
+
+
+def _stub(bindir: Path, name: str, body: str) -> None:
+    bindir.mkdir(exist_ok=True)
+    (bindir / name).write_bytes(("#!/bin/sh\n" + body).encode())
+    (bindir / name).chmod(0o755)
+
+
+def _posix(p: Path) -> str:
+    return str(p).replace("\\", "/")
+
+
+def _run_growpart(root: Path, crypttab: str | None, label: str = "dos",
+                  **env_extra: str) -> tuple[subprocess.CompletedProcess, str]:
+    bindir = root / "bin"
+    log = _posix(root / "calls.log")
+    _stub(bindir, "blkid", f'[ "$4" = LABEL=OSROOT_CRYPT ] && echo "{_posix(root)}/dev/mmcblk0p2"\nexit 0\n')
+    _stub(bindir, "findfs", "exit 1\n")
+    _stub(bindir, "sfdisk", f'case "$1" in --dump) echo "label: {label}" ;; '
+                            f'*) echo "sfdisk $* <$(cat)" >> "{log}" ;; esac\n')
+    _stub(bindir, "partx", f'echo "partx $*" >> "{log}"; exit "${{FAKE_PARTX_RC:-0}}"\n')
+    _stub(bindir, "resizepart", f'echo "resizepart $*" >> "{log}"; exit "${{FAKE_RESIZEPART_RC:-0}}"\n')
+    _stub(bindir, "blockdev", f'echo "blockdev $*" >> "{log}"\n')
+    tab = root / "crypttab"
+    if crypttab is not None:
+        tab.write_text(crypttab)
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+               OTP_GROWPART_CRYPTTAB=_posix(tab), OTP_GROWPART_SYS=_posix(root / "sys"),
+               OTP_GROWPART_DEV=_posix(root / "dev"), **env_extra)
+    body = (LAYER_INITRAMFS / "scripts" / "init-premount" / "otp-growpart").read_text(encoding="utf-8")
+    r = subprocess.run([SH, "-c", body, "otp-growpart"], capture_output=True, env=env, timeout=60)
+    calls = root / "calls.log"
+    return r, calls.read_text() if calls.exists() else ""
+
+
+TAB = "# <name> <source> <key> <options>\nosroot_crypt LABEL=OSROOT_CRYPT none luks,initramfs,keyscript=hwkey\n"
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_otp_growpart_grows_the_last_partition_before_the_container_is_opened(tmp_path):
+    # a card written from the Imager file: a 4 GiB root partition on a 16 GiB card
+    root = _fake_disk(tmp_path / "small", {1: (8192, 524288), 2: (532480, 8388608)}, 31116288)
+    r, calls = _run_growpart(root, TAB)
+    want = (31116288 - 532480) // 2048 * 2048
+    dev = _posix(root / "dev" / "mmcblk0")
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+    # partx tells the kernel (util-linux; resizepart is in util-linux-extra, which Raspberry Pi OS Lite lacks)
+    assert calls == f"sfdisk --no-reread --no-tell-kernel -N 2 {dev} <532480,{want}\npartx -u -n 2 {dev}\n"
+    root = _fake_disk(tmp_path / "nopartx", {1: (8192, 524288), 2: (532480, 8388608)}, 31116288)
+    calls = _run_growpart(root, TAB, FAKE_PARTX_RC="1", FAKE_RESIZEPART_RC="1")[1]
+    dev = _posix(root / "dev" / "mmcblk0")
+    assert calls.splitlines()[1:] == [f"partx -u -n 2 {dev}", f"resizepart {dev} 2 {want}", f"blockdev --rereadpt {dev}"]
+    # a board the station flashed: the partition already ends at the card's end
+    root = _fake_disk(tmp_path / "full", {1: (8192, 524288), 2: (532480, 30582784)}, 31116288)
+    assert _run_growpart(root, TAB)[1] == ""
+    # not the last partition: left alone
+    root = _fake_disk(tmp_path / "later", {1: (8192, 524288), 2: (532480, 8388608), 3: (8921088, 2048)}, 31116288)
+    assert _run_growpart(root, TAB)[1] == ""
+    # GPT: the backup header moves to the end and the last 33 sectors stay free
+    root = _fake_disk(tmp_path / "gpt", {1: (8192, 524288), 2: (532480, 8388608)}, 31116288)
+    r, calls = _run_growpart(root, TAB, label="gpt")
+    assert f"<532480,{(31116288 - 33 - 532480) // 2048 * 2048}\n" in calls
+    # no crypttab (the clear image): nothing at all
+    root = _fake_disk(tmp_path / "clear", {1: (8192, 524288), 2: (532480, 8388608)}, 31116288)
+    r, calls = _run_growpart(root, None)
+    assert r.returncode == 0 and calls == ""
+
+
+def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_rc: int) -> tuple[subprocess.CompletedProcess, str]:
+    """otp-growroot with /sys/class/block, /etc/crypttab and its marker under ``root``; cryptsetup, findmnt,
+    sfdisk, resize2fs, df stubbed (cryptsetup resize answers ``resize_rc`` without a key, the keyscript
+    ``keyscript_rc``)."""
+    bindir = root / "bin"
+    log = _posix(root / "calls.log")
+    p = _posix(root)
+    _stub(bindir, "findmnt", 'echo /dev/mapper/cryptroot\n')
+    _stub(bindir, "cryptsetup", f'case "$1" in\n'
+                                f'  status) printf "  device:  {p}/dev/mmcblk0p2\\n  offset:  {moff} sectors\\n'
+                                f'  size:    {msize} sectors\\n" ;;\n'
+                                f'  resize) echo "cryptsetup $*" >> "{log}"; key=$(cat); '
+                                f'case "$*" in *key-file*) [ -n "$key" ] && exit 0; exit 2 ;; esac; exit {resize_rc} ;;\n'
+                                f'esac\n')
+    _stub(bindir, "sfdisk", 'case "$1" in --dump) echo "label: dos" ;; esac\n')
+    _stub(bindir, "resize2fs", f'echo "resize2fs $*" >> "{log}"\n')
+    _stub(bindir, "df", 'echo "Filesystem Size"; echo "x 7.1G"\n')
+    _stub(bindir, "hwkey", f'echo "keyscript" >> "{log}"; [ {keyscript_rc} = 0 ] && printf 0123abcd; exit {keyscript_rc}\n')
+    (root / "etc").mkdir(exist_ok=True)
+    (root / "etc" / "crypttab").write_text(f"cryptroot UUID=x none luks,initramfs,keyscript={_posix(bindir)}/hwkey\n")
+    body = (REPO / "docker" / "scripts" / "custom-crypt" / "otp-growroot").read_text(encoding="utf-8")
+    body = (body.replace("/sys/class/block/", f"{p}/sys/class/block/").replace("/var/lib/otp-station", f"{p}/state")
+                .replace("/etc/crypttab", f"{p}/etc/crypttab").replace('"/dev/$disk"', f'"{p}/dev/$disk"')
+                .replace('[ -b "$part" ]', '[ -e "$part" ]'))                 # a plain file stands in for the device
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run([SH, "-c", body], capture_output=True, env=env, timeout=60)
+    calls = root / "calls.log"
+    return r, calls.read_text() if calls.exists() else ""
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_otp_growroot_leaves_a_mapping_that_fills_its_partition_alone(tmp_path):
+    """cryptsetup resize of a LUKS2 mapping with its key in the kernel keyring asks for the passphrase even when
+    there is nothing to do, and the keyscript fails once the firmware HMAC is locked: a mapping that already ends
+    where the partition ends is not touched, only the file system grows."""
+    psize = 30582784
+    root = _fake_disk(tmp_path / "full", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
+    r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=1, keyscript_rc=1)
+    assert r.returncode == 0, r.stderr.decode(errors="replace") + r.stdout.decode(errors="replace")
+    assert "cryptsetup" not in calls and "keyscript" not in calls and "resize2fs /dev/mapper/cryptroot" in calls
+    assert (root / "state" / "root-grown").is_file()
+    # a mapping shorter than its partition: resized with the key from the keyscript when the keyring has none
+    root = _fake_disk(tmp_path / "short", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
+    r, calls = _run_growroot(root, 32768, 8355840, resize_rc=1, keyscript_rc=0)
+    assert r.returncode == 0 and "keyscript" in calls and "--key-file=-" in calls
+    # ... and when the keyscript fails too (HMAC locked), it says so and tries again at the next boot
+    root = _fake_disk(tmp_path / "locked", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
+    r, calls = _run_growroot(root, 32768, 8355840, resize_rc=1, keyscript_rc=1)
+    assert r.returncode == 1 and b"cannot grow without the key" in r.stdout
+    assert not (root / "state" / "root-grown").exists()
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh on PATH (on Windows Git Bash provides one)")
+def test_otp_hwlock_locks_the_hmac_after_the_unlock(tmp_path):
+    bindir = tmp_path / "bin"
+    log = _posix(tmp_path / "calls.log")
+    _stub(bindir, "rpi-fw-crypto", f'echo "$*" >> "{log}"; exit "${{FAKE_RC:-0}}"\n')
+    body = (REPO / "docker" / "scripts" / "custom-crypt" / "otp-hwlock").read_text(encoding="utf-8")
+    body = body.replace("/dev/kmsg", _posix(tmp_path / "kmsg"))
+    tab = tmp_path / "crypttab"
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""), OTP_HWLOCK_CRYPTTAB=_posix(tab))
+    r = subprocess.run([SH, "-c", body, "otp-hwlock"], capture_output=True, env=env, timeout=60)
+    assert r.returncode == 0 and not (tmp_path / "calls.log").exists(), "no crypttab: nothing to lock"
+    tab.write_text(TAB)
+    r = subprocess.run([SH, "-c", body, "otp-hwlock"], capture_output=True, env=env, timeout=60)
+    assert r.returncode == 0 and (tmp_path / "calls.log").read_text() == "set-key-status 1 HMAC_LOCKED\n"
+    r = subprocess.run([SH, "-c", body, "otp-hwlock"], capture_output=True, env=dict(env, FAKE_RC="3"), timeout=60)
+    assert r.returncode == 0 and "could not lock" in (tmp_path / "kmsg").read_text(), "an old firmware never stops the boot"
 
 
 # ---------------------------------------------------------------------- the keyscript, run

@@ -201,7 +201,7 @@ worksheet. Open and secure boards get the same settings.
 
 | Field | Setting | On the board |
 | --- | --- | --- |
-| Hostname | `image.hostname` (`pi5-{serial}`) | host name and `/etc/hosts`; `{serial}` is the board's 8-hex serial; avahi announces `<name>.local` |
+| Hostname | `image.hostname` (`{family}-{serial}`) | host name and `/etc/hosts`; `{serial}` is the board's 8-hex serial, `{family}` its family (`pi5`, `cm4`); avahi announces `<name>.local` |
 | Time zone (a list) | `image.timezone` (`Europe/Kyiv`) | `/etc/localtime`, `/etc/timezone` |
 | Keyboard (a list) | `image.keyboard` (`us`) | `/etc/default/keyboard`: the console layout the password is typed with. Raspberry Pi OS itself defaults to `gb`, where Shift+2 gives `"` and Shift+' gives `@` |
 | User, password | `image.user` (`pi`), `image.password_hash` | Raspberry Pi OS renames its first user `pi` to this name (userconf) and sets the password; it is in the `sudo` group and `sudo` asks for the password |
@@ -262,8 +262,13 @@ worksheet. Open and secure boards get the same settings.
   Pi kernel has AppArmor built in but selects no LSM by default, so Raspberry Pi OS ships the package with it
   off; `aa-status` on a board lists the loaded profiles), and on the
   **secure** (crypt) image `rpi-eeprom-update.service` is off (that bootloader is signed for the board,
-  and only the station updates it) and `otp-growroot.service` grows the encrypted root to the whole card at
-  the first boot (the partition when it ends before the card does, the LUKS2 mapping, the ext4 inside).
+  and only the station updates it), and the encrypted root grows to the whole card at the first boot: the
+  initramfs script `otp-growpart` grows its partition **before** cryptroot opens the container (a card written
+  from the Imager file is larger than the file), so the LUKS2 mapping opens at the partition's full size, and
+  `otp-growroot.service` then grows the ext4 inside. `rpi-resize` is masked there. The mapping is never resized
+  later: `cryptsetup resize` of a LUKS2 mapping whose key sits in the kernel keyring asks for the passphrase even
+  when there is nothing to do, and after the unlock the initramfs locks the firmware HMAC the keyscript needs
+  (`rpi-fw-crypto set-key-status 1 HMAC_LOCKED`, rpi-image-gen's `hwlock`; until the next boot).
 * **How it is built.** The server writes `otp-image.yaml` (an rpi-image-gen config: the family's device layer,
   `rpi5` or `rpi-cm4`, the `image-rpios` layout, the image name, the station layers with the family's kernel layer
   and `luks2_cipher: aes-xts-plain64`) and mounts it read-only at `/cfg` for the build. `image/example.yaml` and
@@ -307,7 +312,10 @@ per scenario:
   dm-crypt / crypto modules, `/etc/crypttab` (`cryptroot UUID=<the set's LUKS UUID> none
   luks,initramfs,keyscript=…`), the root in `/etc/fstab` and in `cmdline.txt` on `/dev/mapper/cryptroot`
   (`init=…/firstboot` removed), `auto_initramfs=1` when `config.txt` loads no initramfs,
-  `otp-growroot.service`, `rpi-eeprom-update.service` masked; then `update-initramfs -u -k all` (with
+  `otp-growroot.service`, the initramfs scripts `otp-growpart` (grows the root partition before cryptroot opens
+  it; its hook adds `sfdisk`, `blkid`, `partx`) and `otp-hwlock` (locks the firmware HMAC after the unlock,
+  as the station image does), `rpi-eeprom-update.service` and `rpi-resize.service` masked; then
+  `update-initramfs -u -k all` (with
   `MODULES=most` for that run only: `dep` would guess the modules of the build container). The result is
   checked (every initramfs on the boot partition has the keyscript, `rpi-fw-crypto`, the crypttab with that UUID
   and the modules) and the root file system must pass `e2fsck`. The files the image had in `/boot/firmware`
@@ -462,8 +470,9 @@ encrypted with its OTP key for **that SD card** (keyslot 0 = `HMAC(OTP key, CID 
 board cannot unlock it), with the partition table of the image set (its disk identifier, the first partition at
 the set's alignment); the partitions are laid out as rpi-fastbootd lays out an IDP image. Write it with Raspberry
 Pi Imager (*Choose OS → Use custom*, no OS customisation: the boot files are signed, the first-boot files come
-from the station) to the board's card in a card reader. At the first boot `otp-growroot` grows the root
-partition, the mapping and the file system to the whole card. The file is assembled from the sparse pieces as
+from the station) to the board's card in a card reader. At the first boot the initramfs grows the root partition
+to the whole card before it opens the container (`otp-growpart`), so the mapping opens at full size, and
+`otp-growroot` grows the file system. The file is assembled from the sparse pieces as
 it streams (`otp_server/diskimage.py`: nothing is written to disk; gaps read as zeros), so it is the size of the
 partitions, mostly ciphertext. Only ciphertext, signed boot files and the first-boot files leave the station,
 as in stage 3. The station images need this version's crypt layer for the growth (built after the change).
@@ -515,8 +524,11 @@ burns the key hash.
 * the kernel reports the Cortex-A72 vulnerable to Spectre v2 and speculative store bypass: those mitigations need EL3
   firmware, and the Raspberry Pi armstub of a BCM2711 has none (a Pi 5 boots through Arm Trusted Firmware). With
   `builds.image.cm4_tfa` the CM4 images boot through Debian's Arm Trusted Firmware (`arm-trusted-firmware`, platform
-  rpi4: `bl31.bin`, `armstub=bl31.bin`, `enable_gic=1`, `enable_uart=1` under `[cm4]`; layer `otp-tfa-rpi4`). Off by
-  default until a module has booted with it (test plan phase 2b on the wiki).
+  rpi4: `bl31.bin`, `armstub=bl31.bin`, `enable_gic=1`, `enable_uart=1`, `device_tree_address=0x4000000` under
+  `[cm4]`; layer `otp-tfa-rpi4`). TF-A edits the device tree in place and uses the 1 MiB after its start as scratch
+  space (`fdt_open_into(dtb, dtb, 0x100000)`); without `device_tree_address` the firmware puts the device tree right
+  below the initramfs, and TF-A overwrote the initramfs of the crypt image on a module (it booted the open image).
+  Off by default until a module has booted the secure image with it (test plan phase 2b on the wiki).
 
 **Stage 2** serves the same gadget: built for `pi5-family,cm4`, it carries the CM4's firmware (`start4cd.elf`,
 `fixup4cd.dat`: pi-gen-micro's cut-down firmware for `gpu_mem=16`) and device trees; the kernel (`rpi-v8`) is the same.
@@ -541,16 +553,20 @@ initramfs with `dm-crypt`, `aes-neon-bs`, the `hwkey` keyscript and `rpi-fw-cryp
 signed CM4 `boot.img` with `kernel8.img`, `initramfs8`, `start4.elf` and the key lock); the end-to-end runner on the real
 artifacts with a mock CM4 (scenarios C and D).
 
-**On a real CM4** (`8726622b`, CM4 Rev 1.1, 1 GB, 8 GB eMMC, Waveshare CM4-NANO-B; 2026-11-10/11, the station on
-macOS): the open scenario, the first boot and the sandboxed apps passed (wiki: *Compute Module 4 test plan*, phases 1
-and 2). Confirmed there: the BCM2711 ROM reports the 8-hex serial the page keys boards by; the WebUSB timings fit (no
-retries); the gadget's cut-down `start4cd.elf` answers `getvar:public-key`; `erase` takes about 3 s; the sandbox probe
-`23 PASS, 2 INFO, 0 FAIL`. The module had a device key in OTP before any secure run (see "The secure scenario and the
-device key export"); the run also found the table-based AES and the unmitigated Spectre v2 / v4 above.
+**On a real CM4** (`8726622b`, CM4 Rev 1.1, 1 GB, 8 GB eMMC, Waveshare CM4-NANO-B; 2026-11-10/12, the station on
+macOS; wiki: *Compute Module 4 test plan*): both scenarios passed. Open (phases 1-2): the first boot, the sandboxed
+apps (probe `23 PASS, 2 INFO, 0 FAIL`). Secure (phases 3-4, at `04e4fba`): signed EEPROM and `program_pubkey`, the
+signed gadget, the key export through the cut-down `start4cd.elf` (the module already held a key: origin
+`existing`), the station-built LUKS2 root with `oem cryptcheck` keyslot 0, an unattended boot with the root
+unlocked through the firmware HMAC, `privkey` refused, the root read through `xts-aes-neonbs` at 80 MB/s (raw eMMC
+87 MB/s), `poweroff` holding. Phase 5: stage 3 again on the locked module (no second key export), the cable pulled
+during stage 3, nRPIBOOT released too early, and an open run of a new Pi 5 (`d49c6c2e`) as the regression. Also
+confirmed: the ROM's 8-hex USB serial, the WebUSB timings (the signed gadget's check takes 12.0 s on a CM4, inside
+the 12 s pause plus Chrome's ~5 s), `erase` in about 3 s.
 
-**Not confirmed on a real CM4 yet**: that the gadget's `start4cd.elf` serves the key export, `oem fwcrypto init` and
-`oem cryptcheck` (if it does not, the gadget needs the full firmware); that the CM4 crypt image unlocks its root at
-boot, on `xts-aes-neonbs`; Arm Trusted Firmware on a module; the secure scenario as a whole.
+**Not confirmed on a real CM4 yet**: Arm Trusted Firmware on the secure image with `device_tree_address` (it booted
+the open image, and broke the secure one before that setting); the Imager file's first boot (not possible on an eMMC
+module; on an SD card it runs `otp-growpart`).
 
 ## Operator procedure
 
@@ -627,8 +643,7 @@ and over USB (the plain crypt image set never leaves the server):
 * The board gets its own `image.json`: the `encrypted` block becomes a plain root partition with
   `expand-to-fit` (`imagejson.station_luks`), so `oem idpwrite` only writes the partition table and the
   container goes raw to `mmcblk0p2` (`root.luks.sparse`). The LUKS2 data segment is dynamic, so it covers
-  the whole partition; the file system grows at first boot (`otp-growroot`, and `rpi-resize` on the station
-  image).
+  the whole partition; the file system grows at first boot (`otp-growroot`).
 * Before `idpdone` and the power-off the page runs `oem cryptcheck mmcblk0p2`: rpi-fastbootd derives the key from
   OTP itself and checks it against the container's keyslots without activating it (no `/dev/mapper` device, so
   nothing decrypted ever exists on the board), answering the keyslot it opened. It must be keyslot 0. A board
@@ -750,7 +765,7 @@ is shown on the page; unknown keys produce a warning.
 | `image.custom` | (none) | the custom image stage 3 writes instead of the station image: the id of an image uploaded on the page (empty = the station image) |
 | `image.packages` | (none) | system packages built into the station image, one package id per line (see *System packages and sandboxed apps*); a change rebuilds the image |
 | `image.apps` | (none) | sandboxed apps built into the station image, one per line: `<package id> slot=<1..64> [grant=<permission>,...] [memory=<MiB>] [cpus=<n>] [tasks=<n>]` (defaults 256 MiB, 1 CPU, 512 tasks); a change rebuilds the image |
-| `image.hostname` | `pi5-{serial}` | host name of the boards; `{serial}` = the board's 8-hex serial |
+| `image.hostname` | `{family}-{serial}` | host name of the boards; `{serial}` = the board's 8-hex serial, `{family}` = `pi5` or `cm4` (a sheet with the old default `pi5-{serial}` is read as the new one) |
 | `image.timezone` | `Europe/Kyiv` | time zone of the image's tzdata (the page offers the list) |
 | `image.keyboard` | `us` | keyboard layout of the boards' console (xkb `us`, `gb`, `ua`, …; the page offers the list) |
 | `image.user` | `pi` | the boards' login account (Raspberry Pi OS renames its first user `pi` to it at first boot) |
@@ -772,7 +787,7 @@ is shown on the page; unknown keys produce a warning.
 | `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
 | `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
 | `builds.image.keep_raw_image` | `false` | keep the raw `.img` next to the sparse pieces |
-| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Experimental (not yet booted on a module); switching it rebuilds the cm4 images |
+| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub, the device tree at 64 MiB): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Experimental (booted the open image on a module; the secure image with `device_tree_address` not yet); switching it rebuilds the cm4 images |
 | `docker.binary` | `docker` | docker CLI to run |
 | `docker.start_desktop` | `true` | Windows: start Docker Desktop when the engine is down |
 | `docker.desktop_path` | (standard location) | Docker Desktop executable |
@@ -950,7 +965,8 @@ otp_server/
 docker/
   tools.Dockerfile, tools-entrypoint.sh     otp-tools image ("otp-run <script>")
   scripts/stage1.sh, stage2-sign.sh, boot-slot.sh, root-luks.sh (+ luks_encrypt.py), image-collect.sh
-  scripts/custom-image.sh (+ ext4_sparse.py, custom-crypt/: otp-hwkey, the initramfs hook, otp-growroot)
+  scripts/custom-image.sh (+ ext4_sparse.py, custom-crypt/: otp-hwkey, the initramfs hooks and scripts
+                            otp-cryptroot, otp-aes, otp-growpart, otp-hwlock, otp-growroot)
   gadget.Dockerfile, gadget-entrypoint.sh   arm64 pi-gen-micro builder (+ rpi-fastbootd build stage)
   apps.Dockerfile                           otp-app-builder: qemu-system-aarch64, mmdebstrap, mke2fs
   scripts/app-vmkit.sh, app-vm-init, app-rootfs.sh, app-install.sh   an app's root file system, installed in a VM
@@ -961,7 +977,8 @@ image/
   build.sh                 rpi-image-gen front end (the station runs it with --in-container)
   docker/                  the builder image (Debian trixie + rpi-image-gen's dependencies)
   layer/                   station layers: otp-rpios-packages and otp-rpios-kernel-2712 / -v8 (generated), otp-rpios-lite,
-                           otp-rpios-setup (+ otp-rpios-setup.d: kernel command line fragment, initramfs otp-aes),
+                           otp-rpios-setup (+ otp-rpios-setup.d: kernel command line fragment, initramfs
+                           otp-aes and otp-growpart),
                            otp-apps, otp-tfa-rpi4 (CM4, builds.image.cm4_tfa)
   rpios_packages.py        writes the package layers from a Raspberry Pi OS Lite release's .info file
   example.yaml             the config of the default OS image settings (example-cm4.yaml: the Compute Module 4's)
@@ -1063,11 +1080,18 @@ bash 4 or later; `tests/hosttools.py` checks). On Windows put Git's Unix tools f
 are skipped (WSL's `C:\Windows\System32\bash.exe` is never used). `C:\Program Files\Git\bin` is not the same: its
 `sh.exe` puts Git's own tools before the test's stubs. On macOS the tests that need GNU `stat`/`sed` or bash 4 skip
 with a hint; `brew install coreutils gnu-sed bash` with the gnubin directories first on `PATH` runs them. With
-`usr\bin` first on Windows: 1282 passed, 3 skipped (2026-11-11). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
+`usr\bin` first on Windows: 1292 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
 platform default) and exits with 2 when no scenario can run there.
 
 ## Troubleshooting
 
+* **"The station was updated after this page was loaded".** The page's files changed under an open tab (a
+  `git pull` and a server restart): the tab still runs the old page, which must not drive a board against the new
+  server. Reload it (Ctrl+F5); until then Connect board and Provision stay disabled. On 2026-11-11 a tab opened
+  before an update ran a whole secure stage 3 with the previous page.
+* **The board left USB during stage 3** (cable pulled, power lost): the fastboot gadget ran from RAM and is gone.
+  Put the board back into RPIBOOT mode, **Connect board**, **Run** stage 2, then **Connect fastboot gadget** and
+  **Run** stage 3; the page says so instead of the raw WebUSB error.
 * **"No Google OAuth client".** Save the Desktop-app client JSON as `google-oauth-client.json` in the repository
   root (see Requirements) and reload the page.
 * **Google sign-in fails or the login stops working after a week.** The OAuth app is still in *Testing*: then

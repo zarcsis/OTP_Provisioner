@@ -143,7 +143,8 @@ case "${VARIANT}" in clear|crypt) ;; *) die "VARIANT must be clear or crypt, got
 if [ "${VARIANT}" = crypt ]; then
     [[ "${LUKS_UUID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "LUKS_UUID must be a lowercase UUID"
     [[ "${MAPPER}" =~ ^[a-z][a-z0-9_]{0,31}$ ]] || die "MAPPER must be a plain mapping name"
-    for f in otp-hwkey otp-cryptroot.hook otp-aes otp-growroot otp-growroot.service; do
+    for f in otp-hwkey otp-cryptroot.hook otp-aes otp-growpart otp-growpart.hook otp-hwlock otp-growroot \
+             otp-growroot.service; do
         [ -f "${CRYPT_FILES}/${f}" ] || die "${CRYPT_FILES}/${f} missing"
     done
 fi
@@ -279,14 +280,24 @@ if [ "${VARIANT}" = crypt ]; then
     install -m 0755 -D "${CRYPT_FILES}/otp-cryptroot.hook" "${R}/etc/initramfs-tools/hooks/otp-cryptroot"
     # a CM4 (no AES instructions) gets the constant-time bit-sliced AES before cryptroot opens the root
     install -m 0755 -D "${CRYPT_FILES}/otp-aes" "${R}/etc/initramfs-tools/scripts/init-top/otp-aes"
+    # the root partition grows to the card before the container is opened (a card written from the Imager file),
+    # so the mapping never needs the key later; after the unlock the firmware HMAC is locked until reboot
+    install -m 0755 -D "${CRYPT_FILES}/otp-growpart" "${R}/etc/initramfs-tools/scripts/init-premount/otp-growpart"
+    install -m 0755 -D "${CRYPT_FILES}/otp-growpart.hook" "${R}/etc/initramfs-tools/hooks/otp-growpart"
+    install -m 0755 -D "${CRYPT_FILES}/otp-hwlock" "${R}/etc/initramfs-tools/scripts/local-premount/otp-hwlock"
     install -m 0755 -D "${CRYPT_FILES}/otp-growroot" "${R}/usr/local/sbin/otp-growroot"
     install -m 0644 -D "${CRYPT_FILES}/otp-growroot.service" "${R}/etc/systemd/system/otp-growroot.service"
     sed -i 's/\r$//' "${R}/usr/lib/cryptsetup/keyscripts/otp-hwkey" "${R}/etc/initramfs-tools/hooks/otp-cryptroot" \
-        "${R}/etc/initramfs-tools/scripts/init-top/otp-aes" \
+        "${R}/etc/initramfs-tools/scripts/init-top/otp-aes" "${R}/etc/initramfs-tools/scripts/init-premount/otp-growpart" \
+        "${R}/etc/initramfs-tools/hooks/otp-growpart" "${R}/etc/initramfs-tools/scripts/local-premount/otp-hwlock" \
         "${R}/usr/local/sbin/otp-growroot" "${R}/etc/systemd/system/otp-growroot.service"
     in_root systemctl enable otp-growroot.service 2>&1 | sed 's/^/    /'
     if [ -e "${R}/usr/lib/systemd/system/rpi-eeprom-update.service" ] || [ -e "${R}/lib/systemd/system/rpi-eeprom-update.service" ]; then
         in_root systemctl mask rpi-eeprom-update.service 2>&1 | sed 's/^/    /'
+    fi
+    # otp-growroot grows the encrypted root; rpi-resize's systemd-growfs would try the mapping without the key
+    if [ -e "${R}/usr/lib/systemd/system/rpi-resize.service" ] || [ -e "${R}/lib/systemd/system/rpi-resize.service" ]; then
+        in_root systemctl mask rpi-resize.service 2>&1 | sed 's/^/    /'
     fi
     touch "${R}/etc/crypttab"
     awk -v m="${MAPPER}" '$1 != m' "${R}/etc/crypttab" > "${WORK}/crypttab"
@@ -347,7 +358,8 @@ EOF
         rel="${BOOT_MP}/$(basename "${f}")"
         in_root lsinitramfs "${rel}" > "${WORK}/lsinitramfs.txt" 2>/dev/null || die "lsinitramfs cannot read ${rel}"
         for want in usr/lib/cryptsetup/keyscripts/otp-hwkey usr/bin/rpi-fw-crypto cryptroot/crypttab \
-                    scripts/init-top/otp-aes; do
+                    scripts/init-top/otp-aes scripts/init-premount/otp-growpart scripts/local-premount/otp-hwlock \
+                    usr/sbin/sfdisk usr/sbin/blkid; do
             grep -q "^${want}\$" "${WORK}/lsinitramfs.txt" || grep -q "/${want##*/}\$" "${WORK}/lsinitramfs.txt" \
                 || die "${rel} lacks ${want}"
         done

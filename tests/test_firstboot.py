@@ -179,6 +179,10 @@ def test_seed_is_deterministic_and_follows_every_setting():
 def test_hostname_template():
     assert fb.hostname_for("pi5-{serial}", "A7EB274C") == "pi5-a7eb274c"
     assert fb.hostname_for("drone", SERIAL) == "drone"
+    # one template for a station that provisions both families (a CM4 came up as pi5-<serial> before)
+    assert fb.hostname_for("{family}-{serial}", "8726622B", "cm4") == "cm4-8726622b"
+    assert fb.hostname_for("{family}-{serial}", "D49C6C2E") == "pi5-d49c6c2e"
+    assert fb.render(image(hostname="{family}-{serial}"), SERIAL, "cm4").summary["hostname"] == f"cm4-{SERIAL}"
     assert fb.render(image(hostname="x-{serial}-y"), SERIAL).summary["hostname"] == f"x-{SERIAL}-y"
 
 

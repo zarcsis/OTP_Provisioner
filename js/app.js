@@ -241,7 +241,7 @@
     function updateButtons() {
         const running = flow.running;
         const online = api.available;
-        const ready = online && googleReady();
+        const ready = online && googleReady() && !srv.pageStale;
         $('#btn-connect').disabled = running || !ready || !navigator.usb;
         $('#btn-abort').disabled = !running;
         const plan = flow.plan();
@@ -252,6 +252,7 @@
         let hint = '';
         if (checking()) hint = 'checking the server…';
         else if (!online) hint = 'server offline: start it with "uv run server.py"';
+        else if (srv.pageStale) hint = 'the station was updated: reload this page (Ctrl+F5)';
         else if (!googleReady()) hint = 'sign in to Google first';
         else if (!flow.module) hint = 'connect a board first';
         else if (running) hint = `provisioning ${flow.serial}…`;
@@ -1250,6 +1251,16 @@
         srv.status = s;
         document.body.classList.toggle('offline', !s);
         $('#offline-box').classList.toggle('hidden', !!s);
+        // the station's page files changed since this tab loaded them (the station was updated): the old page
+        // must not drive a board against the new server
+        const pv = s && s.page && s.page.version;
+        if (pv && !srv.pageVersion) srv.pageVersion = pv;
+        else if (pv && pv !== srv.pageVersion && !srv.pageStale) {
+            srv.pageStale = true;
+            log('warn', 'The station was updated after this page was loaded: reload the page (Ctrl+F5) before you provision a board');
+            updateButtons();
+        }
+        $('#stale-box').classList.toggle('hidden', !srv.pageStale);
         renderServerBadges();
         renderBuilds();
         renderCustomImages();

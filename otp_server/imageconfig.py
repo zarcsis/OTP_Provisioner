@@ -165,14 +165,16 @@ def check_apps(lines: list[str]) -> list[str]:
 
 
 def check_hostname(v: str) -> str:
-    """A host name, or a template with ``{serial}`` (the 8-hex board serial) in it."""
+    """A host name, or a template with ``{serial}`` (the 8-hex board serial) and ``{family}`` (``pi5``, ``cm4``)."""
     v = v.strip().lower()
-    rest = v.replace(firstboot.SERIAL_PLACEHOLDER, "")
+    rest = v.replace(firstboot.SERIAL_PLACEHOLDER, "").replace(firstboot.FAMILY_PLACEHOLDER, "")
     if "{" in rest or "}" in rest:
-        raise ValueError(f"hostname {v!r}: the only placeholder is {firstboot.SERIAL_PLACEHOLDER}")
-    if not _HOSTNAME_RE.fullmatch(firstboot.hostname_for(v, _SAMPLE_SERIAL)):
+        raise ValueError(f"hostname {v!r}: the placeholders are {firstboot.SERIAL_PLACEHOLDER} and "
+                         f"{firstboot.FAMILY_PLACEHOLDER}")
+    if not _HOSTNAME_RE.fullmatch(firstboot.hostname_for(v, _SAMPLE_SERIAL, "cm4")):
         raise ValueError(f"hostname {v!r}: lower-case letters, digits and '-' (not at either end), up to 63 "
-                         f"with {firstboot.SERIAL_PLACEHOLDER} counted as 8 characters")
+                         f"with {firstboot.SERIAL_PLACEHOLDER} counted as 8 characters and "
+                         f"{firstboot.FAMILY_PLACEHOLDER} as 3")
     return v
 
 
@@ -285,7 +287,7 @@ def warnings(img: Any) -> list[str]:
         out.append("Wi-Fi country 00 (world) limits channels and power; set the country the boards fly in")
     if firstboot.SERIAL_PLACEHOLDER not in img.hostname:
         out.append(f"every board gets the host name {img.hostname!r}; put {firstboot.SERIAL_PLACEHOLDER} in it "
-                   "(e.g. pi5-{serial}) to tell them apart on the network")
+                   "(e.g. {family}-{serial}) to tell them apart on the network")
     return out
 
 

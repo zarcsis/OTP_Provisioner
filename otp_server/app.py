@@ -21,6 +21,7 @@ carries no foreign ``Origin``/``Referer``. That closes DNS rebinding and cross-s
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -29,6 +30,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -329,10 +331,28 @@ class Services:
         except Exception as exc:  # a read-only probe must never break /api/status
             return {"platform": "windows", "rpiboot": False, "fastboot": False, "detail": f"driver check failed: {exc}"}
 
+    def page_version(self) -> str:
+        """16 hex digits of sha256 over the page's files (``index.html``, ``css/``, ``js/``: names and bytes). The
+        page keeps the value it first saw and asks for a reload when it changes: a tab opened before the station
+        was updated runs the old page against the new server (it happened on the first CM4 run)."""
+        web = Path(self.cfg.web_dir)
+        files = [web / "index.html"] + sorted(p for d in ("css", "js") for p in (web / d).rglob("*") if p.is_file())
+        stamp = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files if p.is_file())
+        cached = getattr(self, "_page_version", None)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        h = hashlib.sha256()
+        for p in files:
+            if p.is_file():
+                h.update(p.relative_to(web).as_posix().encode() + b"\0" + p.read_bytes() + b"\0")
+        self._page_version = (stamp, h.hexdigest()[:16])
+        return self._page_version[1]
+
     def status(self) -> dict:
         """The ``/api/status`` document (SPEC section 8)."""
         return {
             "version": __version__,
+            "page": {"version": self.page_version()},
             "google": self.account.status() if self.account is not None else None,
             "google_ready": self.google_ready(),
             "settings": self.settings_status(),

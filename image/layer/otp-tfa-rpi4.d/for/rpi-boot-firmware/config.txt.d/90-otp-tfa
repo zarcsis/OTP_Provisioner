@@ -4,3 +4,9 @@
 armstub=bl31.bin
 enable_gic=1
 enable_uart=1
+# TF-A edits the device tree in place and uses the 1 MiB after its start as scratch space (rpi4_prepare_dtb:
+# fdt_open_into(dtb, dtb, 0x100000)). Left to itself the firmware puts the device tree just below the initramfs,
+# whose start TF-A then overwrites: no initramfs, no unlocked root (seen on a CM4, 2026-11-11). At 64 MiB the
+# device tree has that room: the kernel ends below 32 MiB, the initramfs sits at the top of RAM. No
+# device_tree_end: a device tree padded up to it would leave fdt_open_into no room at all.
+device_tree_address=0x4000000

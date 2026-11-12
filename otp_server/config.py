@@ -70,7 +70,7 @@ DEFAULTS: dict[str, Any] = {
         "custom": "",
         "packages": [],
         "apps": [],
-        "hostname": "pi5-{serial}",
+        "hostname": "{family}-{serial}",
         "timezone": "Europe/Kyiv",
         "keyboard": "us",
         "user": "pi",
