@@ -216,7 +216,7 @@ uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-un
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
 uv run --group dev python -B -m pytest -q     # ~1295 tests, ~1.5 min; needs no Docker, no Google, no hardware
-uv run python -B tests/web/run_selftest.py    # ~665 checks: the page in headless Chrome against a fake API + mock board
+uv run python -B tests/web/run_selftest.py    # ~670 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
 
@@ -235,7 +235,7 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
   it the `sh` tests skip, and so does the kernel command line test (`tests/hosttools.bash4` never takes WSL's
   `System32\bash.exe`, which gets neither the env nor the `C:/` paths); Git's `bin\sh.exe` puts Git's tools before
   the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With `usr\bin`
-  first: 1295 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
+  first: 1296 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
   need GNU `stat`/`sed` or bash 4 skip with a hint (`tests/hosttools.py`).
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
@@ -588,6 +588,10 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   `js/`); the page keeps the first one and disables Connect/Provision with a reload banner when it changes.
 * **Stage 3's disconnect advice** said "Provision": after a cable pull the gadget (it runs from RAM) is gone, and
   the board must run stage 2 again; the page says so now, and the server's record gets the same text.
+* **A failed stage 3 left a board "Image written"** (Pi 5 `2a03e58f`, 2026-11-12: the cable pulled at 15% of the root
+  of a re-flash): stages only ever moved forward, so the page said "fully provisioned" over an erased, partly written
+  card and Provision had nothing to do. A failed stage 3 on a flashed board now sets it back to `gadget` with a warning
+  note (`_apply_stage3`, the mock in `tests/web/mocks.js` the same).
 
 **Builds on Windows**
 * **Docker Desktop registers its own `aarch64` binfmt handler**, but rpi-image-gen checks for

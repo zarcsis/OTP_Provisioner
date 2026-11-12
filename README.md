@@ -1086,7 +1086,7 @@ bash 4 or later; `tests/hosttools.py` checks). On Windows put Git's Unix tools f
 are skipped (WSL's `C:\Windows\System32\bash.exe` is never used). `C:\Program Files\Git\bin` is not the same: its
 `sh.exe` puts Git's own tools before the test's stubs. On macOS the tests that need GNU `stat`/`sed` or bash 4 skip
 with a hint; `brew install coreutils gnu-sed bash` with the gnubin directories first on `PATH` runs them. With
-`usr\bin` first on Windows: 1295 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
+`usr\bin` first on Windows: 1296 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
 platform default) and exits with 2 when no scenario can run there.
 
 ## Troubleshooting
@@ -1097,7 +1097,9 @@ platform default) and exits with 2 when no scenario can run there.
   before an update ran a whole secure stage 3 with the previous page.
 * **The board left USB during stage 3** (cable pulled, power lost): the fastboot gadget ran from RAM and is gone.
   Put the board back into RPIBOOT mode, **Connect board**, **Run** stage 2, then **Connect fastboot gadget** and
-  **Run** stage 3; the page says so instead of the raw WebUSB error.
+  **Run** stage 3; the page says so instead of the raw WebUSB error. A board that was "Image written" before such a
+  run goes back to "Fastboot gadget booted" (its storage may be erased or partly written), so **Provision** offers
+  stages 2 and 3 again instead of calling it fully provisioned.
 * **"No Google OAuth client".** Save the Desktop-app client JSON as `google-oauth-client.json` in the repository
   root (see Requirements) and reload the page.
 * **Google sign-in fails or the login stops working after a week.** The OAuth app is still in *Testing*: then

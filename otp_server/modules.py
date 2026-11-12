@@ -665,6 +665,13 @@ class ModuleService:
                 ok = False
         if ok:
             rec["stage"] = "flashed"
+        elif rec["stage"] == "flashed":
+            # A run that broke off may have erased the storage or written part of it (2026-11-12: a cable pulled
+            # at 15% of the root left a board "Image written" and the page saying "fully provisioned"): its
+            # image no longer counts, so the plan offers stage 3 again.
+            rec["stage"] = "gadget"
+            notes.append("warning: the board's storage may be erased or partly written: its image no longer "
+                         "counts as written (stage 3 is due again)")
         return ok
 
     def _stage_facts(self, n: int, result: dict) -> dict:

@@ -395,6 +395,27 @@ def test_stage3(module_service):
     assert rec["events"][-1]["kind"] == "stage3"
 
 
+def test_a_failed_stage3_on_a_flashed_board_makes_stage3_due_again(module_service):
+    """2a03e58f, 2026-11-12: the cable pulled at 15% of the root left the board "Image written" and the page
+    saying "fully provisioned" over an erased, partly written card."""
+    module_service.hello("a7eb274c")
+    module_service.set_mode("a7eb274c", "open")
+    rec, _ = module_service.record_result("a7eb274c", 3, {"ok": True, "details": {}})
+    assert rec["stage"] == "flashed"
+    rec, v = module_service.record_result("a7eb274c", 3, {
+        "ok": False, "interrupted": True, "error": "the board was disconnected during stage 3",
+        "details": {"flashed": ["boot.vfat.sparse"]}})
+    assert v["ok"] is False and rec["stage"] == "gadget"
+    assert any(n.startswith("warning: the board's storage may be erased") for n in v["notes"])
+    assert rec["events"][-1]["note"].startswith("failed: page reported failure: the board was disconnected")
+    assert "storage may be erased" not in rec["events"][-1]["note"]
+    # a failure on a board that was not flashed changes nothing
+    rec, v = module_service.record_result("a7eb274c", 3, {"ok": False, "error": "x"})
+    assert rec["stage"] == "gadget" and not any("storage may be erased" in n for n in v["notes"])
+    rec, v = module_service.record_result("a7eb274c", 3, {"ok": True, "details": {}})
+    assert v["ok"] is True and rec["stage"] == "flashed"
+
+
 def test_record_result_bad_input(module_service):
     module_service.hello("a7eb274c")
     for bad in (0, 4, "x"):

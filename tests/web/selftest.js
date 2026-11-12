@@ -1171,6 +1171,24 @@
             deq(flow.plan(), [3], 'resume: stage 3 is still pending');
         }
         {
+            // a flashed board flashed again and unplugged on the way: the server takes back "Image written"
+            // (2a03e58f, 2026-11-12: the page said "fully provisioned" over an erased, partly written card)
+            const { files, m3 } = await buildServerFiles();
+            const api = new T.FakeApi({ files, manifests: { 1: null, 2: null, 3: m3 } });
+            api.seed('a7eb274c', { stage: 'flashed' });
+            const hub = new T.MockHub();
+            const sim = new T.FastbootSim({ goneOnFlash: 'mmcblk0p2', deviceKey: KEY_A });
+            hub.plug(sim);
+            const ev = newEv();
+            const flow = makeFlow(api, hub, ev);
+            const m = await flow.connectBoard();
+            eq(m && m.stage, 'flashed', 'a flashed board connected as a gadget');
+            deq(flow.plan(), [], '… nothing planned');
+            eq(await flow.provision([3]), false, 'stage 3 run again, board unplugged while flashing → fails');
+            eq(flow.module && flow.module.stage, 'gadget', 'the record is no longer "Image written"');
+            deq(flow.plan(), [3], 'stage 3 is due again');
+        }
+        {
             const { files, m1 } = await buildServerFiles();
             const api = new T.FakeApi({ files, manifests: { 1: m1 } });
             const hub = new T.MockHub();

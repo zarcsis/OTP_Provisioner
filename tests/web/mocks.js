@@ -813,6 +813,12 @@
                     notes.push("the page did not confirm that the board's OTP key opens keyslot 0 of its station-built encrypted root (oem cryptcheck); the board may not boot");
                 }
                 if (ok) this._advance(m, 'flashed');
+                else if (m.stage === 'flashed') {
+                    // like the server: a broken-off run may have erased the storage, so stage 3 is due again
+                    m.stage = 'gadget';
+                    m.stage_label = LABELS.gadget;
+                    notes.push("warning: the board's storage may be erased or partly written: its image no longer counts as written (stage 3 is due again)");
+                }
             }
             m.events.push({ t: 'now', kind: 'stage' + n, note: ok ? 'ok' : 'failed: ' + (body.error || notes.join('; ')) });
             return { module: this._copy(m), verdict: { ok, notes } };
