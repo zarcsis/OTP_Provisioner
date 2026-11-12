@@ -7,7 +7,9 @@ here may prevent the server from starting:
 * signing in to Google is required: until the operator has signed in (``/api/google/login``) and the
   settings worksheet has been read, the module, stage and build endpoints answer HTTP 401 and the page
   shows only the sign-in. The settings are re-read from the sheet while the server runs
-  (:meth:`Services.refresh_settings`), so changing them needs no restart;
+  (:meth:`Services.refresh_settings`), so changing them needs no restart. A request waits for Google at
+  most :attr:`Services.GOOGLE_WAIT` seconds (the read goes on in a thread): a Sheets request can take
+  60 s to time out, and the page's ``/api/status`` poll is what enables its Connect button;
 * an unreachable store (``StoreError``) is reported in ``/api/status`` and turns the module endpoints
   into HTTP 503;
 * Docker being down is only reported (``/api/status`` -> ``docker.ok = false``); builds fail as jobs;
@@ -42,6 +44,15 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class _Call:
+    """One call run by :meth:`Services._bounded`: set ``done`` when it returned or raised."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+
+
+@dataclass
 class Services:
     """Everything the HTTP API and the CLI need. ``store``/``modules`` are ``None`` when the store
     could not be created (``store_error`` says why); ``artifacts`` is ``None`` when the artifacts
@@ -69,16 +80,59 @@ class Services:
     auto_build: bool | None = None
     auto_build_done: bool = False
     _settings_lock: Any = field(default_factory=threading.RLock, repr=False)
+    _calls: dict = field(default_factory=dict, repr=False)
+    _calls_lock: Any = field(default_factory=threading.Lock, repr=False)
+    _storage_last: dict | None = field(default=None, repr=False)
 
     SETTINGS_TTL = 15.0
+    #: Seconds a request waits for a Google Sheets call before it answers with what the station knows.
+    GOOGLE_WAIT = 2.0
+
+    def _bounded(self, key: str, fn: Any, wait: float) -> tuple[bool, Any]:
+        """Run ``fn()`` in a daemon thread, one call per ``key`` at a time (a request that comes while one
+        is running waits for that one), and wait for it at most ``wait`` seconds. Returns ``(finished,
+        result)``; an exception of ``fn`` is raised here when it finished in time. A request thread must
+        not hang on Google: Sheets requests time out after 60 s, and every request that queued behind a
+        hanging read used to start its own once it got the lock."""
+        with self._calls_lock:
+            call = self._calls.get(key)
+            if call is None or call.done.is_set():
+                call = _Call()
+
+                def run(call: _Call = call) -> None:
+                    try:
+                        call.result = fn()
+                    except BaseException as exc:  # handed to whoever waits for it
+                        call.error = exc
+                    finally:
+                        call.done.set()
+
+                self._calls[key] = call
+                threading.Thread(target=run, name=f"google-{key}", daemon=True).start()
+        if not call.done.wait(wait):
+            return False, None
+        if call.error is not None:
+            raise call.error
+        return True, call.result
 
     # ------------------------------------------------------------------ Google + settings
-    def refresh_settings(self, force: bool = False) -> bool:
-        """Read the settings worksheet (at most every :attr:`SETTINGS_TTL` s unless ``force``) and apply it
-        to ``cfg`` in place. Returns whether settings from the sheet are in effect. A broken sheet keeps
-        the last good settings and reports why (``settings_error``)."""
+    def refresh_settings(self, force: bool = False, wait: float | None = None) -> bool:
+        """Read the settings worksheet (at most every :attr:`SETTINGS_TTL` s after the previous read ended,
+        unless ``force``) and apply it to ``cfg`` in place. Returns whether settings from the sheet are in
+        effect. A broken sheet keeps the last good settings and reports why (``settings_error``).
+
+        ``wait`` None reads in this thread (startup, sign-in, saving settings, the CLI); a number reads in
+        a thread of its own and waits for it at most that long (requests: :meth:`_bounded`)."""
         if self.account is None or self.settings is None:
             return True
+        if wait is None:
+            return self._read_settings(force)
+        if not force and time.monotonic() - self.settings_checked_at < self.SETTINGS_TTL:
+            return self.settings_loaded_at is not None
+        self._bounded("settings", lambda: self._read_settings(force), wait)
+        return self.settings_loaded_at is not None
+
+    def _read_settings(self, force: bool) -> bool:
         with self._settings_lock:
             now = time.monotonic()
             loaded = self.settings_loaded_at is not None
@@ -109,17 +163,22 @@ class Services:
             except ValueError as exc:
                 self.settings_error = f"invalid value in the settings sheet: {exc}"
                 return loaded
+            finally:
+                # the next read starts SETTINGS_TTL after this one ended, not after it started (a read
+                # that timed out after 60 s is not followed by another one at once)
+                self.settings_checked_at = time.monotonic()
             self.cfg.apply_settings(new)
             self.settings_unknown = list(unknown)
             self.settings_error = ""
             self.settings_loaded_at = now
             return True
 
-    def google_ready(self) -> bool:
-        """Signed in and the settings sheet read (always true when no Google account is wired: tests)."""
+    def google_ready(self, wait: float | None = None) -> bool:
+        """Signed in and the settings sheet read (always true when no Google account is wired: tests).
+        ``wait``: see :meth:`refresh_settings`."""
         if self.account is None:
             return True
-        return self.account.has_token() and self.refresh_settings()
+        return self.account.has_token() and self.refresh_settings(wait=wait)
 
     def google_problem(self) -> str:
         if self.account is None:
@@ -244,8 +303,12 @@ class Services:
         }
 
     # ------------------------------------------------------------------ status pieces
-    def storage_status(self) -> dict:
-        """``store.describe()``, or a synthetic failure record when the store is unusable."""
+    def storage_status(self, wait: float | None = None) -> dict:
+        """``store.describe()``, or a synthetic failure record when the store is unusable. ``describe()``
+        connects to the spreadsheet when it is not connected yet and waits for a store call in progress:
+        with ``wait`` it runs in a thread (:meth:`_bounded`), and when it has not answered in time the
+        last answer is returned with a note."""
+        backend = getattr(self.store, "backend", "?")
         if self.store is None:
             return {
                 "backend": "gsheets",
@@ -254,14 +317,23 @@ class Services:
                 "detail": self.store_error or "store not configured",
             }
         try:
-            d = dict(self.store.describe())
+            if wait is None:
+                d = dict(self.store.describe())
+            else:
+                finished, result = self._bounded("storage", self.store.describe, wait)
+                if not finished:
+                    last = dict(self._storage_last or {"backend": backend, "ok": False, "location": ""})
+                    slow = "waiting for Google Sheets to answer"
+                    last["detail"] = f"{last['detail']} ({slow})" if last.get("detail") else slow
+                    return last
+                d = dict(result)
         except Exception as exc:  # describe() should never raise; stay defensive
-            return {"backend": getattr(self.store, "backend", "?"), "ok": False, "location": "",
-                    "detail": f"store error: {exc}"}
-        d.setdefault("backend", getattr(self.store, "backend", "?"))
+            return {"backend": backend, "ok": False, "location": "", "detail": f"store error: {exc}"}
+        d.setdefault("backend", backend)
         d.setdefault("ok", False)
         d.setdefault("location", "")
         d.setdefault("detail", "")
+        self._storage_last = d
         return d
 
     def docker_status(self) -> dict:
@@ -354,10 +426,10 @@ class Services:
             "version": __version__,
             "page": {"version": self.page_version()},
             "google": self.account.status() if self.account is not None else None,
-            "google_ready": self.google_ready(),
+            "google_ready": self.google_ready(wait=self.GOOGLE_WAIT),
             "settings": self.settings_status(),
             "config": self.cfg.summary(),
-            "storage": self.storage_status(),
+            "storage": self.storage_status(wait=self.GOOGLE_WAIT),
             "docker": self.docker_status(),
             "usb_driver": self.usb_driver_status(),
             "artifacts": self.artifacts_status(),

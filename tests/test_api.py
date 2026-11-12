@@ -1225,6 +1225,98 @@ def test_settings_sheet_broken_value_keeps_the_previous_settings(genv):
     assert s["settings"]["error"] == "" and s["config"]["provisioning"]["erase_storage"] is True
 
 
+def test_a_hanging_google_does_not_hold_up_the_status_or_the_gate(genv):
+    """Sheets answered metadata but hung on every cell read (2026-11-12): each read took 60 s to time out,
+    and every /api/status queued behind it started a read of its own, so the page stayed at "Checking the
+    server…" with Connect disabled. A request waits GOOGLE_WAIT at most; one read runs at a time."""
+    genv.account.signed_in = True
+    genv.sheet.rows = {"provisioning.erase_storage": "false"}
+    assert genv.client.get("/api/status").json()["google_ready"] is True
+    genv.svc.GOOGLE_WAIT = 0.2
+    release, started = threading.Event(), threading.Event()
+    read, describe = genv.sheet.read, genv.store.describe
+
+    def hanging_read():
+        started.set()
+        release.wait(30)
+        return read()
+
+    def hanging_describe():
+        release.wait(30)
+        return describe()
+
+    genv.sheet.read, genv.store.describe = hanging_read, hanging_describe
+    genv.sheet.rows = {"provisioning.erase_storage": "true"}
+    try:
+        reads = genv.sheet.reads
+        t0 = time.monotonic()
+        s = genv.client.get("/api/status").json()
+        assert started.is_set()
+        assert s["google_ready"] is True                      # the last good settings stay in force
+        assert s["config"]["provisioning"]["erase_storage"] is False
+        assert s["storage"]["ok"] is True and "waiting for Google Sheets" in s["storage"]["detail"]
+        assert genv.client.get("/api/modules").status_code == 200
+        assert genv.client.get("/api/status").json()["google_ready"] is True
+        assert time.monotonic() - t0 < 5
+        assert genv.sheet.reads == reads                      # still the one read, not finished
+    finally:
+        release.set()
+    for _ in range(100):                                       # the read finishes in its thread
+        if genv.cfg.provisioning.erase_storage is True:
+            break
+        time.sleep(0.05)
+    assert genv.sheet.reads == reads + 1
+    s = genv.client.get("/api/status").json()
+    assert s["config"]["provisioning"]["erase_storage"] is True
+    assert "waiting" not in s["storage"]["detail"]
+
+
+def test_a_hanging_google_at_first_keeps_the_gate_closed_without_hanging(genv):
+    genv.account.signed_in = True
+    genv.svc.GOOGLE_WAIT = 0.2
+    release = threading.Event()
+    read = genv.sheet.read
+    genv.sheet.read = lambda: (release.wait(30), read())[1]
+    try:
+        t0 = time.monotonic()
+        s = genv.client.get("/api/status").json()
+        assert s["google_ready"] is False and s["settings"]["ok"] is False
+        r = genv.client.get("/api/modules")
+        assert r.status_code == 401 and r.json()["detail"] == "the settings sheet has not been read yet"
+        assert time.monotonic() - t0 < 5
+    finally:
+        release.set()
+    for _ in range(100):
+        if genv.svc.settings_loaded_at is not None:
+            break
+        time.sleep(0.05)
+    assert genv.client.get("/api/modules").status_code == 200
+
+
+def test_settings_are_not_read_again_right_after_a_read_that_timed_out(genv, monkeypatch):
+    """The TTL runs from the end of a read: a read that took 60 s to fail is not followed by another at once."""
+    genv.account.signed_in = True
+    genv.svc.SETTINGS_TTL = 15.0
+    clock = [1000.0]
+    monkeypatch.setattr("otp_server.app.time.monotonic", lambda: clock[0])
+    read = genv.sheet.read
+
+    def slow_failing_read():
+        clock[0] += 60
+        genv.sheet.error = "Google unreachable (ReadTimeout: x); check the network -- retrying"
+        return read()
+
+    genv.sheet.read = slow_failing_read
+    assert genv.svc.refresh_settings() is False
+    assert genv.sheet.reads == 1 and genv.svc.settings_error.startswith("Google unreachable")
+    clock[0] += 5
+    genv.svc.refresh_settings()
+    assert genv.sheet.reads == 1
+    clock[0] += 11
+    genv.svc.refresh_settings()
+    assert genv.sheet.reads == 2
+
+
 def test_revoked_login_closes_the_gate(genv):
     from otp_server.google_account import NotSignedIn
 

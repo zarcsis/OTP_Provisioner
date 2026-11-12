@@ -150,7 +150,7 @@ def api_router(svc: Any) -> APIRouter:
 
     def require_google() -> None:
         """Every module / stage / build endpoint needs the Google login and the settings sheet."""
-        if not svc.google_ready():
+        if not svc.google_ready(wait=svc.GOOGLE_WAIT):
             raise HTTPException(401, detail=svc.google_problem())
 
     def modules() -> Any:

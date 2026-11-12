@@ -749,7 +749,11 @@ description) for every setting the sheet lacks and removes the rows of retired s
 `builds.image.config`); it changes a value only when the OS image panel on the page saves it. An empty value
 means the default; switches are `true`/`false`, lists one item per line. The server re-reads the sheet while it runs
 (at most every 15 s), so **changes need no restart**. A value it cannot use keeps the previous settings and
-is shown on the page; unknown keys produce a warning.
+is shown on the page; unknown keys produce a warning. When Google is slow or not answering, the page's requests
+do not wait for it longer than 2 s: the read goes on in the background, the last good settings stay in force,
+and the storage line of the status says "waiting for Google Sheets to answer". Boards cannot be provisioned
+meanwhile (every stage writes the board's record), but the page says why instead of staying at "Checking the
+server…".
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -1080,7 +1084,7 @@ bash 4 or later; `tests/hosttools.py` checks). On Windows put Git's Unix tools f
 are skipped (WSL's `C:\Windows\System32\bash.exe` is never used). `C:\Program Files\Git\bin` is not the same: its
 `sh.exe` puts Git's own tools before the test's stubs. On macOS the tests that need GNU `stat`/`sed` or bash 4 skip
 with a hint; `brew install coreutils gnu-sed bash` with the gnubin directories first on `PATH` runs them. With
-`usr\bin` first on Windows: 1292 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
+`usr\bin` first on Windows: 1295 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
 platform default) and exits with 2 when no scenario can run there.
 
 ## Troubleshooting

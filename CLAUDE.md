@@ -232,7 +232,7 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
   it the `sh` tests skip, and so does the kernel command line test (`tests/hosttools.bash4` never takes WSL's
   `System32\bash.exe`, which gets neither the env nor the `C:/` paths); Git's `bin\sh.exe` puts Git's tools before
   the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With `usr\bin`
-  first: 1292 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
+  first: 1295 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
   need GNU `stat`/`sed` or bash 4 skip with a hint (`tests/hosttools.py`).
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
@@ -607,6 +607,13 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   every 10 s and the server starts without Google (503 on module endpoints). An OAuth app left in
   *Testing* expires logins after 7 days; publish it (scope `drive.file` needs no verification). The
   `settings` worksheet is re-read every 15 s; retired keys and old defaults are rewritten on read.
+* **A hanging Sheets kept the page at "Checking the server…"** (2026-11-12). Google answered spreadsheet metadata
+  in 0.3 s but every cell read of the station spreadsheet hung (from the station and from another network alike).
+  `/api/status` read the settings under a lock; each read took 60 s to time out, and every request queued behind
+  it started a read of its own once it got the lock (the TTL ran from the start of the previous read), so the
+  status took minutes and Connect stayed disabled. Requests now wait at most `Services.GOOGLE_WAIT` (2 s) for
+  the settings read and `store.describe()` (`Services._bounded`: one call per key at a time, in a daemon thread),
+  the TTL runs from the end of a read, and the last good settings stay in force.
 
 ## Invariants: do not break these
 
