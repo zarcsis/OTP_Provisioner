@@ -613,7 +613,9 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   it started a read of its own once it got the lock (the TTL ran from the start of the previous read), so the
   status took minutes and Connect stayed disabled. Requests now wait at most `Services.GOOGLE_WAIT` (2 s) for
   the settings read and `store.describe()` (`Services._bounded`: one call per key at a time, in a daemon thread),
-  the TTL runs from the end of a read, and the last good settings stay in force.
+  the TTL runs from the end of a read, and the last good settings stay in force. The document itself: a fresh
+  spreadsheet worked through the API, ours hung (even the Drive CSV export) while the browser showed it; a trivial
+  edit in the browser (a value typed into an empty cell and removed) brought the API back within minutes.
 
 ## Invariants: do not break these
 

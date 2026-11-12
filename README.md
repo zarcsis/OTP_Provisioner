@@ -753,7 +753,9 @@ is shown on the page; unknown keys produce a warning. When Google is slow or not
 do not wait for it longer than 2 s: the read goes on in the background, the last good settings stay in force,
 and the storage line of the status says "waiting for Google Sheets to answer". Boards cannot be provisioned
 meanwhile (every stage writes the board's record), but the page says why instead of staying at "Checking the
-server…".
+server…". Once, Google kept timing out on the station spreadsheet's cells (the API only; the spreadsheet opened in
+the browser): download a copy first (File → Download → .xlsx: it is the only copy of the boards' keys), then type
+a value into an empty cell in the browser and delete it again; that brought the API back within minutes.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
