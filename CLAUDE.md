@@ -77,7 +77,10 @@ that `otp-growroot` never found the station image's root (fixed in item 11). Fla
 `otp-growroot` "done: 14G root file system", the mapping filling its partition, `rpi-resize` masked, nothing failed.
 Then its Imager file on the same card: `otp-growpart` grew partition 2 from 12730368 to 30007296 sectors in the
 initramfs before cryptroot, the LUKS2 mapping opened at the partition's size, `otp-growroot` grew the file system to
-14G, `HMAC_LOCKED` after the unlock, cloud-init done, nothing failed.
+14G, `HMAC_LOCKED` after the unlock, cloud-init done, nothing failed. The open Pi 5 `2a03e58f` the same day: a cable
+pulled during stage 3 gave the new "run stage 2 again" text on the page and in the record, and showed the record
+staying "Image written" (fixed); flashed again, `rpi-resize` grew the clear root to 53G, the demo app ran (25
+detections per 5 s, 0.0 px), probe 23 PASS / 2 INFO / 0 FAIL.
 
 ## How it was written
 
