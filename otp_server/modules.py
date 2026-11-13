@@ -550,6 +550,13 @@ class ModuleService:
                 u = u[2:]
             if u[-8:] != rec["serial"]:
                 notes.append(f"warning: USER_SERIAL_NUM {usn} differs from the USB serial {rec['serial']}")
+        arb = expect.get("arb_version")
+        if ok and isinstance(arb, int) and not isinstance(arb, bool) and arb > self.arb_version(rec):
+            # program_arb=1 went with a stage 1 the board finished. The board reports no anti-rollback version, so
+            # this is what was sent (OTP: it only goes up), not something the board confirmed.
+            rec["facts"]["arb_version"] = arb
+            _add_event(rec, "otp", f"program_arb=1 sent: bootloader anti-rollback version {arb} (the board does not "
+                                   "report it back)")
         if ok:
             rec["stage"] = _stage_max(rec["stage"], "eeprom")
         return ok
@@ -779,6 +786,13 @@ class ModuleService:
         return isinstance(facts, dict) and facts.get("jtag_locked") is True
 
     @staticmethod
+    def arb_version(record: dict) -> int:
+        """The bootloader anti-rollback version stage 1 sent with ``program_arb=1`` (``facts.arb_version``; 0: none)."""
+        facts = (record or {}).get("facts")
+        v = facts.get("arb_version") if isinstance(facts, dict) else None
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+    @staticmethod
     def lock_assumption(record: dict) -> dict:
         """``facts.otp_lock``: ``{"state": "suspected" | "", "why", "at", "rejected": [variant, ...]}`` -- what
         the station assumes about the OTP lock while the board has not reported it (``{}`` when nothing)."""
@@ -834,6 +848,7 @@ class ModuleService:
                 "locked_to_our_key": self.locked_to_our_key(r),
                 "secure_boot_provisioned": r["secure_boot_provisioned"],
                 "jtag_locked": self.jtag_locked(r),
+                "arb_version": self.arb_version(r),
                 "lock_suspected": self.lock_suspected(r),
                 "lock_note": self.lock_assumption(r).get("why", ""),
                 "device_key": bool(r["device_key_pem"]),

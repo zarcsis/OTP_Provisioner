@@ -447,7 +447,7 @@ def test_public_view(module_service):
     assert view["secrets"] == {"rsa_key": True, "customer_key_hash": rec["customer_key_hash"], "device_secret": True,
                                "rsa_key_fingerprint": public_key_fingerprint(rec["rsa_public_pem"])}
     assert view["otp"] == {"customer_key_hash": ZERO_HASH, "locked": False, "locked_to_our_key": False,
-                           "secure_boot_provisioned": False, "jtag_locked": False, "lock_suspected": False,
+                           "secure_boot_provisioned": False, "jtag_locked": False, "arb_version": 0, "lock_suspected": False,
                            "lock_note": "", "device_key": True,
                            "device_key_fingerprint": public_key_fingerprint(EC_PEM),
                            "device_key_exported": False, "device_key_origin": ""}

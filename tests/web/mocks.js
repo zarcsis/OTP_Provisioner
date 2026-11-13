@@ -675,7 +675,7 @@
                 m = { serial, stage: 'new', stage_label: LABELS.new, mode: this.defaultMode, mode_chosen: '', mode_locked: false,
                     chip: '', board: '', duid: '', mac: '', created: 'now', updated: 'now',
                     secrets: { rsa_key: true, customer_key_hash: 'ab'.repeat(32), device_secret: true, rsa_key_fingerprint: 'cd'.repeat(32) },
-                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, jtag_locked: false, device_key: false, device_key_fingerprint: '', device_key_exported: false, device_key_origin: '' },
+                    otp: { customer_key_hash: '', locked: false, locked_to_our_key: false, secure_boot_provisioned: false, jtag_locked: false, arb_version: 0, device_key: false, device_key_fingerprint: '', device_key_exported: false, device_key_origin: '' },
                     metadata: {}, facts: {}, events: [] };
                 this.modules.set(serial, m);
                 return [m, true];
@@ -800,6 +800,12 @@
                     m.otp.locked_to_our_key = body.metadata.CUSTOMER_KEY_HASH === m.secrets.customer_key_hash;
                     m.mode_locked = true;
                     m.mode = 'secure';
+                }
+                // otp_server/modules.py _apply_stage1: program_arb=1 went with a finished stage 1 -> the version sent
+                const arb = body.expect && body.expect.arb_version;
+                if (ok && Number.isInteger(arb) && arb > (m.otp.arb_version || 0)) {
+                    m.otp.arb_version = arb;
+                    m.events.push({ t: 'now', kind: 'otp', note: `program_arb=1 sent: bootloader anti-rollback version ${arb} (the board does not report it back)` });
                 }
                 if (ok) { this._advance(m, 'eeprom'); notes.push('EEPROM_UPDATE = success'); }
             } else if (n === 2) {

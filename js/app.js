@@ -335,6 +335,7 @@
                 kv('OTP', otpText, otp.locked && !otp.locked_to_our_key ? 'bad' : ''),
                 kv('Secure boot', otp.secure_boot_provisioned ? 'provisioned' : 'not provisioned'),
                 kv('JTAG', otp.jtag_locked ? 'VideoCore JTAG locked (permanent)' : 'not locked'),
+                otp.arb_version ? kv('Anti-rollback', `bootloader version ${otp.arb_version} sent to OTP (program_arb)`) : null,
                 kv('Device key', otp.device_key ? el('span', { title: otp.device_key_fingerprint || '' }, 'ECDSA ✓ ' + shortHex(otp.device_key_fingerprint, 16) + (otp.device_key_exported ? ' · private key on the server' : '')) : '—', 'mono'),
                 otp.device_key_origin === 'existing' ? kv('Key origin', 'in OTP before the station exported it: unknown, whoever made it may hold a copy', 'bad') : null,
                 kv('DUID', m.duid, 'mono'),

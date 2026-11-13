@@ -96,6 +96,34 @@ def test_settings_read_the_old_gadget_default_as_the_new_one():
     assert "builds.image.families" in settings.DESCRIPTIONS
 
 
+def test_arm_trusted_firmware_is_on_by_default():
+    """builds.image.cm4_tfa: off until Arm Trusted Firmware had booted the secure image on a module (8726622b,
+    2026-11-12, at 4a967ba); the "false" the station wrote into every sheet before is read as the new default."""
+    from otp_server import settings
+    from otp_server.config import DEFAULTS
+    assert DEFAULTS["builds"]["image"]["cm4_tfa"] is True and load_config().builds.image.cm4_tfa is True
+    assert settings.REPLACED_DEFAULTS["builds.image.cm4_tfa"] == frozenset({"false"})
+    assert "experimental" not in settings.DESCRIPTIONS["builds.image.cm4_tfa"]
+    assert "experimental" in next(iter(settings.OLD_DESCRIPTIONS["builds.image.cm4_tfa"]))
+
+
+def test_program_arb_with_the_submodule_firmware():
+    """The real rpi-eeprom / usbboot of the submodule: the BCM2711 recovery.bin knows program_arb and the EEPROM image
+    and stage 2's bootloader are not older than what it writes. The BCM2712 recovery.bin of 2026-10-23 has no such
+    option (its release notes name it); when this fails after a submodule update, check the new one on a Pi 5 and set
+    boards.PI5.arb."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from otp_server.artifacts.stage1 import _ARB_KEY, Stage1Builder, newest_pieeprom
+    builder = Stage1Builder(SimpleNamespace(repo_root=Path(__file__).resolve().parents[1]), None, None, None, None)
+    d = builder.channel_dir("latest", boards.CM4)
+    if not (d / "recovery.bin").is_file() or not builder.bootfiles_path().is_file():
+        pytest.skip("external/usbboot is not checked out")
+    assert builder.arb_version(d / "recovery.bin", newest_pieeprom(d, boards.CM4.pieeprom_size), boards.CM4) >= 2
+    assert _ARB_KEY not in (builder.channel_dir("latest", boards.PI5) / "recovery.bin").read_bytes()
+
+
 def test_the_host_name_names_the_family():
     """The default host name template has {family}: a CM4 came up as pi5-<serial> with the old one, which a sheet
     that still holds it is read as the new default."""
@@ -150,7 +178,7 @@ def test_stage1_secure_cm4_burns_the_key_hash(make_env):
     assert m["mode"] == "signed" and m["config_txt"] == "uart_2ndstage=1\nrecovery_reboot=1\nprogram_pubkey=1\n"
     assert [i["key"] for i in m["irreversible"]] == ["program_pubkey"]
     assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": rec["customer_key_hash"],
-                           "otp_key_hash": None, "jtag_lock": False}
+                           "otp_key_hash": None, "jtag_lock": False, "arb_version": None}
     run = env.docker.runs_of("stage1.sh")[-1]
     assert {k: run["env"][k] for k in ("MODE", "CHIP", "SIGN_RECOVERY", "LOCKED")} == {
         "MODE": "signed", "CHIP": "2711", "SIGN_RECOVERY": "0", "LOCKED": "0"}
@@ -166,6 +194,98 @@ def test_stage1_cm4_locked_to_our_key_sends_the_plain_second_stage(make_env):
     assert "plain recovery" in m["notes"][0] and "counter-signed" not in m["notes"][0]
     run = env.docker.runs_of("stage1.sh")[-1]
     assert (run["env"]["SIGN_RECOVERY"], run["env"]["LOCKED"]) == ("0", "1")
+
+
+def _arb_firmware(env, *, recovery_key: bool = True, rec_ver: int = 2, eeprom_ver: int = 2, stage2_ver: int = 2,
+                  bootmain_ver: int | None = 2) -> None:
+    """The fake firmware of a release with bootloader anti-rollback (rpi-eeprom 2026-10-23): recovery.bin with the
+    program_arb option, MFG_VER in every bootloader binary, stage 2's bootfiles.bin a real tar."""
+    import io
+    import tarfile
+
+    usb = env.cfg.repo_root / "external" / "usbboot"
+    for soc, ver, eeprom in (("2711", rec_ver, 524288), ("2712", 3, 2097152)):
+        d = usb / "rpi-eeprom" / f"firmware-{soc}" / "latest"
+        key = b"\x00program_arb\x00" if recovery_key and soc == "2711" else b" and program_arb config settings "
+        (d / "recovery.bin").write_bytes(b"\x08" * 1000 + key + f"MFG_VER: {ver}\x00".encode() + b"\x08" * 1000)
+        for p in d.glob("pieeprom-*.bin"):
+            if p.stat().st_size == eeprom:
+                body = f"MFG_VER: {eeprom_ver if soc == '2711' else 3}\x00".encode()
+                p.write_bytes(body + p.read_bytes()[len(body):])
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, ver in (("2711/bootcode4.bin", stage2_ver), ("2711/bootmain", bootmain_ver),
+                          ("2712/bootcode5.bin", 3), ("2712/bootmain", 3)):
+            data = b"\x01" * 100 + (f"MFG_VER: {ver}\x00".encode() if ver is not None else b"")
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    (usb / "firmware" / "bootfiles.bin").write_bytes(buf.getvalue())
+
+
+def test_stage1_program_arb_on_a_secure_cm4(make_env):
+    """provisioning.arb: program_arb=1 with every secure stage 1 of a CM4 (an irreversible step to confirm), the
+    version recovery.bin writes in expect; the verdict records it (the board reports nothing to check it by)."""
+    env = make_env(provisioning={"arb": True})
+    _arb_firmware(env)
+    rec = cm4(env, mode="secure")
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["config_txt"] == "uart_2ndstage=1\nrecovery_reboot=1\nprogram_pubkey=1\nprogram_arb=1\n"
+    assert [i["key"] for i in m["irreversible"]] == ["program_pubkey", "program_arb"]
+    assert m["expect"]["arb_version"] == 2
+    assert any("anti-rollback version 2" in n for n in m["notes"])
+    md = {"EEPROM_UPDATE": "success", "SECURE_BOOT_PROVISION": "success", "USER_BOARDREV": CM4_REV,
+          "CUSTOMER_KEY_HASH": rec["customer_key_hash"]}
+    rec, v = env.modules.record_result(SERIAL, 1, {"ok": True, "metadata": md, "expect": m["expect"],
+                                                   "files_served": []})
+    assert v["ok"] is True and rec["facts"]["arb_version"] == 2
+    assert env.modules.public_view(rec)["otp"]["arb_version"] == 2
+    otp = [e for e in rec["events"] if e["kind"] == "otp"]
+    assert otp and "program_arb=1 sent: bootloader anti-rollback version 2" in otp[-1]["note"]
+    # locked now: program_arb=1 goes again (the same version changes nothing; a newer recovery.bin raises it)
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert m["config_txt"] == "uart_2ndstage=1\nrecovery_reboot=1\nprogram_arb=1\n"
+    assert [i["key"] for i in m["irreversible"]] == ["program_arb"]
+    events = len(env.store.get(SERIAL)["events"])
+    rec, _ = env.modules.record_result(SERIAL, 1, {"ok": True, "metadata": md, "expect": {**m["expect"], "arb_version": 1},
+                                                   "files_served": []})
+    assert rec["facts"]["arb_version"] == 2                     # OTP only goes up
+    assert not any(e["kind"] == "otp" for e in rec["events"][events:])
+
+
+def test_stage1_program_arb_is_not_sent_where_it_cannot_apply(make_env):
+    env = make_env(provisioning={"arb": True})
+    _arb_firmware(env)
+    # the open scenario
+    cm4(env, mode="open")
+    m = env.arts.stage_manifest(SERIAL, 1)
+    assert "program_arb" not in m["config_txt"] and m["irreversible"] == [] and m["expect"]["arb_version"] is None
+    assert "provisioning.arb only applies to the secure scenario" in m["notes"]
+    # a Raspberry Pi 5: its recovery.bin of 2026-10-23 has no program_arb option
+    env.modules.hello(SERIAL2, {"chip": "BCM2712"})
+    env.modules.set_mode(SERIAL2, "secure")
+    m = env.arts.stage_manifest(SERIAL2, 1)
+    assert "program_arb" not in m["config_txt"] and [i["key"] for i in m["irreversible"]] == ["program_pubkey"]
+    assert any("BCM2712 recovery.bin has no program_arb option yet" in n for n in m["notes"])
+    assert boards.PI5.arb is False and boards.CM4.arb is True
+
+
+@pytest.mark.parametrize("fw, why", [
+    ({"recovery_key": False}, "has no program_arb option"),
+    ({"stage2_ver": 1}, "bootfiles.bin 2711/bootcode4.bin (version 1) would then refuse to boot"),
+    ({"bootmain_ver": None}, "bootfiles.bin 2711/bootmain (no MFG_VER)"),
+    ({"eeprom_ver": 1}, "pieeprom-2026-10-23.bin (version 1)"),
+])
+def test_stage1_program_arb_refused_when_a_later_bootloader_is_older(make_env, fw, why):
+    """program_arb=1 writes recovery.bin's version for good: a stage-2 bootloader (or the EEPROM image) older than that
+    would never boot again, so stage 1 is refused with the reason instead."""
+    env = make_env(provisioning={"arb": True})
+    _arb_firmware(env, **fw)
+    cm4(env, mode="secure")
+    with pytest.raises(NotReady, match="provisioning.arb") as exc:
+        env.arts.stage_manifest(SERIAL, 1)
+    assert why in str(exc.value)
+    assert env.docker.runs_of("stage1.sh") == []
 
 
 def test_cm4_stage1_report_and_an_assumed_lock_that_was_wrong(make_env):

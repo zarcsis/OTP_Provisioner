@@ -168,6 +168,16 @@ BUILD_TIMESTAMP="$(strings "${PIEEPROM}" | sed -n 's/.*BUILD_TIMESTAMP=\([0-9][0
 [ -n "${BUILD_TIMESTAMP}" ] || die "no BUILD_TIMESTAMP in ${PIEEPROM_REL}"
 echo "    pieeprom: ${PIEEPROM_REL} (BUILD_TIMESTAMP=${BUILD_TIMESTAMP})"
 echo "    recovery: ${RECOVERY_REL}"
+if tr -d '\r' < "${OUT}/config.txt" | grep -Eq '^[[:space:]]*program_arb[[:space:]]*=[[:space:]]*1[[:space:]]*$'; then
+    # Bootloader anti-rollback: the version built into recovery.bin goes to OTP for good. Only with the
+    # secure scenario's signed EEPROM, and only with a recovery.bin that knows the option (an unknown
+    # config.txt key is ignored without a word, so the operator would believe it written).
+    [ "${MODE}" = signed ] || die "config.txt sets program_arb=1 but MODE=unsigned: anti-rollback belongs to the secure scenario"
+    # the key itself (NUL-terminated), not the "... and program_arb config settings require rpiboot mode" message
+    # that the BCM2712 recovery.bin of 2026-10-23 has without the option
+    grep -aqP '\x00program_arb\x00' "${RECOVERY}" || die "config.txt sets program_arb=1 but ${RECOVERY_REL} has no such option"
+    echo "    program_arb=1: anti-rollback version $(strings "${RECOVERY}" | sed -n 's/^MFG_VER: *\([0-9][0-9]*\)$/\1/p' | sed -n 1p) of ${RECOVERY_REL}"
+fi
 
 stage_tools
 

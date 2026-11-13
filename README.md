@@ -18,7 +18,7 @@ is provisioned in one of two **scenarios**, picked on the page per board (both a
 
 | | **Open** | **Secure** |
 | --- | --- | --- |
-| Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`) |
+| Stage 1 · EEPROM & OTP | unsigned EEPROM, OTP untouched | EEPROM signed with the board's RSA key, `program_pubkey=1` burns the key hash into OTP (+ `program_jtag_lock=1` with `provisioning.jtag_lock`, + `program_arb=1` on a CM4 with `provisioning.arb`) |
 | Stage 2 · Fastboot gadget | the gadget built by this server | the same gadget, `boot.sig` once the board is locked |
 | Stage 3 · Image | Raspberry Pi OS Lite, clear (`IGconf_image_pmap=clear`), nothing written to OTP; the boot partition carries the board's first-boot files | the OTP device key is generated (if blank) and **exported to the server**; the **server builds the board's LUKS2 container** holding the root file system (`IGconf_image_pmap=crypt` image, keyslot 0 = the board's key) and the board writes that ciphertext raw, then proves its key opens it (`oem cryptcheck`, nothing is decrypted on the board); the boot partition carries the board's first-boot files and is re-signed per board, with `lock_device_private_key=1` in the signed `config.txt` (the running OS cannot read the OTP key) |
 
@@ -528,7 +528,20 @@ burns the key hash.
   `[cm4]`; layer `otp-tfa-rpi4`). TF-A edits the device tree in place and uses the 1 MiB after its start as scratch
   space (`fdt_open_into(dtb, dtb, 0x100000)`); without `device_tree_address` the firmware puts the device tree right
   below the initramfs, and TF-A overwrote the initramfs of the crypt image on a module (it booted the open image).
-  Off by default until a module has booted the secure image with it (test plan phase 2b on the wiki).
+  On by default since a module booted the secure image with it (2026-11-12, test plan phase 2b on the wiki:
+  `PSCIv1.1`, `spectre_v2: Mitigation: … BHB`, `spec_store_bypass: Not affected`); a sheet that still holds the
+  `false` earlier versions wrote is read as `true`, an operator who wants it off writes `false` again;
+* any Raspberry Pi-signed bootloader runs on it over rpiboot (its boot ROM checks no customer counter-signature),
+  older releases included. `provisioning.arb` adds `program_arb=1` to its secure stage 1: the anti-rollback version
+  of the station's `recovery.bin` (rpi-eeprom 2026-10-23: 2, its `MFG_VER`) goes to OTP, and EEPROM bootloaders of
+  an older version stop booting. Raspberry Pi calls it preliminary; on a BCM2711 the bootloader enforces it, not
+  the boot ROM, so an older `recovery.bin` still runs over rpiboot and can flash an older bootloader, which then
+  stops (no boot, no bypass). The station refuses the stage when the EEPROM image or stage 2's `bootcode4.bin` /
+  `bootmain` (usbboot `firmware/bootfiles.bin`) are older than what it would write, since stage 2 would never boot
+  again. The board does not report the version back; the record keeps what was sent (`facts.arb_version`, the board
+  card's **Anti-rollback** line, an `otp` event). The BCM2712 `recovery.bin` of the same release has no such option
+  (its release notes name it), so a Pi 5 is not sent it; a Pi 5 refuses older bootloaders through the counter-
+  signature already, as long as only the current one is signed for it.
 
 **Stage 2** serves the same gadget: built for `pi5-family,cm4`, it carries the CM4's firmware (`start4cd.elf`,
 `fixup4cd.dat`: pi-gen-micro's cut-down firmware for `gpu_mem=16`) and device trees; the kernel (`rpi-v8`) is the same.
@@ -763,6 +776,7 @@ a value into an empty cell in the browser and delete it again; that brought the 
 | --- | --- | --- |
 | `provisioning.default_mode` | `open` | scenario the page preselects for a new board: `open` or `secure` |
 | `provisioning.jtag_lock` | `false` | secure scenario: also burn `program_jtag_lock=1` (IRREVERSIBLE) |
+| `provisioning.arb` | `false` | secure scenario, Compute Module 4: also burn `program_arb=1` (IRREVERSIBLE): the bootloader anti-rollback version of the station's `recovery.bin` goes to OTP and older EEPROM bootloaders stop booting (see "Compute Module 4"); a Pi 5 is not sent it |
 | `provisioning.recovery_passphrase` | `false` | secure scenario: add a server-derived LUKS passphrase as keyslot 1 |
 | `provisioning.confirm_irreversible` | `true` | the page asks the operator to type the serial before OTP writes / erase |
 | `provisioning.erase_storage` | `true` | stage 3: erase the storage device before the image is written |
@@ -795,7 +809,7 @@ a value into an empty cell in the browser and delete it again; that brought the 
 | `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
 | `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
 | `builds.image.keep_raw_image` | `false` | keep the raw `.img` next to the sparse pieces |
-| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub, the device tree at 64 MiB): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Booted the open and (with `device_tree_address`) the secure image on a module; switching it rebuilds the cm4 images |
+| `builds.image.cm4_tfa` | `true` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub, the device tree at 64 MiB): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Booted the open and (with `device_tree_address`) the secure image on a module; switching it rebuilds the cm4 images |
 | `docker.binary` | `docker` | docker CLI to run |
 | `docker.start_desktop` | `true` | Windows: start Docker Desktop when the engine is down |
 | `docker.desktop_path` | (standard location) | Docker Desktop executable |
@@ -832,6 +846,7 @@ What the irreversible operations burn (the page lists each one and asks for the 
 | --- | --- | --- |
 | `program_pubkey=1` (stage 1 `config.txt`) | secure scenario, board not yet locked | Burns the SHA-256 of this board's RSA public key into OTP. From then on the SoC only runs EEPROM and boot images signed with that key. Lose the key and the board is bricked for this station. |
 | `program_jtag_lock=1` (stage 1) | secure scenario **and** `provisioning.jtag_lock`, board not reported locked yet | Permanently disables VideoCore JTAG. |
+| `program_arb=1` (stage 1) | secure scenario **and** `provisioning.arb`, a Compute Module 4 | Raises the bootloader anti-rollback version in OTP to that of the station's `recovery.bin`; EEPROM bootloaders of an older version stop booting. It only goes up. |
 | device key generation (stage 3: the gadget's export request / `oem fwcrypto init`) | secure scenario, blank key slot (a key already in OTP is exported as it is, nothing is generated) | The firmware generates the device-unique ECDSA P-256 key in OTP. It cannot be changed or erased; a copy goes to the station. |
 | `erase:<disk>` (stage 3) | `erase_storage: true` | Wipes the SD card / eMMC / NVMe before IDP writes the partition table. |
 
@@ -1088,7 +1103,7 @@ bash 4 or later; `tests/hosttools.py` checks). On Windows put Git's Unix tools f
 are skipped (WSL's `C:\Windows\System32\bash.exe` is never used). `C:\Program Files\Git\bin` is not the same: its
 `sh.exe` puts Git's own tools before the test's stubs. On macOS the tests that need GNU `stat`/`sed` or bash 4 skip
 with a hint; `brew install coreutils gnu-sed bash` with the gnubin directories first on `PATH` runs them. With
-`usr\bin` first on Windows: 1296 passed, 3 skipped (2026-11-12). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
+`usr\bin` first on Windows: 1305 passed, 3 skipped (2026-11-13). `run_e2e.py` uses the server's work dir (`OTP_WORK_DIR` or the
 platform default) and exits with 2 when no scenario can run there.
 
 ## Troubleshooting

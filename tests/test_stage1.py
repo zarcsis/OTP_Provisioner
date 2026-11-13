@@ -152,7 +152,7 @@ def test_signed_passes_expect_ckh_from_the_key(make_env, how):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed"
-    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh, "otp_key_hash": None, "jtag_lock": False}
+    assert m["expect"] == {"secure_boot_provision": True, "customer_key_hash": ckh, "otp_key_hash": None, "jtag_lock": False, "arb_version": None}
     (run,) = env.docker.runs
     assert run["env"]["EXPECT_CKH"] == ckh and customer_key_hash(run["public_pem"]) == ckh
     assert run["env"]["MODE"] == "signed" and run["env"]["SIGN_RECOVERY"] == "0"
@@ -359,7 +359,7 @@ def test_open_plan_is_unsigned_and_ignores_the_board_key(make_env):
     assert plan.signed is False and plan.customer_key_hash == ""
     m = env.arts.stage_manifest(SERIAL, 1)
     assert m["mode"] == "unsigned"
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": None, "jtag_lock": False}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": None, "jtag_lock": False, "arb_version": None}
     (run,) = env.docker.runs
     assert "/keys" not in run["mounts"] and "EXPECT_CKH" not in run["env"]
 
@@ -374,7 +374,7 @@ def test_board_locked_to_our_key_gets_a_signed_stage1(make_env):
     m = env.arts.stage_manifest(SERIAL, 1)
     ckh = customer_key_hash(rec["rsa_public_pem"])
     assert m["mode"] == "signed" and m["irreversible"] == []
-    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": ckh, "jtag_lock": False}
+    assert m["expect"] == {"secure_boot_provision": False, "customer_key_hash": None, "otp_key_hash": ckh, "jtag_lock": False, "arb_version": None}
     assert m["notes"][0] == "board OTP is already locked to our key: signed EEPROM and counter-signed recovery"
     assert "program_pubkey" not in m["config_txt"]
     (run,) = env.docker.runs
@@ -506,6 +506,15 @@ def test_script_cm4_passes_the_guards_to_its_firmware(tmp_path, extra):
     cp = _run_script(tmp_path, {"EXPECT_CKH": "ab" * 32, **extra}, "[all]\nSIGNED_BOOT=1\n" if signed else "[all]\n",
                      "uart_2ndstage=1\nrecovery_reboot=1\n")
     assert "firmware directory not found" in cp.stderr and "firmware-2711/latest" in cp.stderr, cp.stderr
+
+
+def test_script_guards_program_arb():
+    """program_arb=1 only with a signed EEPROM and a recovery.bin that has the option itself: the BCM2712 one of
+    2026-10-23 names it only in a message (recovery ignores an unknown key without a word). Run against the real
+    firmware in the tools image on 2026-11-13: the CM4 passes with version 2, the Pi 5 and an unsigned run die."""
+    text = (REPO_ROOT / "docker" / "scripts" / "stage1.sh").read_text(encoding="utf-8")
+    assert "grep -aqP '\\x00program_arb\\x00'" in text
+    assert "program_arb=1 but MODE=unsigned" in text
 
 
 def test_script_compares_key_hash_with_expect_ckh():

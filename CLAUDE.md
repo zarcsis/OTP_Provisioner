@@ -125,6 +125,11 @@ checked against a real board between steps:
    that fills its partition, `rpi-resize` masked on crypt images; the firmware HMAC locked after the unlock in custom
    crypt images too (`otp-hwlock`); the page asking for a reload when the station's page files changed under it;
    the stage-3 disconnect text; `{family}` in `image.hostname` (default `{family}-{serial}`).
+12. (2026-11-13) After the tester's third report (Arm Trusted Firmware booted the secure CM4 image): `cm4_tfa` on by
+   default (the `false` earlier versions wrote is replaced); `otp-growroot` rounds the mapping's possible size to the
+   container's sectors (F11); `provisioning.arb` (`program_arb=1` for a secure CM4, refused when a later bootloader
+   is older; not for the Pi 5, whose `recovery.bin` lacks the option); the status waits for Google at most 2 s; a
+   failed stage 3 takes back "Image written".
 
 Design decisions that were the owner's and should not be re-litigated:
 
@@ -221,7 +226,7 @@ uv run python -B -m otp_server build tools|gadget|image [--force]
 uv run python -B -m otp_server modules [--json] | mark-locked <serial> | mark-unlocked <serial>
 uv lock --upgrade                             # a deliberate dependency update: commit uv.lock with it
 
-uv run --group dev python -B -m pytest -q     # ~1295 tests, ~1.5 min; needs no Docker, no Google, no hardware
+uv run --group dev python -B -m pytest -q     # ~1300 tests, ~1.5 min; needs no Docker, no Google, no hardware
 uv run python -B tests/web/run_selftest.py    # ~670 checks: the page in headless Chrome against a fake API + mock board
 uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real artifacts + mock board, scenarios A-D
 ```
@@ -241,7 +246,7 @@ uv run python -B tests/web/run_e2e.py         # ~510 checks: real server + real 
   it the `sh` tests skip, and so does the kernel command line test (`tests/hosttools.bash4` never takes WSL's
   `System32\bash.exe`, which gets neither the env nor the `C:/` paths); Git's `bin\sh.exe` puts Git's tools before
   the test's stubs (`test_otp_rpios_setup_enables_apparmor_service` then runs the real `chroot`). With `usr\bin`
-  first: 1296 passed, 3 skipped (2026-11-12). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
+  first: 1305 passed, 3 skipped (2026-11-13). A tool shell (Claude Code's PowerShell) often lacks it. On macOS the tests that
   need GNU `stat`/`sed` or bash 4 skip with a hint (`tests/hosttools.py`).
 * An app change is checked on a board with README "Checking a board": units, cgroup, journal of the provider,
   UIDs and AppArmor labels by `ps`, `podman inspect`, the probe's summary inside the container, `aa-status`.
@@ -386,6 +391,13 @@ through the page once (secure, first run) and that is the accepted weak point of
   `tests/test_artifacts.py` checks the patch against what `js/fastboot.js` sends. A signature cannot be
   withdrawn: gadgets signed for a board with the stock daemon stay valid for it, so rebuild before boards go
   out.
+* **Bootloader anti-rollback** (`provisioning.arb`, off by default): `program_arb=1` in a secure stage 1 writes the
+  anti-rollback version of `recovery.bin` (taken to be its `MFG_VER`: rpi-eeprom 2026-10-23 raised both) into OTP.
+  Only families whose `recovery.bin` knows the option (`Family.arb`: the CM4; the BCM2712 one of the same release
+  has only a message naming it, without the NUL-terminated key, which `stage1.sh` checks for). `Stage1Builder.
+  arb_version` refuses the stage when the EEPROM image or stage 2's second stage / `bootmain` from `bootfiles.bin`
+  carry an older `MFG_VER`: on a BCM2711 the bootloader enforces it ("bootmain watermark"), so stage 2 would stop
+  for good. The board reports no anti-rollback version; `facts.arb_version` is what was sent.
 * **On a Compute Module 4 (BCM2711)** the same chain is weaker in three places (README "Compute Module 4"): its
   boot ROM checks only Raspberry Pi's signature of the second stage, so `bootcode4.bin` is never counter-signed and
   any Raspberry Pi-signed bootloader runs over rpiboot (what stays enforced is the signed EEPROM config and
@@ -669,8 +681,12 @@ run from the station image on `2a03e58f` on 2026-10-28)**
 * `otp-growpart` (initramfs script and hook) exists twice too: `image/layer/otp-rpios-setup.d/device/initramfs-tools`
   and `docker/scripts/custom-crypt/` (`otp-growpart`, `otp-growpart.hook`); byte-equal by test. Nothing after the
   initramfs resizes the LUKS2 mapping of a station crypt image (it would need the locked HMAC).
-* `builds.image.cm4_tfa` stays off by default until Arm Trusted Firmware has booted on a CM4 (test plan phase 2b); the
-  Pi 5 never gets the layer (`Family.tfa_layer` is empty: its firmware runs TF-A already).
+* `builds.image.cm4_tfa` is on by default since Arm Trusted Firmware booted the secure image on a CM4 (2026-11-12); the
+  Pi 5 never gets the layer (`Family.tfa_layer` is empty: its firmware runs TF-A already). `image/example-cm4.yaml`
+  is the CM4 render with the default (the layer `tfa` in it).
+* `program_arb=1` is never sent with a stage 1 whose later bootloaders (the EEPROM image, stage 2's `bootfiles.bin`)
+  are older than the `recovery.bin` that writes it, nor to a family whose `recovery.bin` lacks the option
+  (`Family.arb`); `stage1.sh` dies on either too.
 * The Imager file is assembled from the same per-board pieces stage 3 serves (signed slot, container); it must
   not gain anything the page may not see (it carries what stage 3 carries: ciphertext, signed boot files,
   first-boot files).

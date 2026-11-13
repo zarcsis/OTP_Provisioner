@@ -81,7 +81,7 @@ def test_defaults(tmp_path):
     assert b.image.families == ["pi5", "cm4"]
     assert (b.image.builder_tag, b.image.volume, b.image.keep_raw_image) == (
         "otp-image-builder:trixie", "otp-image-work", False)
-    assert b.image.cm4_tfa is False          # Arm Trusted Firmware on the CM4: off until confirmed on a module
+    assert b.image.cm4_tfa is True           # Arm Trusted Firmware on the CM4: on since it booted the secure image
     i = cfg.image
     assert (i.name, i.hostname, i.timezone, i.user, i.password_hash) == (
         "rpios-trixie-arm64-lite", "{family}-{serial}", "Europe/Kyiv", "pi", "")
@@ -645,7 +645,7 @@ def test_summary(make_cfg, tmp_path):
                                      "volume": "otp-pgm-work"}
     assert s["builds"]["image"] == {"overrides": [], "builder_tag": "otp-image-builder:trixie",
                                     "volume": "otp-image-work", "keep_raw_image": False,
-                                    "families": [f for f in cfg.builds.image.families], "cm4_tfa": False}
+                                    "families": [f for f in cfg.builds.image.families], "cm4_tfa": True}
     d = s["docker"]
     assert set(d) == {"binary", "start_desktop", "desktop_path", "idle_timeout"}
     assert d["desktop_path"] == (str(cfg.docker.desktop_path) if cfg.docker.desktop_path else None)

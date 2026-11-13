@@ -56,6 +56,7 @@ DEFAULTS: dict[str, Any] = {
     "provisioning": {
         "default_mode": "open",
         "jtag_lock": False,
+        "arb": False,
         "recovery_passphrase": False,
         "confirm_irreversible": True,
         "erase_storage": True,
@@ -97,7 +98,7 @@ DEFAULTS: dict[str, Any] = {
             "builder_tag": "otp-image-builder:trixie",
             "volume": "otp-image-work",
             "keep_raw_image": False,
-            "cm4_tfa": False,
+            "cm4_tfa": True,
         },
     },
     "docker": {"binary": "docker", "start_desktop": True, "desktop_path": None, "idle_timeout": 1800},
@@ -121,7 +122,7 @@ class ServerCfg:
 @dataclass
 class ProvisioningCfg:
     """``default_mode`` is the scenario the page preselects (:data:`PROVISIONING_MODES`); the operator
-    picks the scenario per board. ``jtag_lock`` and ``recovery_passphrase`` only apply to ``secure``."""
+    picks the scenario per board. ``jtag_lock``, ``arb`` and ``recovery_passphrase`` only apply to ``secure``."""
 
     default_mode: str
     jtag_lock: bool
@@ -131,6 +132,8 @@ class ProvisioningCfg:
     firmware_channel: str
     max_piece_size: int
     boot_conf: str
+    #: ``program_arb=1`` in a secure stage 1 of a family whose recovery.bin knows it (:attr:`boards.Family.arb`).
+    arb: bool = False
 
 
 @dataclass
@@ -181,8 +184,9 @@ class ImageBuildCfg:
     keep_raw_image: bool
     families: list[str] = field(default_factory=lambda: ["pi5"])
     #: The Compute Module 4 images boot through Arm Trusted Firmware (layer otp-tfa-rpi4): the kernel gets the
-    #: Spectre v2 / v4 workarounds the Raspberry Pi armstub of a BCM2711 lacks. Off until confirmed on a module.
-    cm4_tfa: bool = False
+    #: Spectre v2 / v4 workarounds the Raspberry Pi armstub of a BCM2711 lacks. On by default since it booted the
+    #: open and the secure image on a module (2026-11-12).
+    cm4_tfa: bool = True
 
 
 @dataclass
@@ -625,6 +629,7 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
     provisioning = ProvisioningCfg(
         default_mode=_enum(prov.get("default_mode"), "provisioning.default_mode", PROVISIONING_MODES),
         jtag_lock=_bool(prov.get("jtag_lock"), "provisioning.jtag_lock"),
+        arb=_bool(prov.get("arb", False), "provisioning.arb"),
         recovery_passphrase=_bool(prov.get("recovery_passphrase"), "provisioning.recovery_passphrase"),
         confirm_irreversible=_bool(prov.get("confirm_irreversible"), "provisioning.confirm_irreversible"),
         erase_storage=_bool(prov.get("erase_storage"), "provisioning.erase_storage"),
@@ -661,7 +666,7 @@ def _build(tree: dict, root: Path, unknown: list[str]) -> Config:
             volume=_str(image.get("volume"), "builds.image.volume") or "",
             keep_raw_image=_bool(image.get("keep_raw_image"), "builds.image.keep_raw_image"),
             families=families,
-            cm4_tfa=_bool(image.get("cm4_tfa", False), "builds.image.cm4_tfa"),
+            cm4_tfa=_bool(image.get("cm4_tfa", True), "builds.image.cm4_tfa"),
         ),
     )
 

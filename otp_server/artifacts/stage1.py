@@ -9,6 +9,7 @@ binaries are produced by ``docker/scripts/stage1.sh`` in the tools image.
 from __future__ import annotations
 
 import re
+import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,20 @@ def outputs(family: boards.Family) -> tuple[str, ...]:
 WHY_PUBKEY = ("burns sha256 of this board's public key into OTP: the SoC will only run firmware signed with "
               "this key, forever")
 WHY_JTAG = "permanently disables VideoCore JTAG"
+WHY_ARB = ("writes the bootloader anti-rollback version of this recovery.bin into OTP: EEPROM bootloaders of an "
+           "older version stop booting, forever (the version can only go up)")
+_MFG_RE = re.compile(rb"MFG_VER: ?(\d+)")
+#: The option as recovery.bin's config parser knows it (NUL-terminated: the BCM2712 recovery.bin of 2026-10-23 names
+#: program_arb only in a message, without the option).
+_ARB_KEY = b"\x00program_arb\x00"
+
+
+def mfg_version(data: bytes) -> int | None:
+    """The ``MFG_VER: N`` a Raspberry Pi bootloader binary carries (recovery.bin, bootcode, bootmain, pieeprom).
+    rpi-eeprom 2026-10-23 raised it together with the anti-rollback support ("Bump the MFG version"): the station
+    takes it for the anti-rollback version ``program_arb=1`` writes."""
+    m = _MFG_RE.search(data)
+    return int(m.group(1)) if m else None
 
 
 def _mismatch(stored: str, computed: str) -> str:
@@ -64,6 +79,10 @@ class Stage1Plan:
     locked: bool = False
     #: provisioning.jtag_lock is on, but the board reported JTAG_LOCKED=1 before: program_jtag_lock is not sent again.
     jtag_locked_already: bool = False
+    #: program_arb=1 is sent (provisioning.arb, secure scenario, a family whose recovery.bin knows it), writing this
+    #: anti-rollback version.
+    arb: bool = False
+    arb_version: int | None = None
 
     @property
     def mode(self) -> str:
@@ -75,7 +94,7 @@ class Stage1Plan:
         return self.family.second_stage
 
 
-def config_txt(program_pubkey: bool, jtag_lock: bool, family: boards.Family = boards.PI5) -> str:
+def config_txt(program_pubkey: bool, jtag_lock: bool, family: boards.Family = boards.PI5, arb: bool = False) -> str:
     """Stage-1 config.txt (SPEC §10.2 order). ``set_reboot_order=0x3`` brings a BCM2712 back into RPIBOOT after
     the update; a CM4 comes back by itself (its nRPIBOOT jumper is fitted)."""
     lines = ["uart_2ndstage=1"] + (["set_reboot_order=0x3"] if family.reboot_order else []) + ["recovery_reboot=1"]
@@ -83,6 +102,8 @@ def config_txt(program_pubkey: bool, jtag_lock: bool, family: boards.Family = bo
         lines.append("program_pubkey=1")
     if jtag_lock:
         lines.append("program_jtag_lock=1")
+    if arb:
+        lines.append("program_arb=1")
     return "\n".join(lines) + "\n"
 
 
@@ -179,6 +200,42 @@ class Stage1Builder:
         return content_hash([eeprom / "rpi-eeprom-config", eeprom / "rpi-eeprom-digest",
                              eeprom / "tools" / "rpi-sign-bootcode", ext / "tools" / "update-pieeprom.sh"])
 
+    def bootfiles_path(self) -> Path:
+        """Stage 2's usbboot firmware (``GadgetBuilder.bootfiles_path``): the bootloader the board runs next."""
+        return Path(self.cfg.repo_root) / "external" / "usbboot" / "firmware" / "bootfiles.bin"
+
+    def arb_version(self, recovery: Path, pieeprom: Path, family: boards.Family) -> int:
+        """The anti-rollback version ``program_arb=1`` would write (``MFG_VER`` of ``recovery``), after checking that
+        every bootloader the station gives the board afterwards is not older: the EEPROM image of this stage and stage
+        2's second stage and ``bootmain`` from ``bootfiles.bin``. One of them older would stop the board at stage 2 for
+        good, so that is refused (NotReady) rather than written."""
+        rec = recovery.read_bytes()
+        if _ARB_KEY not in rec:
+            raise NotReady(f"provisioning.arb is on, but firmware-{family.soc} recovery.bin has no program_arb option: "
+                           "update external/usbboot, or turn provisioning.arb off")
+        version = mfg_version(rec)
+        if version is None:
+            raise NotReady(f"provisioning.arb: firmware-{family.soc} recovery.bin carries no MFG_VER, so the station "
+                           "cannot tell which anti-rollback version it would write; turn provisioning.arb off")
+        later = {pieeprom.name: pieeprom.read_bytes()}
+        try:
+            with tarfile.open(self.bootfiles_path()) as tar:
+                for name in (family.second_stage, "bootmain"):
+                    member = tar.extractfile(f"{family.soc}/{name}")
+                    later[f"bootfiles.bin {family.soc}/{name}"] = member.read() if member else b""
+        except (OSError, KeyError, tarfile.TarError) as exc:
+            raise NotReady(f"provisioning.arb: cannot read stage 2's usbboot firmware/bootfiles.bin ({exc})") from None
+        older = []
+        for name, data in later.items():
+            v = mfg_version(data)
+            if v is None or v < version:
+                older.append(f"{name} ({'no MFG_VER' if v is None else f'version {v}'})")
+        if older:
+            raise NotReady(f"provisioning.arb: program_arb=1 would write anti-rollback version {version}, and "
+                           f"{', '.join(older)} would then refuse to boot: update external/usbboot, or turn "
+                           "provisioning.arb off")
+        return version
+
     @staticmethod
     def _key_hash(record: dict) -> tuple[str, bool]:
         """``(customer_key_hash, computed_from_the_key)`` for a signed plan.
@@ -220,6 +277,10 @@ class Stage1Builder:
         signed = secure or locked_to_ours
         program_pubkey = secure and not locked_to_ours
         jtag = bool(prov.jtag_lock) and secure and not jtag_locked
+        # program_arb=1 goes with every secure stage 1 while the setting is on: the same version again changes
+        # nothing, a newer recovery.bin raises it
+        arb = bool(prov.arb) and secure and family.arb
+        arb_version = self.arb_version(rec, pie, family) if arb else None
         # A BCM2711 boot ROM runs the plain recovery.bin whatever its OTP holds.
         sign_recovery = locked_to_ours and family.countersigned_recovery
         khash, key_checked = self._key_hash(record) if signed else ("", False)
@@ -233,13 +294,19 @@ class Stage1Builder:
                                 "(no customer key): the line was removed; SIGNED_BOOT belongs to the secure scenario")
         if prov.jtag_lock and not secure:
             warnings.append("provisioning.jtag_lock only applies to the secure scenario")
-        cfgtxt = config_txt(program_pubkey, jtag, family)
+        if prov.arb and not secure:
+            warnings.append("provisioning.arb only applies to the secure scenario")
+        elif prov.arb and not family.arb:
+            warnings.append(f"provisioning.arb: the {family.chip} recovery.bin has no program_arb option yet, so this "
+                            "board is not sent it")
+        cfgtxt = config_txt(program_pubkey, jtag, family, arb=arb)
         plan = Stage1Plan(signed=signed, program_pubkey=program_pubkey, jtag_lock=jtag,
                           sign_recovery=sign_recovery, channel=channel, pieeprom=pie, recovery=rec,
                           boot_conf=boot_conf, config_txt=cfgtxt, customer_key_hash=khash,
                           key_checked=key_checked, warnings=warnings, family=family,
                           locked=signed and not program_pubkey,
-                          jtag_locked_already=bool(prov.jtag_lock) and secure and jtag_locked)
+                          jtag_locked_already=bool(prov.jtag_lock) and secure and jtag_locked,
+                          arb=arb, arb_version=arb_version)
         plan.fp = fingerprint("stage1", family.soc, plan.mode, channel, pie.name, self.hashes.sha256(pie),
                               self.hashes.sha256(rec), self._eeprom_tools_hash(),
                               boot_conf, cfgtxt, sign_recovery, khash if signed else None,
@@ -388,6 +455,8 @@ class Stage1Builder:
             irreversible.append({"key": "program_pubkey", "value": "1", "why": WHY_PUBKEY})
         if plan.jtag_lock:
             irreversible.append({"key": "program_jtag_lock", "value": "1", "why": WHY_JTAG})
+        if plan.arb:
+            irreversible.append({"key": "program_arb", "value": "1", "why": WHY_ARB})
         fam = plan.family
         notes = []
         recovery = "counter-signed recovery" if fam.countersigned_recovery else "plain recovery (a BCM2711 needs no other)"
@@ -405,6 +474,10 @@ class Stage1Builder:
         if plan.jtag_locked_already:
             notes.append("VideoCore JTAG is locked already (the board reported JTAG_LOCKED=1): program_jtag_lock is "
                          "not sent again")
+        if plan.arb:
+            notes.append(f"program_arb=1: bootloader anti-rollback version {plan.arb_version} goes to OTP (the board "
+                         f"does not report it back; its UART says 'Programming bootmain watermark {plan.arb_version}' "
+                         "or 'already above')")
         if not fam.reboot_order:
             notes.append("the board comes back in RPIBOOT mode for stage 2 because its nRPIBOOT jumper stays fitted "
                          "until stage 3 is done")
@@ -427,7 +500,9 @@ class Stage1Builder:
                        # signed for a board whose OTP holds (or is assumed to hold) our key hash: it must say so
                        "otp_key_hash": plan.customer_key_hash if plan.locked else None,
                        # program_jtag_lock=1 was sent: the board must report JTAG_LOCKED=1
-                       "jtag_lock": plan.jtag_lock},
+                       "jtag_lock": plan.jtag_lock,
+                       # program_arb=1 was sent with this version (the board reports nothing to check it against)
+                       "arb_version": plan.arb_version if plan.arb else None},
             "notes": notes,
             "source": {"channel": plan.channel, "pieeprom": plan.pieeprom.name, "firmware": f"firmware-{fam.soc}"},
         }

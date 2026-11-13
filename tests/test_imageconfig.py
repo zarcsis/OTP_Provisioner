@@ -39,10 +39,12 @@ def test_render_for_the_compute_module_4():
     for a SoC without AES instructions, but the station builds every container in aes-xts-plain64)."""
     from otp_server import boards
     yaml = pytest.importorskip("yaml")
-    pi5, cm4 = ic.render(image()), ic.render(image(), family=boards.CM4)
+    # the station's default: Arm Trusted Firmware on (builds.image.cm4_tfa)
+    pi5, cm4 = ic.render(image()), ic.render(image(), family=boards.CM4, tfa=load_config().builds.image.cm4_tfa)
     doc = yaml.safe_load(cm4.text)
     assert doc["device"]["layer"] == "rpi-cm4" and doc["device"]["luks2_cipher"] == "aes-xts-plain64"
-    assert doc["layer"] == {"base": "otp-rpios-lite", "kernel": "otp-rpios-kernel-v8", "station": "otp-rpios-setup"}
+    assert doc["layer"] == {"base": "otp-rpios-lite", "kernel": "otp-rpios-kernel-v8", "station": "otp-rpios-setup",
+                            "tfa": "otp-tfa-rpi4"}
     assert "Compute Module 4" in cm4.text.splitlines()[0]
     assert cm4.summary["family"] == "cm4" and cm4.digest() != pi5.digest()
     assert (REPO_ROOT / "image" / "example-cm4.yaml").read_bytes().decode("utf-8") == cm4.text

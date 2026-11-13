@@ -19,6 +19,7 @@ from otp_server.settings import (
     BOOTSTRAP,
     DESCRIPTIONS,
     HEADER,
+    OLD_DESCRIPTIONS,
     WORKSHEET,
     SettingsSheet,
     decode_rows,
@@ -681,6 +682,8 @@ def test_defaults_of_earlier_versions_are_replaced_and_descriptions_refreshed(ca
     full[row["builds.image.overrides"]][1:] = ["IGconf_x=1", "extra KEY=VALUE overrides for the droneos build, one per "
                                                "line (IGconf_image_pmap is set per scenario)"]
     full[row["image.timezone"]][1:] = ["UTC", "time zone (IANA name, e.g. Europe/Kyiv)"]
+    # Arm Trusted Firmware on the CM4 was off by default until it booted the secure image on a module
+    full[row["builds.image.cm4_tfa"]][1:] = ["false", next(iter(OLD_DESCRIPTIONS["builds.image.cm4_tfa"]))]
     full[row["image.user"]][2] = "my own note"                                      # an operator's note stays
     full[row["builds.gadget.volume"]][1] = "my-own-volume"                         # the operator's value stays
     account, ws = sheet_with([list(r) for r in full])
@@ -694,6 +697,8 @@ def test_defaults_of_earlier_versions_are_replaced_and_descriptions_refreshed(ca
     assert by_key["builds.image.volume"][1:] == ["otp-image-work", DESCRIPTIONS["builds.image.volume"]]
     assert by_key["builds.image.overrides"][1:] == ["IGconf_x=1", DESCRIPTIONS["builds.image.overrides"]]
     assert by_key["image.timezone"][1:] == ["UTC", DESCRIPTIONS["image.timezone"]]
+    assert rows["builds.image.cm4_tfa"] == "true"
+    assert by_key["builds.image.cm4_tfa"][1:] == ["true", DESCRIPTIONS["builds.image.cm4_tfa"]]
     assert by_key["image.user"][2] == "my own note"
     assert "paths.droneos" not in by_key                                            # deleted after the updates
     assert any("was the default of an earlier version" in r.getMessage() for r in caplog.records)

@@ -47,6 +47,8 @@ REPLACED_DEFAULTS: dict[str, frozenset[str]] = {
     "builds.gadget.targets": frozenset({"pi5-family"}),
     # before the host name knew the board family (a CM4 came up as pi5-<serial>)
     "image.hostname": frozenset({"pi5-{serial}"}),
+    # off until Arm Trusted Firmware had booted the secure image on a module (2026-11-12)
+    "builds.image.cm4_tfa": frozenset({"false"}),
 }
 #: Descriptions earlier versions wrote; such a cell is rewritten with the current text (any other text in the
 #: description column is the operator's note and stays).
@@ -60,6 +62,9 @@ OLD_DESCRIPTIONS: dict[str, frozenset[str]] = {
     "image.name": frozenset({"image name (part of the image set names)"}),
     "image.hostname": frozenset({"hostname of the boards"}),
     "image.user": frozenset({"login account created on the boards"}),
+    "builds.image.cm4_tfa": frozenset({"Compute Module 4 images boot through Arm Trusted Firmware (Debian's bl31.bin "
+                                       "for rpi4 as the armstub): the kernel gets the Spectre v2/v4 workarounds the "
+                                       "stock BCM2711 stub lacks; experimental, rebuilds the cm4 images"}),
 }
 #: Values kept exactly as typed (never trimmed).
 RAW_VALUES = frozenset({"image.wifi_password"})
@@ -67,6 +72,10 @@ RAW_VALUES = frozenset({"image.wifi_password"})
 DESCRIPTIONS: dict[str, str] = {
     "provisioning.default_mode": "scenario the page preselects for a new board: open or secure",
     "provisioning.jtag_lock": "secure scenario: also burn program_jtag_lock=1 (IRREVERSIBLE)",
+    "provisioning.arb": "secure scenario, Compute Module 4: also burn program_arb=1 (IRREVERSIBLE): the "
+                        "bootloader anti-rollback version of the station's recovery.bin goes to OTP and older "
+                        "EEPROM bootloaders stop booting (Raspberry Pi: preliminary; the Pi 5's recovery.bin "
+                        "has no program_arb yet, so a Pi 5 is not sent it)",
     "provisioning.recovery_passphrase": "secure scenario: add a server-derived LUKS passphrase as keyslot 1",
     "provisioning.confirm_irreversible": "the page asks the operator to type the serial before OTP writes / erase",
     "provisioning.erase_storage": "stage 3: erase the storage device before the image is written",
@@ -112,7 +121,7 @@ DESCRIPTIONS: dict[str, str] = {
     "builds.image.keep_raw_image": "keep the raw .img next to the sparse pieces",
     "builds.image.cm4_tfa": "Compute Module 4 images boot through Arm Trusted Firmware (Debian's bl31.bin for rpi4 "
                             "as the armstub): the kernel gets the Spectre v2/v4 workarounds the stock BCM2711 stub "
-                            "lacks; experimental, rebuilds the cm4 images",
+                            "lacks; switching it rebuilds the cm4 images",
     "docker.binary": "docker CLI to run",
     "docker.start_desktop": "Windows: start Docker Desktop when the engine is down",
     "docker.desktop_path": "Docker Desktop executable (empty = the standard location)",

@@ -19,3 +19,4 @@ layer:
   base: otp-rpios-lite
   kernel: otp-rpios-kernel-v8
   station: otp-rpios-setup
+  tfa: otp-tfa-rpi4

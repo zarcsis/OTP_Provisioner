@@ -60,6 +60,10 @@ class Family:
     #: Image layer that puts Arm Trusted Firmware in as the armstub when ``builds.image.cm4_tfa`` is on (empty: the
     #: family's own boot firmware already runs TF-A, as a Raspberry Pi 5's does).
     tfa_layer: str = ""
+    #: The family's recovery.bin knows ``program_arb=1`` (bootloader anti-rollback in OTP, ``provisioning.arb``).
+    #: rpi-eeprom 2026-10-23: the BCM2711 one does (a watermark its bootloader checks, "Programming bootmain
+    #: watermark"); the BCM2712 one of the same release has no such key yet, although its release notes name it.
+    arb: bool = False
 
 
 PI5 = Family(
@@ -78,7 +82,7 @@ CM4 = Family(
     rpiboot_how="fit the nRPIBOOT jumper (CM4 IO Board: J2 'disable eMMC boot'; carriers with a BOOT switch: "
                 "switch it on) and power the board on",
     after_flash="remove the nRPIBOOT jumper (or switch BOOT off), then power-cycle it on its own supply",
-    tfa_layer="otp-tfa-rpi4",
+    tfa_layer="otp-tfa-rpi4", arb=True,
 )
 FAMILIES: dict[str, Family] = {f.key: f for f in (PI5, CM4)}
 _BY_CHIP = {f.chip: f for f in FAMILIES.values()}
