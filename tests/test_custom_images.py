@@ -727,11 +727,12 @@ def test_otp_growpart_grows_the_last_partition_before_the_container_is_opened(tm
 
 
 def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_rc: int,
-                  source: str = "disk/by-slot/system") -> tuple[subprocess.CompletedProcess, str]:
+                  source: str = "disk/by-slot/system", sector: int | None = 4096) -> tuple[subprocess.CompletedProcess, str]:
     """otp-growroot with /sys/class/block, /etc/crypttab and its marker under ``root``; cryptsetup, findmnt,
     sfdisk, resize2fs, df stubbed (cryptsetup resize answers ``resize_rc`` without a key, the keyscript
-    ``keyscript_rc``). The root is mounted from ``<root>/dev/<source>``, a link to ``dev/dm-0`` as on a board:
-    ``disk/by-slot/system`` (the station image's fstab) or ``mapper/cryptroot`` (a custom image's)."""
+    ``keyscript_rc``; ``cryptsetup status`` reports the container's ``sector`` size, none when None). The root is
+    mounted from ``<root>/dev/<source>``, a link to ``dev/dm-0`` as on a board: ``disk/by-slot/system`` (the
+    station image's fstab) or ``mapper/cryptroot`` (a custom image's)."""
     bindir = root / "bin"
     log = _posix(root / "calls.log")
     p = _posix(root)
@@ -748,7 +749,8 @@ def _run_growroot(root: Path, moff: int, msize: int, resize_rc: int, keyscript_r
     _stub(bindir, "findmnt", f'echo "{p}/dev/{source}"\n')
     _stub(bindir, "cryptsetup", f'case "$1" in\n'
                                 f'  status) printf "  device:  {p}/dev/mmcblk0p2\\n  offset:  {moff} sectors\\n'
-                                f'  size:    {msize} sectors\\n" ;;\n'
+                                f'  size:    {msize} sectors\\n'
+                                + (f'  sector size:  {sector}\\n' if sector else '') + '" ;;\n'
                                 f'  resize) echo "cryptsetup $*" >> "{log}"; key=$(cat); '
                                 f'case "$*" in *key-file*) [ -n "$key" ] && exit 0; exit 2 ;; esac; exit {resize_rc} ;;\n'
                                 f'esac\n')
@@ -787,6 +789,21 @@ def test_otp_growroot_leaves_a_mapping_that_fills_its_partition_alone(tmp_path):
     root = _fake_disk(tmp_path / "mapper", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
     r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=1, keyscript_rc=1, source="mapper/cryptroot")
     assert r.returncode == 0 and calls.strip().endswith("/mapper/dev/dm-0"), calls
+    # a partition 1-7 sectors past a whole number of 4096-byte sectors: the full-size mapping cannot reach its
+    # end, and that is no reason to resize (F11 of the CM4 report of 2026-11-12: it would fail at every boot)
+    for extra in (1, 7):
+        root = _fake_disk(tmp_path / f"odd{extra}", {1: (8192, 524288), 2: (532480, psize + extra)}, 31116288)
+        r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=1, keyscript_rc=1)
+        assert r.returncode == 0 and "cryptsetup" not in calls and calls.startswith("resize2fs "), (extra, calls)
+        assert (root / "state" / "root-grown").is_file()
+    # ... but 8 sectors more is a whole container sector: that is resized
+    root = _fake_disk(tmp_path / "odd8", {1: (8192, 524288), 2: (532480, psize + 8)}, 31116288)
+    r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=0, keyscript_rc=1)
+    assert r.returncode == 0 and "cryptsetup resize" in calls, calls
+    # a cryptsetup that does not print the sector size: 512-byte sectors, as before
+    root = _fake_disk(tmp_path / "nosector", {1: (8192, 524288), 2: (532480, psize + 1)}, 31116288)
+    r, calls = _run_growroot(root, 32768, psize - 32768, resize_rc=0, keyscript_rc=1, sector=None)
+    assert r.returncode == 0 and "cryptsetup resize" in calls, calls
     # a mapping shorter than its partition: resized with the key from the keyscript when the keyring has none
     root = _fake_disk(tmp_path / "short", {1: (8192, 524288), 2: (532480, psize)}, 31116288)
     r, calls = _run_growroot(root, 32768, 8355840, resize_rc=1, keyscript_rc=0)

@@ -564,9 +564,11 @@ during stage 3, nRPIBOOT released too early, and an open run of a new Pi 5 (`d49
 confirmed: the ROM's 8-hex USB serial, the WebUSB timings (the signed gadget's check takes 12.0 s on a CM4, inside
 the 12 s pause plus Chrome's ~5 s), `erase` in about 3 s.
 
-**Not confirmed on a real CM4 yet**: Arm Trusted Firmware on the secure image with `device_tree_address` (it booted
-the open image, and broke the secure one before that setting); the Imager file's first boot (not possible on an eMMC
-module; on an SD card it runs `otp-growpart`, which did its work on a locked Pi 5 on 2026-11-12).
+Arm Trusted Firmware (`builds.image.cm4_tfa`) booted the open image on the module, broke the secure one before
+`device_tree_address` was set, and booted the secure one with it at `4a967ba` (PSCI 1.1, Spectre v2 mitigated).
+
+**Not confirmed on a real CM4 yet**: the Imager file's first boot (not possible on an eMMC module; on an SD card it
+runs `otp-growpart`, which did its work on a locked Pi 5 on 2026-11-12).
 
 ## Operator procedure
 
@@ -793,7 +795,7 @@ a value into an empty cell in the browser and delete it again; that brought the 
 | `builds.image.builder_tag` | `otp-image-builder:trixie` | Docker tag of the image builder (rpi-image-gen) |
 | `builds.image.volume` | `otp-image-work` | Docker volume with the image build tree |
 | `builds.image.keep_raw_image` | `false` | keep the raw `.img` next to the sparse pieces |
-| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub, the device tree at 64 MiB): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Experimental (booted the open image on a module; the secure image with `device_tree_address` not yet); switching it rebuilds the cm4 images |
+| `builds.image.cm4_tfa` | `false` | the Compute Module 4 images boot through Arm Trusted Firmware (Debian's `bl31.bin` for rpi4 as the armstub, the device tree at 64 MiB): the kernel gets the Spectre v2 / v4 workarounds the stock BCM2711 stub lacks. Booted the open and (with `device_tree_address`) the secure image on a module; switching it rebuilds the cm4 images |
 | `docker.binary` | `docker` | docker CLI to run |
 | `docker.start_desktop` | `true` | Windows: start Docker Desktop when the engine is down |
 | `docker.desktop_path` | (standard location) | Docker Desktop executable |

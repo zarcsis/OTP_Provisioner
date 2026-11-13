@@ -61,12 +61,19 @@ if [ -e "/sys/class/block/$pname/partition" ]; then
     fi
 fi
 
-# 2. The dm-crypt mapping, when it ends before the partition does (offset and size in 512-byte sectors).
+# 2. The dm-crypt mapping, when it ends before the partition does (offset and size in 512-byte sectors). A
+#    mapping is a whole number of the container's sectors (4096 bytes = 8 of 512), so the last 1-7 sectors of a
+#    partition whose size past the offset is not a multiple of that are left out even at full size: they do
+#    not count, or a mapping that cannot grow would be resized (it needs the key) at every boot.
 psize=$(cat "/sys/class/block/$pname/size")
 moff=$(cryptsetup status "$name" | awk '$1 == "offset:" { print $2 }')
 msize=$(cryptsetup status "$name" | awk '$1 == "size:" { print $2 }')
-if [ $((moff + msize)) -lt "$psize" ]; then
-    log "mapping $name: $msize -> $((psize - moff)) sectors"
+ssize=$(cryptsetup status "$name" | awk '$1 == "sector" && $2 == "size:" { print $3 }')
+unit=$(( ${ssize:-512} / 512 ))
+[ "$unit" -ge 1 ] || unit=1
+mwant=$(( (psize - moff) / unit * unit ))
+if [ "$mwant" -gt "$msize" ]; then
+    log "mapping $name: $msize -> $mwant sectors"
     if ! cryptsetup resize "$name" </dev/null 2>/dev/null; then
         ks=$(awk -v n="$name" '$1 == n { print $4 }' /etc/crypttab | tr ',' '\n' | sed -n 's/^keyscript=//p')
         [ -n "$ks" ] && [ -x "$ks" ] || { log "cryptsetup resize needs the passphrase and /etc/crypttab names no keyscript"; exit 1; }

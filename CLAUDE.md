@@ -69,7 +69,9 @@ and answered on the wiki's test plan page.
 cryptcheck` keyslot 0, an unattended boot unlocking the root through the firmware HMAC, `privkey` refused, the root on
 `xts-aes-neonbs`, `poweroff` holding) and every required case of phase 5, with a new Pi 5 (`d49c6c2e`) as the open
 regression run. UART logs came through that Pi 5 as a bridge. Arm Trusted Firmware booted the open image but broke the
-secure one (F10, fixed in item 11, not yet re-run on hardware). The same day the locked Pi 5 `ebbdf4fd` was re-provisioned at
+secure one (F10, fixed in item 11; the tester's re-run at `4a967ba` booted the secure crypt image on the locked
+module through TF-A: PSCI 1.1, Spectre v2 "Mitigation: … BHB", `HMAC_LOCKED`, `otp-growroot` done, two reboots,
+`poweroff` holding; no UART that round). The same day the locked Pi 5 `ebbdf4fd` was re-provisioned at
 `48a4cb9` (the locked path: counter-signed recovery and signed EEPROM without `program_pubkey`, the signed gadget with
 `2712/pubkey.bin` from `bootfiles.bin`, the board's own gadget, no second key export, `cryptcheck`) and booted
 unattended (`HMAC_LOCKED`, the lock line in `boot.img`, `xts-aes-ce`); its 5.9G file system on a 14.3G mapping showed
@@ -587,6 +589,13 @@ run from the station image on `2a03e58f` on 2026-10-28)**
   learns a partition's new size through `partx -u -n N` (util-linux) now, `resizepart`/`blockdev --rereadpt` as
   fallbacks. Checked on a loop disk in a privileged container: the partition grown before `cryptsetup open`, the
   mapping opened at the partition's size, `partx -u` on an open partition.
+* **`otp-growroot` compared the mapping with the partition sector for sector** (F11, a review note of the tester's
+  third report): a LUKS2 mapping is a whole number of 4096-byte sectors, so on a partition whose size past the data
+  offset is not a multiple of 8 the full-size mapping ends 1-7 sectors short, and `otp-growroot` would try
+  `cryptsetup resize` (it needs the key) and fail at every boot, the file system never grown. Not seen on a board
+  (`otp-growpart` and the images align to MiB; it needs a card of an odd size whose root `otp-growpart` leaves alone).
+  The size the mapping could have is rounded down to the container's sector size (`sector size:` of `cryptsetup
+  status`, 512 when it prints none).
 * **A tab opened before the station was updated** ran the old page through a whole secure stage 3 (no
   `generated` flag, the old shutdown text). `/api/status` carries `page.version` (sha256 of `index.html`, `css/`,
   `js/`); the page keeps the first one and disables Connect/Provision with a reload banner when it changes.
@@ -816,4 +825,5 @@ For the planned split (server on another machine, Sheets replaced, the open scen
 * Arm Trusted Firmware on a BCM2711 needs the 1 MiB after the device tree's start free (`fdt_open_into` in place):
   pin the tree (`device_tree_address`) away from the initramfs, or the initramfs breaks.
 * Confirmed on `8726622b` (2026-11-12): the secure chain end to end, the key export and `cryptcheck` through the
-  cut-down firmware, the root unlocked through `start4.elf`'s HMAC, `xts-aes-neonbs` on the locked module.
+  cut-down firmware, the root unlocked through `start4.elf`'s HMAC, `xts-aes-neonbs` on the locked module, and (at
+  `4a967ba`) Arm Trusted Firmware with `device_tree_address` on the secure image.
